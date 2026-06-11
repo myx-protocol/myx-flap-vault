@@ -14,7 +14,7 @@
 
 ## Known unknowns (isolated, not blocking)
 
-1. **Dividend contract deposit ABI is unverified** [D§11]. The plan assumes `deposit(uint256)` taking pre-approved WBNB. The assumption is isolated in ONE file (`src/dividend/IDividendDistributor.sol`) and ONE function (`MyxVault._forwardToDividend`). Task 0 verifies on-chain; if the real ABI differs, only those two places change.
+1. **Dividend contract ABI — VERIFIED by Task 0** (docs/phase0-findings.md): `deposit(uint256) returns (bool)` is permissionless approve+pull WBNB (returns false on failure, never reverts — callers must check); per-holder view is `withdrawableDividends(address)`; holders claim via `withdrawDividends()` on the Dividend contract. Residual risks recorded in findings: Dividend owner (Flap Portal) can `emergencyWithdraw` unclaimed WBNB (custodial risk); `minimumShareBalance` excludes small holders from forwarded dividends.
 2. **MYX is not deployed on BSC yet** [D§7]. All unit tests use mocks implementing the minimal interfaces extracted in Task 2 (signatures verified against `myx-contract-v2` source). The fork integration test (Task 12) uses real Flap contracts + mock MYX deployed onto the fork.
 
 ## File structure (locked)
@@ -155,14 +155,18 @@ contract MockPancakeRouter {
 contract MockDividendDistributor {
     IERC20 public immutable wbnb;
     uint256 public totalDeposited;
+    bool public depositSucceeds = true;
     mapping(address => uint256) public pendingOf;
     constructor(address _wbnb) { wbnb = IERC20(_wbnb); }
-    function deposit(uint256 amount) external {
+    function setDepositSucceeds(bool v) external { depositSucceeds = v; }
+    function deposit(uint256 amount) external returns (bool) {
+        if (!depositSucceeds) return false; // mirrors real contract: false, not revert
         wbnb.transferFrom(msg.sender, address(this), amount);
         totalDeposited += amount;
+        return true;
     }
     function setPending(address user, uint256 amount) external { pendingOf[user] = amount; }
-    function pending(address user) external view returns (uint256) { return pendingOf[user]; }
+    function withdrawableDividends(address user) external view returns (uint256) { return pendingOf[user]; }
 }
 
 contract MockTaxToken is ERC20 {
@@ -316,14 +320,14 @@ interface IAggregatorV3 {
 pragma solidity ^0.8.26;
 
 /// @notice Interface to the Flap tax token's native Dividend contract.
-/// @dev ASSUMED ABI — verified by Task 0 (docs/phase0-findings.md).
-///      Assumptions: (1) external deposits are accepted as pre-approved WBNB via deposit(uint256);
-///      (2) per-holder claimable amount is exposed as pending(address).
-///      If the verified ABI differs, change ONLY this file plus MyxVault._forwardToDividend
-///      and MyxVault.pendingReward.
+/// @dev ABI VERIFIED on-chain by Task 0 (docs/phase0-findings.md):
+///      - deposit(uint256) is approve+pull WBNB, permissionless, RETURNS false ON FAILURE
+///        (does not revert) — callers MUST check the return value.
+///      - withdrawableDividends(address) is the per-holder claimable view.
+///      - Holders claim via withdrawDividends() directly on the Dividend contract.
 interface IDividendDistributor {
-    function deposit(uint256 amount) external;
-    function pending(address user) external view returns (uint256);
+    function deposit(uint256 amount) external returns (bool success);
+    function withdrawableDividends(address user) external view returns (uint256);
 }
 ```
 
@@ -585,6 +589,7 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
     error BelowMinimumProcessAmount(uint256 pending, uint256 minimum);
     error StalePrice(address feed);
     error MarketNotInitialized();
+    error DividendDepositFailed();
 
     event RevenueReceived(uint256 amount, uint256 pendingTotal);
     event RevenueProcessed(uint256 bnbAmount, uint256 baseAmount, uint256 lpMinted);
@@ -1090,6 +1095,15 @@ contract MyxVaultHarvestTest is MyxVaultTestBase {
         // claim happened inside the reverted tx, so nothing left the vault overall
         assertEq(dividend.totalDeposited(), 0);
     }
+
+    function test_harvest_dividendDepositFalse_reverts() public {
+        // real Dividend contract returns false instead of reverting (e.g. totalShares == 0)
+        basePool.setRebate(600 ether);
+        dividend.setDepositSucceeds(false);
+        vm.expectRevert(MyxVault.DividendDepositFailed.selector);
+        vault.harvest();
+        assertEq(dividend.totalDeposited(), 0);
+    }
 }
 ```
 
@@ -1127,12 +1141,13 @@ Expected: FAIL — `harvest` not defined.
         emit Harvested(usdtBalance, wbnbOut);
     }
 
-    /// @dev Task 0 verification point: assumed Dividend ABI is approve + deposit(uint256).
-    ///      If the verified ABI differs, change only this function and IDividendDistributor.
+    /// @dev Verified ABI (docs/phase0-findings.md): deposit() is approve+pull and returns
+    ///      false on failure WITHOUT reverting (e.g. totalShares == 0) — must be checked so
+    ///      a failed forward reverts the harvest and funds stay in the vault for retry.
     function _forwardToDividend(uint256 wbnbAmount) internal {
         address dividendAddr = IFlapTaxTokenV3(taxToken).dividendContract();
         IERC20(address(wbnb)).safeIncreaseAllowance(dividendAddr, wbnbAmount);
-        IDividendDistributor(dividendAddr).deposit(wbnbAmount);
+        if (!IDividendDistributor(dividendAddr).deposit(wbnbAmount)) revert DividendDepositFailed();
     }
 ```
 
@@ -1321,9 +1336,10 @@ Expected: FAIL.
     }
 
     /// @notice Per-holder claimable dividend, read from the token's Dividend contract.
-    /// @dev Task 0 verification point: assumed pending(address) view on the Dividend contract.
+    /// @dev Verified signature (docs/phase0-findings.md): withdrawableDividends(address).
+    ///      Holders claim via withdrawDividends() on the Dividend contract directly.
     function pendingReward(address user) external view returns (uint256) {
-        return IDividendDistributor(IFlapTaxTokenV3(taxToken).dividendContract()).pending(user);
+        return IDividendDistributor(IFlapTaxTokenV3(taxToken).dividendContract()).withdrawableDividends(user);
     }
 
     function description() public view override returns (string memory) {
