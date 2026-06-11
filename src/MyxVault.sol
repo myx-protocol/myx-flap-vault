@@ -40,10 +40,12 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
         address baseTokenUsdFeed; // address(0) when baseToken == WBNB
         uint16 maxSlippageBps;
         uint256 minProcessAmount;
+        uint32 maxPriceStaleness; // max seconds since a Chainlink feed update before it is rejected
     }
 
     bytes32 public constant EMERGENCY_ROLE = keccak256("EMERGENCY_ROLE");
     uint16 public constant BPS_DENOMINATOR = 10_000;
+    uint256 public constant SWAP_DEADLINE = 300; // seconds; bounds validator tx-holding window
 
     error CannotRevokeGuardianRole();
     error BelowMinimumProcessAmount(uint256 pending, uint256 minimum);
@@ -73,6 +75,7 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
     IAggregatorV3 public baseTokenUsdFeed;
     uint16 public maxSlippageBps;
     uint256 public minProcessAmount;
+    uint32 public maxPriceStaleness;
 
     uint256 public pendingBnb;
     uint256 public totalLpMinted;
@@ -104,6 +107,7 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
         baseTokenUsdFeed = IAggregatorV3(p.baseTokenUsdFeed);
         maxSlippageBps = p.maxSlippageBps;
         minProcessAmount = p.minProcessAmount;
+        maxPriceStaleness = p.maxPriceStaleness;
 
         address guardian = _getGuardian();
         _grantRole(DEFAULT_ADMIN_ROLE, guardian);
@@ -142,6 +146,9 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
         emit RevenueProcessed(amount, baseAmount, lpOut);
     }
 
+    /// @dev Uses a direct [WBNB, baseToken] PancakeV2 path. The factory MUST only admit base
+    ///      tokens that have a liquid direct WBNB pair; tokens routed via an intermediate would
+    ///      make the feed-derived minOut revert every call. Multi-hop path support is future work.
     /// @dev BNB → baseToken. WBNB base: pure wrap. Other bases: wrap then swap via PancakeV2.
     ///      minOut is derived from Chainlink feeds; slippage guard is never caller-supplied.
     function _toBaseToken(uint256 bnbAmount) internal returns (uint256 baseAmount) {
@@ -160,13 +167,15 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
         path[1] = baseToken;
         IERC20(address(wbnb)).safeIncreaseAllowance(address(swapRouter), bnbAmount);
         uint256[] memory amounts =
-            swapRouter.swapExactTokensForTokens(bnbAmount, minOut, path, address(this), block.timestamp);
+            swapRouter.swapExactTokensForTokens(bnbAmount, minOut, path, address(this), block.timestamp + SWAP_DEADLINE);
         baseAmount = amounts[amounts.length - 1];
     }
 
     function _readPrice(IAggregatorV3 feed) internal view returns (uint256) {
-        (, int256 answer,,,) = feed.latestRoundData();
+        (uint80 roundId, int256 answer,, uint256 updatedAt, uint80 answeredInRound) = feed.latestRoundData();
         if (answer <= 0) revert StalePrice(address(feed));
+        if (answeredInRound < roundId) revert StalePrice(address(feed));
+        if (block.timestamp - updatedAt > maxPriceStaleness) revert StalePrice(address(feed));
         return uint256(answer);
     }
 

@@ -64,6 +64,7 @@ contract MyxVaultTestBase is Test {
         p.usdtUsdFeed = address(usdtUsdFeed);
         p.maxSlippageBps = 300;          // 3%
         p.minProcessAmount = 0.1 ether;  // BNB
+        p.maxPriceStaleness = 3600; // 1 hour
     }
 }
 
@@ -261,6 +262,22 @@ contract MyxVaultProcessSwapTest is MyxVaultTestBase {
 
     function test_processRevenue_revertsOnStaleFeed() public {
         baseFeed.setAnswer(0);
+        _fund(1 ether);
+        vm.expectRevert(abi.encodeWithSelector(MyxVault.StalePrice.selector, address(baseFeed)));
+        swapVault.processRevenue();
+    }
+
+    function test_processRevenue_revertsOnStaleBnbFeed() public {
+        bnbUsdFeed.setAnswer(0);
+        _fund(1 ether);
+        vm.expectRevert(abi.encodeWithSelector(MyxVault.StalePrice.selector, address(bnbUsdFeed)));
+        swapVault.processRevenue();
+    }
+
+    function test_processRevenue_revertsOnOutdatedBaseFeed() public {
+        // base feed answer is positive but last update is older than maxPriceStaleness
+        baseFeed.setUpdatedAt(1); // far in the past relative to fork/test timestamp
+        vm.warp(100000);
         _fund(1 ether);
         vm.expectRevert(abi.encodeWithSelector(MyxVault.StalePrice.selector, address(baseFeed)));
         swapVault.processRevenue();

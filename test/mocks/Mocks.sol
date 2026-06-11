@@ -24,11 +24,14 @@ contract MockWBNB is ERC20 {
 contract MockAggregatorV3 {
     int256 public answer;
     uint8 public immutable decimals_;
+    uint256 public updatedAtOverride; // 0 => report block.timestamp (fresh)
     constructor(int256 _answer, uint8 _decimals) { answer = _answer; decimals_ = _decimals; }
     function setAnswer(int256 a) external { answer = a; }
+    function setUpdatedAt(uint256 t) external { updatedAtOverride = t; }
     function decimals() external view returns (uint8) { return decimals_; }
     function latestRoundData() external view returns (uint80, int256, uint256, uint256, uint80) {
-        return (1, answer, block.timestamp, block.timestamp, 1);
+        uint256 ts = updatedAtOverride == 0 ? block.timestamp : updatedAtOverride;
+        return (1, answer, ts, ts, 1);
     }
 }
 
