@@ -1481,7 +1481,8 @@ contract MyxVaultFactoryTest is Test {
                 bnbUsdFeed: address(bnbFeed),
                 usdtUsdFeed: address(usdtFeed),
                 maxSlippageBps: 300,
-                minProcessAmount: 0.1 ether
+                minProcessAmount: 0.1 ether,
+                maxPriceStaleness: 3600
             }),
             baseTokens,
             feeds
@@ -1513,7 +1514,7 @@ contract MyxVaultFactoryTest is Test {
                 marketId: marketId, poolManager: address(1), basePool: address(1),
                 swapRouter: address(1), wbnb: address(1), quoteToken: address(1),
                 bnbUsdFeed: address(1), usdtUsdFeed: address(1), baseTokenUsdFeed: address(1),
-                maxSlippageBps: 0, minProcessAmount: 0
+                maxSlippageBps: 0, minProcessAmount: 0, maxPriceStaleness: 0
             })
         );
     }
@@ -1587,6 +1588,7 @@ contract MyxVaultFactory is VaultFactoryBaseV2 {
         address usdtUsdFeed;
         uint16 maxSlippageBps;
         uint256 minProcessAmount;
+        uint32 maxPriceStaleness;
     }
 
     error UnsupportedBaseToken();
@@ -1653,7 +1655,8 @@ contract MyxVaultFactory is VaultFactoryBaseV2 {
                             usdtUsdFeed: c.usdtUsdFeed,
                             baseTokenUsdFeed: baseTokenFeeds[baseToken],
                             maxSlippageBps: c.maxSlippageBps,
-                            minProcessAmount: c.minProcessAmount
+                            minProcessAmount: c.minProcessAmount,
+                            maxPriceStaleness: c.maxPriceStaleness
                         })
                     )
                 )
@@ -1775,7 +1778,8 @@ contract MyxVaultForkTest is FlapBSCFixture {
                 bnbUsdFeed: BNB_USD_FEED,
                 usdtUsdFeed: USDT_USD_FEED,
                 maxSlippageBps: 300,
-                minProcessAmount: 0.01 ether
+                minProcessAmount: 0.01 ether,
+                maxPriceStaleness: 3600
             }),
             baseTokens,
             feeds
@@ -1891,7 +1895,8 @@ contract DeployMyxVaultFactory is Script {
                 bnbUsdFeed: vm.envAddress("BNB_USD_FEED"),
                 usdtUsdFeed: vm.envAddress("USDT_USD_FEED"),
                 maxSlippageBps: 300,
-                minProcessAmount: 0.01 ether
+                minProcessAmount: 0.01 ether,
+                maxPriceStaleness: 3600
             }),
             baseTokens,
             feeds
