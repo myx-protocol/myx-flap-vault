@@ -183,3 +183,37 @@ contract MyxVaultProcessWbnbTest is MyxVaultTestBase {
         assertEq(basePool.depositCallCount(), 1);
     }
 }
+
+contract MyxVaultAutoDeployPoolTest is MyxVaultTestBase {
+    function _fund(uint256 amount) internal {
+        vm.deal(address(this), amount);
+        (bool ok,) = address(vault).call{value: amount}("");
+        assertTrue(ok);
+    }
+
+    function test_processRevenue_deploysPoolWhenMissing() public {
+        // no setPool() — pool does not exist yet
+        _fund(1 ether);
+        vault.processRevenue();
+        assertEq(poolManager.deployPoolCallCount(), 1);
+        assertEq(basePool.depositCallCount(), 1);
+    }
+
+    function test_processRevenue_skipsDeployWhenPoolExists() public {
+        PoolMetadata memory meta;
+        meta.baseToken = address(wbnb);
+        meta.basePoolToken = address(lpToken);
+        poolManager.setPool(MyxPoolId.derive(marketId, address(wbnb)), meta);
+        _fund(1 ether);
+        vault.processRevenue();
+        assertEq(poolManager.deployPoolCallCount(), 0);
+    }
+
+    function test_processRevenue_marketMissing_revertsAndRetainsBnb() public {
+        poolManager.setMarketExists(false);
+        _fund(1 ether);
+        vm.expectRevert("MockPoolManager: market missing");
+        vault.processRevenue();
+        assertEq(vault.pendingBnb(), 1 ether); // safely retained for retry after governance creates market
+    }
+}
