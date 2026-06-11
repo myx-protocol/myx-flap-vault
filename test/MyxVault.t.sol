@@ -92,3 +92,32 @@ contract MyxVaultInitTest is MyxVaultTestBase {
         assertLt(used, 100_000); // gross call cost incl. CALL overhead — far below the 1M Rule-005 budget
     }
 }
+
+contract MyxVaultGuardianTest is MyxVaultTestBase {
+    function test_guardianHasEmergencyAndAdminRole() public view {
+        assertTrue(vault.hasRole(vault.EMERGENCY_ROLE(), GUARDIAN));
+        assertTrue(vault.hasRole(vault.DEFAULT_ADMIN_ROLE(), GUARDIAN));
+    }
+
+    function test_creatorHasEmergencyRole() public view {
+        assertTrue(vault.hasRole(vault.EMERGENCY_ROLE(), creator));
+    }
+
+    function test_revokeGuardianRole_reverts() public {
+        vm.prank(GUARDIAN); // even the admin itself cannot revoke the guardian
+        vm.expectRevert(MyxVault.CannotRevokeGuardianRole.selector);
+        vault.revokeRole(vault.EMERGENCY_ROLE(), GUARDIAN);
+    }
+
+    function test_guardianCanRevokeOthers() public {
+        vm.prank(GUARDIAN);
+        vault.revokeRole(vault.EMERGENCY_ROLE(), creator);
+        assertFalse(vault.hasRole(vault.EMERGENCY_ROLE(), creator));
+    }
+
+    function test_guardianCanRenounceItself() public {
+        vm.prank(GUARDIAN);
+        vault.renounceRole(vault.EMERGENCY_ROLE(), GUARDIAN);
+        assertFalse(vault.hasRole(vault.EMERGENCY_ROLE(), GUARDIAN));
+    }
+}
