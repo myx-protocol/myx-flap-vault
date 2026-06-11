@@ -370,3 +370,53 @@ contract MyxVaultProcessSwapTest is MyxVaultTestBase {
         swapVault.processRevenue();
     }
 }
+
+contract MyxVaultViewsTest is MyxVaultTestBase {
+    function setUp() public override {
+        super.setUp();
+        // Register the pool so userLpShare can discover basePoolToken == address(lpToken)
+        PoolMetadata memory meta;
+        meta.marketId = marketId;
+        meta.poolId = MyxPoolId.derive(marketId, address(wbnb));
+        meta.baseToken = address(wbnb);
+        meta.basePoolToken = address(lpToken);
+        poolManager.setPool(meta.poolId, meta);
+    }
+
+    function test_userLpShare_proRataByHolding() public {
+        lpToken.mint(address(vault), 100 ether);
+        address alice = makeAddr("alice");
+        address bob = makeAddr("bob");
+        // alice holds 30%, bob 70% of tax token supply
+        deal(address(taxToken), alice, 30 ether, true);
+        deal(address(taxToken), bob, 70 ether, true);
+        assertEq(vault.userLpShare(alice), 30 ether);
+        assertEq(vault.userLpShare(bob), 70 ether);
+    }
+
+    function test_userLpShare_zeroSupply() public {
+        lpToken.mint(address(vault), 100 ether);
+        assertEq(vault.userLpShare(makeAddr("nobody")), 0);
+    }
+
+    function test_pendingVaultRebates_passesThrough() public {
+        basePool.setRebate(42 ether);
+        (uint256 rebates,) = vault.pendingVaultRebates(1e18);
+        assertEq(rebates, 42 ether);
+    }
+
+    function test_pendingReward_wrapsDividendPending() public {
+        address alice = makeAddr("alice");
+        dividend.setPending(alice, 5 ether);
+        assertEq(vault.pendingReward(alice), 5 ether);
+    }
+
+    function test_description_nonEmpty() public view {
+        assertGt(bytes(vault.description()).length, 20);
+    }
+
+    function test_vaultUISchema_describesMethods() public view {
+        assertEq(vault.vaultUISchema().vaultType, "MyxVault");
+        assertGt(vault.vaultUISchema().methods.length, 0);
+    }
+}

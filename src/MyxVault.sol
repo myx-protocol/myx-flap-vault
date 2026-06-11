@@ -2,7 +2,7 @@
 pragma solidity ^0.8.26;
 
 import {VaultBaseV2} from "./flap/VaultBaseV2.sol";
-import {VaultUISchema} from "./flap/IVaultSchemasV1.sol";
+import {VaultUISchema, VaultMethodSchema, FieldDescriptor} from "./flap/IVaultSchemasV1.sol";
 import {Initializable} from "@openzeppelin-contracts-upgradeable/proxy/utils/Initializable.sol";
 import {AccessControlUpgradeable} from "@openzeppelin-contracts-upgradeable/access/AccessControlUpgradeable.sol";
 import {ReentrancyGuardUpgradeable} from "@openzeppelin-contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
@@ -14,6 +14,7 @@ import {IWBNB} from "./dex/IWBNB.sol";
 import {IAggregatorV3} from "./oracle/IAggregatorV3.sol";
 import {IDividendDistributor} from "./dividend/IDividendDistributor.sol";
 import {IFlapTaxTokenV3} from "./flap/IFlapTaxTokenV3.sol";
+import {Strings} from "@openzeppelin/utils/Strings.sol";
 
 /// @title MyxVault
 /// @notice Flap vault that deposits tax revenue as MYX base-pool liquidity (LP held by
@@ -254,12 +255,72 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
         emit EmergencySwept(amount, to);
     }
 
-    // ── implemented in later tasks ──
-    function description() public view virtual override returns (string memory) {
-        return "MyxVault";
+    /// @notice Notional LP share for a tax-token holder: vaultLp * holderBalance / totalSupply.
+    function userLpShare(address user) external view returns (uint256) {
+        uint256 supply = IERC20(taxToken).totalSupply();
+        if (supply == 0) return 0;
+        address lpToken = poolManager.getPool(poolId).basePoolToken;
+        if (lpToken == address(0)) return 0;
+        uint256 vaultLp = IERC20(lpToken).balanceOf(address(this));
+        return (vaultLp * IERC20(taxToken).balanceOf(user)) / supply;
     }
 
-    function vaultUISchema() public pure virtual override returns (VaultUISchema memory schema) {
+    /// @notice Vault-level claimable rebates from the MYX base pool.
+    /// @param price MYX oracle price input required by pendingUserRebates upstream.
+    function pendingVaultRebates(uint256 price) external view returns (uint256 rebates, uint256 genesisRebates) {
+        return basePool.pendingUserRebates(poolId, address(this), price);
+    }
+
+    /// @notice Per-holder claimable dividend, read from the token's Dividend contract.
+    /// @dev Verified signature (docs/phase0-findings.md): withdrawableDividends(address).
+    ///      Holders claim via withdrawDividends() on the Dividend contract directly.
+    function pendingReward(address user) external view returns (uint256) {
+        return IDividendDistributor(IFlapTaxTokenV3(taxToken).dividendContract()).withdrawableDividends(user);
+    }
+
+    function description() public view override returns (string memory) {
+        return string.concat(
+            "MYX liquidity vault: converts tax revenue into MYX base-pool LP held by this vault (",
+            Strings.toString(totalLpMinted),
+            " LP minted) and forwards harvested rebates to the token's dividend contract (",
+            Strings.toString(totalRewardsForwarded),
+            " WBNB forwarded). Pending BNB: ",
+            Strings.toString(pendingBnb),
+            ". processRevenue() and harvest() are permissionless."
+        );
+    }
+
+    function vaultUISchema() public pure override returns (VaultUISchema memory schema) {
         schema.vaultType = "MyxVault";
+        schema.description =
+            "Tax revenue becomes MYX base-pool liquidity; LP rewards flow back to holders via the dividend contract.";
+        schema.methods = new VaultMethodSchema[](5);
+
+        schema.methods[0].name = "userLpShare";
+        schema.methods[0].description = "Notional LP share for a holder, pro-rata to token balance.";
+        schema.methods[0].inputs = new FieldDescriptor[](1);
+        schema.methods[0].inputs[0] = FieldDescriptor("user", "address", "Holder address", 0);
+        schema.methods[0].outputs = new FieldDescriptor[](1);
+        schema.methods[0].outputs[0] = FieldDescriptor("share", "uint256", "Notional LP amount", 18);
+
+        schema.methods[1].name = "pendingBnb";
+        schema.methods[1].description = "Tax revenue awaiting processing.";
+        schema.methods[1].outputs = new FieldDescriptor[](1);
+        schema.methods[1].outputs[0] = FieldDescriptor("amount", "uint256", "BNB amount", 18);
+
+        schema.methods[2].name = "processRevenue";
+        schema.methods[2].description = "Convert pending BNB into MYX base-pool liquidity. Anyone can call.";
+        schema.methods[2].isWriteMethod = true;
+
+        schema.methods[3].name = "harvest";
+        schema.methods[3].description = "Claim LP rebates and forward them to the dividend contract. Anyone can call.";
+        schema.methods[3].isWriteMethod = true;
+
+        schema.methods[4].name = "pendingReward";
+        schema.methods[4].description = "Claimable dividend for a holder (claim on the token's dividend contract).";
+        schema.methods[4].inputs = new FieldDescriptor[](1);
+        schema.methods[4].inputs[0] = FieldDescriptor("user", "address", "Holder address", 0);
+        schema.methods[4].outputs = new FieldDescriptor[](1);
+        schema.methods[4].outputs[0] = FieldDescriptor("amount", "uint256", "Claimable WBNB amount", 18);
     }
 }
