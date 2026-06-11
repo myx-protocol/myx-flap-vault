@@ -704,21 +704,24 @@ contract MyxVaultGuardianTest is MyxVaultTestBase {
     }
 
     function test_revokeGuardianRole_reverts() public {
+        bytes32 role = vault.EMERGENCY_ROLE();
         vm.prank(GUARDIAN); // even the admin itself cannot revoke the guardian
         vm.expectRevert(MyxVault.CannotRevokeGuardianRole.selector);
-        vault.revokeRole(vault.EMERGENCY_ROLE(), GUARDIAN);
+        vault.revokeRole(role, GUARDIAN);
     }
 
     function test_guardianCanRevokeOthers() public {
+        bytes32 role = vault.EMERGENCY_ROLE();
         vm.prank(GUARDIAN);
-        vault.revokeRole(vault.EMERGENCY_ROLE(), creator);
-        assertFalse(vault.hasRole(vault.EMERGENCY_ROLE(), creator));
+        vault.revokeRole(role, creator);
+        assertFalse(vault.hasRole(role, creator));
     }
 
     function test_guardianCanRenounceItself() public {
+        bytes32 role = vault.EMERGENCY_ROLE();
         vm.prank(GUARDIAN);
-        vault.renounceRole(vault.EMERGENCY_ROLE(), GUARDIAN);
-        assertFalse(vault.hasRole(vault.EMERGENCY_ROLE(), GUARDIAN));
+        vault.renounceRole(role, GUARDIAN);
+        assertFalse(vault.hasRole(role, GUARDIAN));
     }
 }
 ```
