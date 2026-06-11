@@ -3,7 +3,7 @@ pragma solidity ^0.8.26;
 
 import {Test} from "forge-std/Test.sol";
 import {MyxVault} from "../src/MyxVault.sol";
-import {MarketId, PoolId, MyxPoolId} from "../src/myx/IMyxPool.sol";
+import {MarketId, PoolId, MyxPoolId, IMyxBasePool, PoolMetadata} from "../src/myx/IMyxPool.sol";
 import {ERC1967Proxy} from "@openzeppelin/proxy/ERC1967/ERC1967Proxy.sol";
 import "./mocks/Mocks.sol";
 
@@ -122,5 +122,64 @@ contract MyxVaultGuardianTest is MyxVaultTestBase {
         vm.prank(GUARDIAN);
         vault.renounceRole(role, GUARDIAN);
         assertFalse(vault.hasRole(role, GUARDIAN));
+    }
+}
+
+contract MyxVaultProcessWbnbTest is MyxVaultTestBase {
+    function setUp() public override {
+        super.setUp();
+        // register the WBNB pool as already existing
+        PoolMetadata memory meta;
+        meta.marketId = marketId;
+        meta.poolId = MyxPoolId.derive(marketId, address(wbnb));
+        meta.baseToken = address(wbnb);
+        meta.basePoolToken = address(lpToken);
+        poolManager.setPool(meta.poolId, meta);
+    }
+
+    function _fund(uint256 amount) internal {
+        vm.deal(address(this), amount);
+        (bool ok,) = address(vault).call{value: amount}("");
+        assertTrue(ok);
+    }
+
+    function test_processRevenue_wrapsAndDeposits() public {
+        _fund(1 ether);
+        vault.processRevenue();
+        assertEq(vault.pendingBnb(), 0);
+        assertEq(basePool.depositCallCount(), 1);
+        assertEq(basePool.lastDepositAmount(), 1 ether);
+        assertEq(basePool.lastDepositRecipient(), address(vault)); // LP held by vault
+        assertEq(lpToken.balanceOf(address(vault)), 1 ether);
+        assertEq(vault.totalLpMinted(), 1 ether);
+    }
+
+    function test_processRevenue_revertsBelowMinimum() public {
+        _fund(0.05 ether); // below 0.1 ether minProcessAmount
+        vm.expectRevert(
+            abi.encodeWithSelector(MyxVault.BelowMinimumProcessAmount.selector, 0.05 ether, 0.1 ether)
+        );
+        vault.processRevenue();
+    }
+
+    function test_processRevenue_failedDepositLeavesBnbPending() public {
+        _fund(1 ether);
+        vm.mockCallRevert(
+            address(basePool),
+            abi.encodeWithSelector(IMyxBasePool.deposit.selector),
+            "POOL_PAUSED"
+        );
+        vm.expectRevert();
+        vault.processRevenue();
+        // state rolled back: BNB safely retained for retry
+        assertEq(vault.pendingBnb(), 1 ether);
+        assertEq(address(vault).balance, 1 ether);
+    }
+
+    function test_processRevenue_callableByAnyone() public {
+        _fund(1 ether);
+        vm.prank(makeAddr("randomCaller"));
+        vault.processRevenue();
+        assertEq(basePool.depositCallCount(), 1);
     }
 }

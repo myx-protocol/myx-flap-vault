@@ -123,6 +123,42 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
         super.revokeRole(role, account);
     }
 
+    /// @notice Converts accumulated BNB into base-pool liquidity. Permissionless by design;
+    ///         MEV protection comes from internally computed swap minOut (never caller input).
+    function processRevenue() external nonReentrant {
+        uint256 amount = pendingBnb;
+        if (amount < minProcessAmount) revert BelowMinimumProcessAmount(amount, minProcessAmount);
+        pendingBnb = 0;
+
+        uint256 baseAmount = _toBaseToken(amount);
+        _ensurePoolExists();
+
+        IERC20(baseToken).safeIncreaseAllowance(address(basePool), baseAmount);
+        // minAmountOut = 0: LP mint is oracle-priced upstream (no AMM spot to sandwich);
+        // the swap leg in _toBaseToken carries the slippage protection.
+        uint256 lpOut = basePool.deposit(poolId, baseAmount, 0, address(this), address(this));
+        totalLpMinted += lpOut;
+
+        emit RevenueProcessed(amount, baseAmount, lpOut);
+    }
+
+    /// @dev BNB → baseToken. WBNB base: pure wrap. Other bases: wrap then swap (later task).
+    function _toBaseToken(uint256 bnbAmount) internal returns (uint256 baseAmount) {
+        wbnb.deposit{value: bnbAmount}();
+        if (baseToken == address(wbnb)) {
+            return bnbAmount;
+        }
+        revert("SWAP_PATH_NOT_IMPLEMENTED"); // replaced in a later task
+    }
+
+    function _ensurePoolExists() internal {
+        PoolMetadata memory pool = poolManager.getPool(poolId);
+        if (pool.basePoolToken == address(0) && pool.baseToken == address(0)) {
+            poolManager.deployPool(IMyxPoolManager.DeployPoolParams({marketId: marketId, baseToken: baseToken}));
+            emit PoolDeployed(poolId);
+        }
+    }
+
     // ── implemented in later tasks ──
     function description() public view virtual override returns (string memory) {
         return "MyxVault";
