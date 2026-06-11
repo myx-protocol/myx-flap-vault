@@ -235,6 +235,25 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
         if (!IDividendDistributor(dividendAddr).deposit(wbnbAmount)) revert DividendDepositFailed();
     }
 
+    /// @notice Redeems vault-held LP back to quote token, sent to `to`. Disaster recovery only.
+    function emergencyWithdraw(uint256 lpAmount, uint256 minAmountOut, address to)
+        external
+        nonReentrant
+        onlyRole(EMERGENCY_ROLE)
+    {
+        (uint256 amountOut,) = basePool.withdraw(poolId, lpAmount, minAmountOut, address(this), to);
+        emit EmergencyWithdrawal(lpAmount, amountOut, to);
+    }
+
+    /// @notice Sweeps stuck native BNB. Disaster recovery only (e.g. processRevenue permanently broken).
+    function emergencySweepBnb(address to) external nonReentrant onlyRole(EMERGENCY_ROLE) {
+        uint256 amount = address(this).balance;
+        pendingBnb = 0;
+        (bool ok,) = to.call{value: amount}("");
+        require(ok, "BNB_SWEEP_FAILED");
+        emit EmergencySwept(amount, to);
+    }
+
     // ── implemented in later tasks ──
     function description() public view virtual override returns (string memory) {
         return "MyxVault";

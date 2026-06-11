@@ -279,6 +279,37 @@ contract MyxVaultHarvestTest is MyxVaultTestBase {
     }
 }
 
+contract MyxVaultEmergencyTest is MyxVaultTestBase {
+    function test_emergencyWithdraw_redeemsLpToRecipient() public {
+        lpToken.mint(address(vault), 10 ether); // simulate held LP
+        address rescue = makeAddr("rescue");
+        vm.prank(GUARDIAN);
+        vault.emergencyWithdraw(10 ether, 0, rescue);
+        assertEq(usdt.balanceOf(rescue), 10 ether); // MockBasePool pays quote 1:1
+    }
+
+    function test_emergencyWithdraw_creatorAllowed() public {
+        lpToken.mint(address(vault), 1 ether);
+        vm.prank(creator);
+        vault.emergencyWithdraw(1 ether, 0, creator);
+    }
+
+    function test_emergencyWithdraw_strangerReverts() public {
+        vm.prank(makeAddr("stranger"));
+        vm.expectRevert(); // AccessControl revert
+        vault.emergencyWithdraw(1 ether, 0, makeAddr("stranger"));
+    }
+
+    function test_emergencySweepBnb() public {
+        vm.deal(address(vault), 2 ether);
+        address rescue = makeAddr("rescue");
+        vm.prank(GUARDIAN);
+        vault.emergencySweepBnb(rescue);
+        assertEq(rescue.balance, 2 ether);
+        assertEq(vault.pendingBnb(), 0);
+    }
+}
+
 contract MyxVaultProcessSwapTest is MyxVaultTestBase {
     MockAggregatorV3 baseFeed;
     MyxVault swapVault;
