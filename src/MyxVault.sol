@@ -13,6 +13,7 @@ import {IPancakeRouterV2} from "./dex/IPancakeRouterV2.sol";
 import {IWBNB} from "./dex/IWBNB.sol";
 import {IAggregatorV3} from "./oracle/IAggregatorV3.sol";
 import {IDividendDistributor} from "./dividend/IDividendDistributor.sol";
+import {IFlapTaxTokenV3} from "./flap/IFlapTaxTokenV3.sol";
 
 /// @title MyxVault
 /// @notice Flap vault that deposits tax revenue as MYX base-pool liquidity (LP held by
@@ -187,6 +188,41 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
             poolManager.deployPool(IMyxPoolManager.DeployPoolParams({marketId: marketId, baseToken: baseToken}));
             emit PoolDeployed(poolId);
         }
+    }
+
+    /// @notice Claims accumulated LP rebates and forwards them to the token's native
+    ///         Dividend contract as WBNB. Permissionless; minOut is feed-priced internally.
+    function harvest() external nonReentrant {
+        basePool.claimUserRebate(poolId, address(this), address(this));
+        uint256 usdtBalance = quoteToken.balanceOf(address(this));
+        if (usdtBalance == 0) return;
+
+        // fair WBNB out = usdt * (USDT/USD) / (BNB/USD); both feeds 8 dec, tokens 18 dec
+        uint256 usdtUsd = _readPrice(usdtUsdFeed);
+        uint256 bnbUsd = _readPrice(bnbUsdFeed);
+        uint256 fairOut = (usdtBalance * usdtUsd) / bnbUsd;
+        uint256 minOut = (fairOut * (BPS_DENOMINATOR - maxSlippageBps)) / BPS_DENOMINATOR;
+
+        address[] memory path = new address[](2);
+        path[0] = address(quoteToken);
+        path[1] = address(wbnb);
+        quoteToken.safeIncreaseAllowance(address(swapRouter), usdtBalance);
+        uint256[] memory amounts =
+            swapRouter.swapExactTokensForTokens(usdtBalance, minOut, path, address(this), block.timestamp + SWAP_DEADLINE);
+        uint256 wbnbOut = amounts[amounts.length - 1];
+
+        _forwardToDividend(wbnbOut);
+        totalRewardsForwarded += wbnbOut;
+        emit Harvested(usdtBalance, wbnbOut);
+    }
+
+    /// @dev Verified ABI (docs/phase0-findings.md): deposit() is approve+pull and returns
+    ///      false on failure WITHOUT reverting (e.g. totalShares == 0) — must be checked so
+    ///      a failed forward reverts the harvest and funds stay in the vault for retry.
+    function _forwardToDividend(uint256 wbnbAmount) internal {
+        address dividendAddr = IFlapTaxTokenV3(taxToken).dividendContract();
+        IERC20(address(wbnb)).safeIncreaseAllowance(dividendAddr, wbnbAmount);
+        if (!IDividendDistributor(dividendAddr).deposit(wbnbAmount)) revert DividendDepositFailed();
     }
 
     // ── implemented in later tasks ──

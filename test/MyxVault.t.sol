@@ -223,6 +223,46 @@ contract MyxVaultAutoDeployPoolTest is MyxVaultTestBase {
     }
 }
 
+contract MyxVaultHarvestTest is MyxVaultTestBase {
+    function setUp() public override {
+        super.setUp();
+        // USDT → WBNB at fair rate: 600 USDT = 1 WBNB → num=1, den=600
+        router.setRate(1, 600);
+    }
+
+    function test_harvest_claimsSwapsAndForwards() public {
+        basePool.setRebate(600 ether); // 600 USDT pending
+        vault.harvest();
+        // 600 USDT → 1 WBNB → forwarded to dividend
+        assertEq(dividend.totalDeposited(), 1 ether);
+        assertEq(vault.totalRewardsForwarded(), 1 ether);
+        assertEq(usdt.balanceOf(address(vault)), 0);
+    }
+
+    function test_harvest_noRebate_noop() public {
+        vault.harvest();
+        assertEq(dividend.totalDeposited(), 0);
+    }
+
+    function test_harvest_badSwapRate_revertsAndRetainsUsdt() public {
+        basePool.setRebate(600 ether);
+        router.setRate(1, 1200); // router pays half of fair → below 3% bound
+        vm.expectRevert("MockRouter: INSUFFICIENT_OUTPUT_AMOUNT");
+        vault.harvest();
+        // claim happened inside the reverted tx, so nothing left the vault overall
+        assertEq(dividend.totalDeposited(), 0);
+    }
+
+    function test_harvest_dividendDepositFalse_reverts() public {
+        // real Dividend contract returns false instead of reverting (e.g. totalShares == 0)
+        basePool.setRebate(600 ether);
+        dividend.setDepositSucceeds(false);
+        vm.expectRevert(MyxVault.DividendDepositFailed.selector);
+        vault.harvest();
+        assertEq(dividend.totalDeposited(), 0);
+    }
+}
+
 contract MyxVaultProcessSwapTest is MyxVaultTestBase {
     MockAggregatorV3 baseFeed;
     MyxVault swapVault;

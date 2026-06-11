@@ -18,6 +18,8 @@ contract MockWBNB is ERC20 {
         (bool ok,) = msg.sender.call{value: wad}("");
         require(ok, "MockWBNB: send failed");
     }
+    /// @dev Required so MockPancakeRouter can mint WBNB as a swap output token.
+    function mint(address to, uint256 amount) external { _mint(to, amount); }
     receive() external payable { _mint(msg.sender, msg.value); }
 }
 
