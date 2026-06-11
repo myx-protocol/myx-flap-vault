@@ -1118,10 +1118,15 @@ Expected: FAIL — `harvest` not defined.
 - [ ] **Step 3: Implement (append to MyxVault)**
 
 ```solidity
+    error ZeroDividendContract();
+
     /// @notice Claims accumulated LP rebates and forwards them to the token's native
     ///         Dividend contract as WBNB. Permissionless; minOut is feed-priced internally.
     function harvest() external nonReentrant {
         basePool.claimUserRebate(poolId, address(this), address(this));
+        // Use the full USDT balance (not just this claim's return value) so any dust left by a
+        // prior dust-skipped harvest is swept once it becomes economic. The only USDT path into
+        // this vault is rebate claims; forwarding it to holders is the vault's purpose.
         uint256 usdtBalance = quoteToken.balanceOf(address(this));
         if (usdtBalance == 0) return;
 
@@ -1129,6 +1134,9 @@ Expected: FAIL — `harvest` not defined.
         uint256 usdtUsd = _readPrice(usdtUsdFeed);
         uint256 bnbUsd = _readPrice(bnbUsdFeed);
         uint256 fairOut = (usdtBalance * usdtUsd) / bnbUsd;
+        // dust below 1 wei WBNB-equivalent would yield minOut == 0 (no slippage floor);
+        // retain it in the vault until the next harvest accumulates an economic amount.
+        if (fairOut == 0) return;
         uint256 minOut = (fairOut * (BPS_DENOMINATOR - maxSlippageBps)) / BPS_DENOMINATOR;
 
         address[] memory path = new address[](2);
@@ -1148,7 +1156,10 @@ Expected: FAIL — `harvest` not defined.
     ///      false on failure WITHOUT reverting (e.g. totalShares == 0) — must be checked so
     ///      a failed forward reverts the harvest and funds stay in the vault for retry.
     function _forwardToDividend(uint256 wbnbAmount) internal {
+        // Resolved live (not cached): the taxToken does not exist at initialize() time
+        // (CREATE2 predicted address), so its dividendContract() cannot be read then.
         address dividendAddr = IFlapTaxTokenV3(taxToken).dividendContract();
+        if (dividendAddr == address(0)) revert ZeroDividendContract();
         IERC20(address(wbnb)).safeIncreaseAllowance(dividendAddr, wbnbAmount);
         if (!IDividendDistributor(dividendAddr).deposit(wbnbAmount)) revert DividendDepositFailed();
     }

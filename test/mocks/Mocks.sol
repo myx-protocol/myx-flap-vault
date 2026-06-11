@@ -75,6 +75,7 @@ contract MockDividendDistributor {
 contract MockTaxToken is ERC20 {
     address public dividendContract;
     constructor(address _dividend) ERC20("Mock Tax Token", "MTT") { dividendContract = _dividend; }
+    function setDividendContract(address d) external { dividendContract = d; }
 }
 
 /// @dev Mints LP 1:1 for deposits; pays rebates in quote token; tracks calls for assertions.

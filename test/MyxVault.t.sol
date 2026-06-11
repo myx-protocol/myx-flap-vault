@@ -237,6 +237,7 @@ contract MyxVaultHarvestTest is MyxVaultTestBase {
         assertEq(dividend.totalDeposited(), 1 ether);
         assertEq(vault.totalRewardsForwarded(), 1 ether);
         assertEq(usdt.balanceOf(address(vault)), 0);
+        assertEq(vault.totalRewardsForwarded(), dividend.totalDeposited());
     }
 
     function test_harvest_noRebate_noop() public {
@@ -260,6 +261,21 @@ contract MyxVaultHarvestTest is MyxVaultTestBase {
         vm.expectRevert(MyxVault.DividendDepositFailed.selector);
         vault.harvest();
         assertEq(dividend.totalDeposited(), 0);
+    }
+
+    function test_harvest_dustRebate_retainedNotForwarded() public {
+        // 500 wei USDT @ $1, BNB @ $600 → fairOut = 500*1e8/600e8 = 0 → skip, retain
+        basePool.setRebate(500);
+        vault.harvest();
+        assertEq(dividend.totalDeposited(), 0);
+        assertEq(usdt.balanceOf(address(vault)), 500); // dust stays for next harvest
+    }
+
+    function test_harvest_zeroDividendContract_reverts() public {
+        basePool.setRebate(600 ether);
+        taxToken.setDividendContract(address(0));
+        vm.expectRevert(MyxVault.ZeroDividendContract.selector);
+        vault.harvest();
     }
 }
 
