@@ -89,6 +89,6 @@ contract MyxVaultInitTest is MyxVaultTestBase {
         (bool ok,) = address(vault).call{value: 1 ether}("");
         uint256 used = gasBefore - gasleft();
         assertTrue(ok);
-        assertLt(used, 100_000); // far below the 1M Rule-005 budget
+        assertLt(used, 100_000); // gross call cost incl. CALL overhead — far below the 1M Rule-005 budget
     }
 }

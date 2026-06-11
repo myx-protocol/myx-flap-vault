@@ -20,7 +20,8 @@ import {IDividendDistributor} from "./dividend/IDividendDistributor.sol";
 /// @dev Invariants:
 ///      - receive() performs accounting only (Flap Rule 005), never external calls.
 ///      - All swap minOut values are derived from Chainlink feeds inside the contract.
-///      - Guardian retains irrevocable EMERGENCY_ROLE (Flap mandate).
+///      - Guardian roles cannot be revoked by any other account; only the guardian
+///        itself may voluntarily renounce (Flap mandate).
 contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, ReentrancyGuardUpgradeable {
     using SafeERC20 for IERC20;
 
@@ -76,6 +77,9 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
     uint256 public pendingBnb;
     uint256 public totalLpMinted;
     uint256 public totalRewardsForwarded;
+
+    /// @dev Reserved storage to allow inserting parent mixins or new variables in upgrades.
+    uint256[35] private __gap;
 
     constructor() {
         _disableInitializers();
