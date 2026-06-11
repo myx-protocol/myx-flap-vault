@@ -3,6 +3,7 @@ pragma solidity ^0.8.26;
 
 import {ERC20} from "@openzeppelin/token/ERC20/ERC20.sol";
 import {IERC20} from "@openzeppelin/token/ERC20/IERC20.sol";
+import {IMyxBasePool, IMyxPoolManager, PoolMetadata, PoolId, MarketId} from "../../src/myx/IMyxPool.sol";
 
 contract MockERC20 is ERC20 {
     constructor(string memory n, string memory s) ERC20(n, s) {}
@@ -69,4 +70,79 @@ contract MockDividendDistributor {
 contract MockTaxToken is ERC20 {
     address public dividendContract;
     constructor(address _dividend) ERC20("Mock Tax Token", "MTT") { dividendContract = _dividend; }
+}
+
+/// @dev Mints LP 1:1 for deposits; pays rebates in quote token; tracks calls for assertions.
+contract MockBasePool is IMyxBasePool {
+    MockERC20 public immutable lpToken;
+    MockERC20 public immutable quoteToken;
+    uint256 public rebateToPay;
+    uint256 public depositCallCount;
+    uint256 public lastDepositAmount;
+    address public lastDepositRecipient;
+
+    constructor(MockERC20 _lp, MockERC20 _quote) {
+        lpToken = _lp;
+        quoteToken = _quote;
+    }
+
+    function setRebate(uint256 amount) external { rebateToPay = amount; }
+
+    function deposit(PoolId, uint256 amountIn, uint256 minAmountOut, address, address recipient)
+        external
+        returns (uint256 amountOut)
+    {
+        // pull base token like the real pool does (token address not tracked; tests pre-fund)
+        amountOut = amountIn; // 1:1 LP
+        require(amountOut >= minAmountOut, "MockBasePool: slippage");
+        depositCallCount += 1;
+        lastDepositAmount = amountIn;
+        lastDepositRecipient = recipient;
+        lpToken.mint(recipient, amountOut);
+    }
+
+    function withdraw(PoolId, uint256 amountIn, uint256 minAmountOut, address, address recipient)
+        external
+        returns (uint256 amountOut, uint256 rebateOut)
+    {
+        amountOut = amountIn; // 1:1 back
+        require(amountOut >= minAmountOut, "MockBasePool: slippage");
+        quoteToken.mint(recipient, amountOut);
+        rebateOut = 0;
+    }
+
+    function claimUserRebate(PoolId, address, address recipient) external returns (uint256 rebateOut) {
+        rebateOut = rebateToPay;
+        rebateToPay = 0;
+        if (rebateOut > 0) quoteToken.mint(recipient, rebateOut);
+    }
+
+    function pendingUserRebates(PoolId, address, uint256) external view returns (uint256, uint256) {
+        return (rebateToPay, 0);
+    }
+}
+
+contract MockPoolManager is IMyxPoolManager {
+    mapping(bytes32 => PoolMetadata) internal pools;
+    uint256 public deployPoolCallCount;
+    bool public marketExists = true;
+
+    function setMarketExists(bool v) external { marketExists = v; }
+
+    function setPool(PoolId poolId, PoolMetadata memory meta) external { pools[PoolId.unwrap(poolId)] = meta; }
+
+    function deployPool(DeployPoolParams calldata params) external {
+        require(marketExists, "MockPoolManager: market missing");
+        deployPoolCallCount += 1;
+        bytes32 id = keccak256(abi.encode(params.marketId, params.baseToken));
+        PoolMetadata memory meta;
+        meta.marketId = params.marketId;
+        meta.poolId = PoolId.wrap(id);
+        meta.baseToken = params.baseToken;
+        pools[id] = meta;
+    }
+
+    function getPool(PoolId poolId) external view returns (PoolMetadata memory) {
+        return pools[PoolId.unwrap(poolId)];
+    }
 }
