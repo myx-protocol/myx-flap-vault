@@ -142,13 +142,32 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
         emit RevenueProcessed(amount, baseAmount, lpOut);
     }
 
-    /// @dev BNB → baseToken. WBNB base: pure wrap. Other bases: wrap then swap (later task).
+    /// @dev BNB → baseToken. WBNB base: pure wrap. Other bases: wrap then swap via PancakeV2.
+    ///      minOut is derived from Chainlink feeds; slippage guard is never caller-supplied.
     function _toBaseToken(uint256 bnbAmount) internal returns (uint256 baseAmount) {
         wbnb.deposit{value: bnbAmount}();
         if (baseToken == address(wbnb)) {
             return bnbAmount;
         }
-        revert("SWAP_PATH_NOT_IMPLEMENTED"); // replaced in a later task
+        // fair amount from feeds: base = bnbAmount * (BNB/USD) / (BASE/USD); both feeds 8 dec, tokens 18 dec
+        uint256 bnbUsd = _readPrice(bnbUsdFeed);
+        uint256 baseUsd = _readPrice(baseTokenUsdFeed);
+        uint256 fairOut = (bnbAmount * bnbUsd) / baseUsd;
+        uint256 minOut = (fairOut * (BPS_DENOMINATOR - maxSlippageBps)) / BPS_DENOMINATOR;
+
+        address[] memory path = new address[](2);
+        path[0] = address(wbnb);
+        path[1] = baseToken;
+        IERC20(address(wbnb)).safeIncreaseAllowance(address(swapRouter), bnbAmount);
+        uint256[] memory amounts =
+            swapRouter.swapExactTokensForTokens(bnbAmount, minOut, path, address(this), block.timestamp);
+        baseAmount = amounts[amounts.length - 1];
+    }
+
+    function _readPrice(IAggregatorV3 feed) internal view returns (uint256) {
+        (, int256 answer,,,) = feed.latestRoundData();
+        if (answer <= 0) revert StalePrice(address(feed));
+        return uint256(answer);
     }
 
     function _ensurePoolExists() internal {

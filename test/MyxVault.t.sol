@@ -40,10 +40,14 @@ contract MyxVaultTestBase is Test {
         dividend = new MockDividendDistributor(address(wbnb));
         taxToken = new MockTaxToken(address(dividend));
 
+        vault = _deployVault(_initParams(address(wbnb)));
+    }
+
+    function _deployVault(MyxVault.InitParams memory p) internal returns (MyxVault) {
         MyxVault impl = new MyxVault();
-        bytes memory initData = abi.encodeCall(MyxVault.initialize, (_initParams(address(wbnb))));
+        bytes memory initData = abi.encodeCall(MyxVault.initialize, (p));
         ERC1967Proxy proxy = new ERC1967Proxy(address(impl), initData);
-        vault = MyxVault(payable(address(proxy)));
+        return MyxVault(payable(address(proxy)));
     }
 
     function _initParams(address base) internal view returns (MyxVault.InitParams memory p) {
@@ -215,5 +219,50 @@ contract MyxVaultAutoDeployPoolTest is MyxVaultTestBase {
         vm.expectRevert("MockPoolManager: market missing");
         vault.processRevenue();
         assertEq(vault.pendingBnb(), 1 ether); // safely retained for retry after governance creates market
+    }
+}
+
+contract MyxVaultProcessSwapTest is MyxVaultTestBase {
+    MockAggregatorV3 baseFeed;
+    MyxVault swapVault;
+
+    function setUp() public override {
+        super.setUp();
+        baseFeed = new MockAggregatorV3(60_000e8, 8); // base = $60k (BTC-like)
+        MyxVault.InitParams memory p = _initParams(address(baseToken));
+        p.baseTokenUsdFeed = address(baseFeed);
+        swapVault = _deployVault(p);
+        // mock router rate: 1 WBNB ($600) = 0.01 base ($60k) → num=1, den=100
+        router.setRate(1, 100);
+    }
+
+    function _fund(uint256 amount) internal {
+        vm.deal(address(this), amount);
+        (bool ok,) = address(swapVault).call{value: amount}("");
+        assertTrue(ok);
+    }
+
+    function test_processRevenue_swapsToBaseThenDeposits() public {
+        _fund(1 ether);
+        swapVault.processRevenue();
+        // 1 BNB → 0.01 base at fair rate; deposited into pool
+        assertEq(basePool.lastDepositAmount(), 0.01 ether);
+        assertEq(swapVault.pendingBnb(), 0);
+    }
+
+    function test_processRevenue_revertsWhenSwapWorseThanSlippageBound() public {
+        // fair = 0.01 base/BNB; bound = 0.0097 (3%); router pays only 0.005 → must revert
+        router.setRate(1, 200);
+        _fund(1 ether);
+        vm.expectRevert("MockRouter: INSUFFICIENT_OUTPUT_AMOUNT");
+        swapVault.processRevenue();
+        assertEq(swapVault.pendingBnb(), 1 ether); // retained for retry
+    }
+
+    function test_processRevenue_revertsOnStaleFeed() public {
+        baseFeed.setAnswer(0);
+        _fund(1 ether);
+        vm.expectRevert(abi.encodeWithSelector(MyxVault.StalePrice.selector, address(baseFeed)));
+        swapVault.processRevenue();
     }
 }
