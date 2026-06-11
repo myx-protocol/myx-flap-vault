@@ -139,6 +139,7 @@ contract MockPoolManager is IMyxPoolManager {
         meta.marketId = params.marketId;
         meta.poolId = PoolId.wrap(id);
         meta.baseToken = params.baseToken;
+        meta.basePoolToken = address(uint160(uint256(id))); // faithful: real deployPool always sets it
         pools[id] = meta;
     }
 

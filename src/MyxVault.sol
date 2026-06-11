@@ -153,7 +153,9 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
 
     function _ensurePoolExists() internal {
         PoolMetadata memory pool = poolManager.getPool(poolId);
-        if (pool.basePoolToken == address(0) && pool.baseToken == address(0)) {
+        // basePoolToken is the definitive deposit-readiness signal: myx deployPool
+        // atomically deploys the LP token, so a registered pool always has it set.
+        if (pool.basePoolToken == address(0)) {
             poolManager.deployPool(IMyxPoolManager.DeployPoolParams({marketId: marketId, baseToken: baseToken}));
             emit PoolDeployed(poolId);
         }
