@@ -185,12 +185,37 @@ contract MyxVaultProcessTest is MyxVaultTestBase {
         assertEq(vault.totalLpMinted(), 1000 ether);
     }
 
-    function test_processRevenue_strangerReverts() public {
+    function test_defaultMode_isAuto() public view {
+        assertTrue(vault.mode() == MyxVault.Mode.AUTO);
+    }
+
+    function test_auto_anyoneCanProcess() public {
+        // default AUTO mode: processRevenue is permissionless
         _fund(1 ether);
         vm.prank(makeAddr("stranger"));
-        vm.expectRevert(); // AccessControl revert
+        vault.processRevenue();
+        assertEq(basePool.depositCallCount(), 1);
+    }
+
+    function test_manual_strangerReverts() public {
+        address stranger = makeAddr("stranger");
+        vm.prank(GUARDIAN);
+        vault.setMode(MyxVault.Mode.MANUAL);
+        _fund(1 ether);
+        vm.prank(stranger);
+        vm.expectRevert(MyxVault.NotAuthorizedInManualMode.selector);
         vault.processRevenue();
         assertEq(vault.pendingBnb(), 1 ether); // untouched
+    }
+
+    function test_manual_operatorAllowed() public {
+        // creator holds OPERATOR_ROLE, so it can process even in MANUAL mode
+        vm.prank(GUARDIAN);
+        vault.setMode(MyxVault.Mode.MANUAL);
+        _fund(1 ether);
+        vm.prank(creator);
+        vault.processRevenue();
+        assertEq(basePool.depositCallCount(), 1);
     }
 
     function test_processRevenue_guardianAllowed() public {
@@ -256,6 +281,35 @@ contract MyxVaultProcessTest is MyxVaultTestBase {
         // state rolled back: BNB safely retained for retry
         assertEq(vault.pendingBnb(), 1 ether);
         assertEq(address(vault).balance, 1 ether);
+    }
+}
+
+contract MyxVaultModeTest is MyxVaultTestBase {
+    event ModeChanged(MyxVault.Mode newMode);
+
+    function test_setMode_creatorAllowed() public {
+        vm.prank(creator);
+        vault.setMode(MyxVault.Mode.MANUAL);
+        assertTrue(vault.mode() == MyxVault.Mode.MANUAL);
+    }
+
+    function test_setMode_guardianAllowed() public {
+        vm.prank(GUARDIAN);
+        vault.setMode(MyxVault.Mode.MANUAL);
+        assertTrue(vault.mode() == MyxVault.Mode.MANUAL);
+    }
+
+    function test_setMode_strangerReverts() public {
+        vm.prank(makeAddr("stranger"));
+        vm.expectRevert(MyxVault.NotModeAdmin.selector);
+        vault.setMode(MyxVault.Mode.MANUAL);
+    }
+
+    function test_setMode_emitsModeChanged() public {
+        vm.expectEmit(false, false, false, true, address(vault));
+        emit ModeChanged(MyxVault.Mode.MANUAL);
+        vm.prank(creator);
+        vault.setMode(MyxVault.Mode.MANUAL);
     }
 }
 

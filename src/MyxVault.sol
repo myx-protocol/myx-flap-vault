@@ -24,8 +24,10 @@ import {Strings} from "@openzeppelin/utils/Strings.sol";
 /// @dev Invariants:
 ///      - receive() performs accounting only (Flap Rule 005), never external calls.
 ///      - harvest swap minOut is derived from Chainlink feeds inside the contract; the
-///        buyback leg has no feed and is bounded by a same-block Portal quote, so
-///        processRevenue is OPERATOR_ROLE-gated instead of permissionless.
+///        buyback leg has no feed and is bounded only by a same-block Portal quote. The
+///        processRevenue trigger is mode-gated: AUTO (default) is permissionless so a keeper
+///        can run it automatically; MANUAL restricts it to OPERATOR_ROLE. setMode is
+///        creator/Guardian-only.
 ///      - Guardian roles cannot be revoked by any other account; only the guardian
 ///        itself may voluntarily renounce (Flap mandate).
 contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, ReentrancyGuardUpgradeable {
@@ -58,8 +60,11 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
     error DividendDepositFailed();
     error ZeroDividendContract();
     error ZeroQuote();
+    error NotAuthorizedInManualMode();
+    error NotModeAdmin();
 
     event RevenueReceived(uint256 amount, uint256 pendingTotal);
+    event ModeChanged(Mode newMode);
     event RevenueProcessed(uint256 bnbAmount, uint256 baseAmount, uint256 lpMinted);
     event PoolDeployed(PoolId poolId);
     event Harvested(uint256 rebateAmount, uint256 wbnbForwarded);
@@ -81,12 +86,15 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
     uint256 public minProcessAmount;
     uint32 public maxPriceStaleness;
 
+    enum Mode { AUTO, MANUAL }
+
     uint256 public pendingBnb;
     uint256 public totalLpMinted;
     uint256 public totalRewardsForwarded;
+    Mode public mode;
 
     /// @dev Reserved storage to allow inserting parent mixins or new variables in upgrades.
-    uint256[37] private __gap;
+    uint256[36] private __gap;
 
     constructor() {
         _disableInitializers();
@@ -117,6 +125,9 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
         _grantRole(EMERGENCY_ROLE, p.creator);
         _grantRole(OPERATOR_ROLE, guardian);
         _grantRole(OPERATOR_ROLE, p.creator);
+
+        // BeaconProxy storage is zero so AUTO=0 is already the default; set explicitly for readability.
+        mode = Mode.AUTO;
     }
 
     /// @dev Flap Rule 005: accounting only. No external calls, no loops, never reverts.
@@ -132,10 +143,15 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
     }
 
     /// @notice Converts accumulated BNB into MYX base-pool liquidity by buying back the tax
-    ///         token via the Flap Portal. Operator-gated: the buy leg's minOut is a same-block
-    ///         Portal quote (no Chainlink feed exists for the tax token), which cannot prevent
-    ///         sandwiches on its own — the caller gate is the real protection.
-    function processRevenue() external nonReentrant onlyRole(OPERATOR_ROLE) {
+    ///         token via the Flap Portal. In AUTO mode this is permissionless (a keeper makes
+    ///         it effectively automatic); in MANUAL mode only OPERATOR_ROLE may call it. The
+    ///         buy leg's minOut is a same-block Portal quote (no Chainlink feed exists for the
+    ///         tax token), which cannot prevent sandwiches on its own — in MANUAL mode the
+    ///         caller gate is the protection.
+    function processRevenue() external nonReentrant {
+        if (mode == Mode.MANUAL && !hasRole(OPERATOR_ROLE, msg.sender)) {
+            revert NotAuthorizedInManualMode();
+        }
         uint256 amount = pendingBnb;
         if (amount < minProcessAmount) revert BelowMinimumProcessAmount(amount, minProcessAmount);
         pendingBnb = 0;
@@ -150,6 +166,14 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
         totalLpMinted += lpOut;
 
         emit RevenueProcessed(amount, received, lpOut);
+    }
+
+    /// @notice Switch between AUTO (permissionless processRevenue) and MANUAL (operator-only).
+    /// @dev Restricted to creator or Guardian. Guardian retains access per the Flap mandate.
+    function setMode(Mode newMode) external {
+        if (msg.sender != creator && msg.sender != _getGuardian()) revert NotModeAdmin();
+        mode = newMode;
+        emit ModeChanged(newMode);
     }
 
     /// @dev BNB → taxToken via the Flap Portal (bonding curve or DEX phase, Portal routes).
@@ -294,7 +318,9 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
             Strings.toString(totalRewardsForwarded),
             " WBNB forwarded). Pending BNB: ",
             Strings.toString(pendingBnb),
-            ". processRevenue() is operator-only; harvest() is permissionless."
+            ". harvest() is permissionless. processRevenue() trigger mode: ",
+            mode == Mode.AUTO ? "AUTO (permissionless)" : "MANUAL (operator-only)",
+            "."
         );
     }
 
@@ -318,7 +344,7 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
 
         schema.methods[2].name = "processRevenue";
         schema.methods[2].description =
-            "Convert pending BNB into MYX base-pool liquidity by buying back the token. Operator only.";
+            "Convert pending BNB into MYX base-pool liquidity by buying back the token. Permissionless in AUTO mode, operator-only in MANUAL mode.";
         schema.methods[2].isWriteMethod = true;
 
         schema.methods[3].name = "harvest";
