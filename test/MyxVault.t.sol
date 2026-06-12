@@ -129,6 +129,15 @@ contract MyxVaultGuardianTest is MyxVaultTestBase {
         vault.revokeRole(role, GUARDIAN);
     }
 
+    function test_revokeGuardianOperatorRole_reverts() public {
+        // v3: processRevenue is OPERATOR_ROLE-gated — the guardian's operator access
+        // must be irrevocable just like its other roles (Flap mandate).
+        bytes32 role = vault.OPERATOR_ROLE();
+        vm.prank(GUARDIAN);
+        vm.expectRevert(MyxVault.CannotRevokeGuardianRole.selector);
+        vault.revokeRole(role, GUARDIAN);
+    }
+
     function test_guardianCanRevokeOthers() public {
         bytes32 role = vault.EMERGENCY_ROLE();
         vm.prank(GUARDIAN);

@@ -90,3 +90,68 @@ Ran 10 test suites: 50 tests passed, 0 failed, 0 skipped (50 total)
 ```
 
 No source was modified during this audit; the suite is unchanged and fully green.
+
+## v3 Rework Delta Audit (2026-06-12)
+
+**Scope of delta:** commits `c5a8b63` (operator-gated Portal buyback), `446aadb` (factory whitelist removal; `vaultData = (MarketId)` only), `1dc21b2` (fork e2e reworked to real Portal buyback). Re-audited `src/MyxVault.sol` + `src/MyxVaultFactory.sol` against rules 001-009 with focus on what v3 changed; rules unaffected by the delta (007/008) were re-confirmed N/A by import inspection.
+
+**Test result:** `forge test --no-match-path test/Integration.fork.t.sol` → **49 passed, 0 failed** (48 pre-existing + 1 added by this audit; fork e2e not run locally, last reworked in `1dc21b2`).
+
+### Per-rule delta verdicts
+
+| Rule | Delta verdict | Evidence (file:line) |
+|------|---------------|----------------------|
+| 001 — Inheritance / `vaultUISchema()` / `description()` | **PASS** | `MyxVault.sol:31` inherits `VaultBaseV2`; `description()` (`:289-299`) rewritten for v3 — accurately states Portal buyback, vault-held LP, "processRevenue() is operator-only; harvest() is permissionless" |
+| 001 — Guardian granted every privileged role incl. new `OPERATOR_ROLE` | **PASS** | `initialize` grants guardian `DEFAULT_ADMIN_ROLE` + `EMERGENCY_ROLE` + `OPERATOR_ROLE` (`MyxVault.sol:115-120`); creator gets `EMERGENCY_ROLE` + `OPERATOR_ROLE` |
+| 001 — Guardian role irrevocable, incl. `OPERATOR_ROLE` | **PASS** | `revokeRole` override (`:129-132`) is **role-agnostic** — reverts for any `account == _getGuardian()` regardless of role, so `OPERATOR_ROLE` is covered; test added this audit (`test_revokeGuardianOperatorRole_reverts`). Only the guardian itself may `renounceRole` |
+| 001 — No DOS via dev parameter manipulation | **PASS** | Still no post-init setters; all economic params fixed in `initialize` from immutable-in-practice factory `config` (set once in factory constructor, no setter) |
+| 002 — Factory structural compliance after whitelist removal | **PASS** | `vaultDataSchema()` (`MyxVaultFactory.sol:108-113`) declares a single `bytes32 marketId` field matching `abi.decode(vaultData, (MarketId))` (`:60`; `MarketId` is a UDVT over `bytes32`); `newVault` portal-gated (`:57`); `isQuoteTokenSupported` native-only (`:91-93`); factory non-upgradeable, beacon upgrade `onlyGuardian` + lockable (`:115-124`). Zero-commission posture unchanged (v1 §1 still applies) |
+| 003 — Fairness / sandwich-risk under operator gating | **PASS (with Medium operational advisory M-02)** | `processRevenue` is `OPERATOR_ROLE`-gated (`MyxVault.sol:139`) — exactly the pattern VaultBase prescribes for "buyback which may be sandwich attacked": permissioned callers + guardian as irrevocable backup. No mutable privileged knob exists to pre-condition a sandwich (slippage/feeds/min-amount frozen at init). Residual mempool exposure documented as M-02 below |
+| 004 — Literal `require` strings | **FAIL (Medium, unchanged)** | v3 kept custom errors and added `ZeroQuote` (`:60`); disposition unchanged from v1 §2 (documented, not fixed — Medium per task scope). v1 Info item `MarketNotInitialized` dead declaration **fixed this audit** (removed) |
+| 004 — `vaultUISchema` accuracy for v3 | **PASS** | Schema description (`:303-305`) matches v3 mechanics; `processRevenue` method description ends "Operator only." (`:320-323`) with `isWriteMethod = true`; `harvest` marked "Anyone can call." — both correct |
+| 005 — `receive()` ≤ 1M gas | **PASS (no regression)** | `receive()` byte-identical in behavior to v1 (`:123-127`): `pendingBnb += msg.value` + event, no external calls/loops; `test_receive_gasUnder1M` asserts < 100k gross |
+| 006 — Integration test coverage of v3 flows | **PASS** | Operator gate happy/stranger/guardian paths, balance-delta under DEX-phase tax, zero-quote revert, swap/deposit failure → BNB retained, pool auto-deploy/skip/missing-market all covered (`MyxVault.t.sol:147-288`); fork e2e reworked to real Portal buyback (`1dc21b2`). Gap found and fixed: guardian revoke-guard was only tested for `EMERGENCY_ROLE` — added `test_revokeGuardianOperatorRole_reverts` |
+| 007 / 008 — AI oracle / trigger service | **N/A (unchanged)** | No `IFlapAIProvider` / `IFlapTriggerService` imports or callbacks in either contract |
+| 009 — Emergency controls | **PASS (upgradeable exception, unchanged)** | Vault still `BeaconProxy`-deployed (`MyxVaultFactory.sol:63-87`); upgrade authority guardian-only + lockable; bonus `emergencyWithdraw`/`emergencySweepBnb` unchanged (`MyxVault.sol:249-265`, both `nonReentrant` + `EMERGENCY_ROLE`) |
+
+### Focused v3 code review (Part 2)
+
+#### M-02 (Medium, operational — accepted with advisory): same-block Portal quote cannot bound a pre-pump; operator txs should avoid the public mempool
+
+`_buyTaxToken` (`MyxVault.sol:161-184`) derives `minOut` from `quoteExactInput` **in the same transaction** as the swap. A front-runner (or a creator-operator self-sandwiching) who pumps the tax-token price in an earlier tx of the same block moves the quote and `minOut` together, so `maxSlippageBps` only bounds quote→execution deviation *within* the call, not deviation from the pre-attack fair price. The contract comments state this honestly ("minOut … cannot prevent sandwiches on its own — the caller gate is the real protection"), and the `OPERATOR_ROLE` gate does eliminate permissionless adversarial triggering — but it does not protect an operator tx transiting the public BSC mempool.
+
+**Disposition: accepted, no code change.** (a) No price feed exists for the tax token, so an in-contract fair-price bound is impossible — this is precisely the case VaultBase's guidance designates for permissioned buyback + guardian backup; (b) loss per call is bounded by attacker capital vs. curve/DEX depth and by `pendingBnb` batch size; (c) the creator-operator self-sandwich variant is dominated by powers the creator already holds and v1 already accepted (`EMERGENCY_ROLE` LP redemption to an arbitrary address, v1 §3). **Operational mitigations (recommended, off-chain):** submit `processRevenue` via a private relay (e.g. bloXroute/48Club on BSC), and/or process frequently to keep per-call `pendingBnb` small.
+
+#### R-01 (resolved — no issue): reentrancy via tax-token `_afterTokenTransfer → dividendContract.setShare` during the buy
+
+During `portal.swapExactInput`, the tax token's transfer hook calls `dividendContract.setShare(vault, …)` (docs/phase0-v3-findings.md caveat 1), handing execution to the dividend contract mid-`processRevenue`. Verified containment: `processRevenue`, `harvest`, `emergencyWithdraw`, `emergencySweepBnb` all share one `ReentrancyGuardUpgradeable` slot, so reentry into any of them reverts; `processRevenue` is additionally role-gated (the dividend contract holds no role); `receive()` is reachable but accounting-only, and `pendingBnb` is zeroed before any external call (CEI, `:140-142`), so a mid-swap `receive()` would merely register new revenue. A reverting `setShare` makes the whole buy revert and BNB stays pending — safe failure path (covered by `test_processRevenue_swapReverts_retainsBnb`). No finding.
+
+#### R-02 (resolved — no issue, one Info note): tax-token custody between buy and deposit
+
+The buy leg is accounted via balance delta (`:173-183`, correct in both bonding-curve and net-of-tax DEX phases per docs/phase0-v3-findings.md §2), and the deposit leg is untaxed (§1: the MYX pool can never become a Flap-registered pool), so `forceApprove(basePool, received)` + `deposit(poolId, received, …)` moves exactly `received` and leaves allowance at 0 — no residual balance from the processing path. **Info:** tokens *donated* directly to the vault land below `balanceBefore` and are never swept (no `emergencyWithdrawToken`); recoverable only via beacon upgrade — acceptable under the Rule 009 proxy exception, recorded here.
+
+#### N-01 (Info — intended design, noted): operator-grant authority sits with the guardian, not the creator
+
+`OPERATOR_ROLE` is granted at init to guardian + creator; its role admin is `DEFAULT_ADMIN_ROLE`, held **only by the guardian**. The creator can call `processRevenue` but cannot delegate it (e.g. to a keeper bot) without a guardian grant. This matches the design intent ("creator + Guardian + grantable" — the grant authority is the guardian as DEFAULT_ADMIN) and is the safer default: a compromised creator key cannot mint new operators. Recorded as intended; if creator-managed delegation is wanted later, the guardian grants `DEFAULT_ADMIN_ROLE` is **not** required — a per-address `OPERATOR_ROLE` grant suffices.
+
+#### N-02 (clean): factory dead-code sweep after whitelist removal
+
+No leftover whitelist state, imports, errors, or script parameters: `src/`, `script/mainnet/`, `script/testnet/` contain no `whitelist`/`allowedBase`/`UnsupportedBaseToken` references; every remaining factory import, error, and `GlobalConfig` field is used. The only dead declaration found repo-wide was the vault's `MarketNotInitialized` error (pre-existing v1 Info) — removed this audit.
+
+### Changes made by this audit
+
+| Change | File | Rationale |
+|--------|------|-----------|
+| Removed dead `error MarketNotInitialized();` | `src/MyxVault.sol` | v1 Info item §4; confirmed still unused after v3 rework |
+| Added `test_revokeGuardianOperatorRole_reverts` | `test/MyxVault.t.sol` | Delta mandate: guardian's `OPERATOR_ROLE` must be irrevocable; guard code was role-agnostic but only `EMERGENCY_ROLE` was tested |
+
+### Delta severity roll-up
+
+| Severity | Count | Items |
+|----------|-------|-------|
+| Critical | 0 | — |
+| High     | 0 | — |
+| Medium   | 2 | Rule 004 custom errors (carried, unchanged); M-02 mempool sandwich advisory (accepted, operational mitigation) |
+| Low/Info | 3 | R-02 donated-token note; N-01 operator-grant authority note; v1 schema-coverage note (carried) |
+
+**No Critical or High findings. v3 rework is spec-compliant; suite green at 49/49 non-fork tests.**

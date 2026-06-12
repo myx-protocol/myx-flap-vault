@@ -55,7 +55,6 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
     error CannotRevokeGuardianRole();
     error BelowMinimumProcessAmount(uint256 pending, uint256 minimum);
     error StalePrice(address feed);
-    error MarketNotInitialized();
     error DividendDepositFailed();
     error ZeroDividendContract();
     error ZeroQuote();
