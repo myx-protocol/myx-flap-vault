@@ -140,7 +140,7 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
         uint256 baseAmount = _toBaseToken(amount);
         _ensurePoolExists();
 
-        IERC20(baseToken).safeIncreaseAllowance(address(basePool), baseAmount);
+        IERC20(baseToken).forceApprove(address(basePool), baseAmount);
         // minAmountOut = 0: LP mint is oracle-priced upstream (no AMM spot to sandwich);
         // the swap leg in _toBaseToken carries the slippage protection.
         uint256 lpOut = basePool.deposit(poolId, baseAmount, 0, address(this), address(this));
@@ -168,7 +168,7 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
         address[] memory path = new address[](2);
         path[0] = address(wbnb);
         path[1] = baseToken;
-        IERC20(address(wbnb)).safeIncreaseAllowance(address(swapRouter), bnbAmount);
+        IERC20(address(wbnb)).forceApprove(address(swapRouter), bnbAmount);
         uint256[] memory amounts =
             swapRouter.swapExactTokensForTokens(bnbAmount, minOut, path, address(this), block.timestamp + SWAP_DEADLINE);
         baseAmount = amounts[amounts.length - 1];
@@ -214,7 +214,7 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
         address[] memory path = new address[](2);
         path[0] = address(quoteToken);
         path[1] = address(wbnb);
-        quoteToken.safeIncreaseAllowance(address(swapRouter), usdtBalance);
+        quoteToken.forceApprove(address(swapRouter), usdtBalance);
         uint256[] memory amounts =
             swapRouter.swapExactTokensForTokens(usdtBalance, minOut, path, address(this), block.timestamp + SWAP_DEADLINE);
         uint256 wbnbOut = amounts[amounts.length - 1];
@@ -232,7 +232,7 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
         // (CREATE2 predicted address), so its dividendContract() cannot be read then.
         address dividendAddr = IFlapTaxTokenV3(taxToken).dividendContract();
         if (dividendAddr == address(0)) revert ZeroDividendContract();
-        IERC20(address(wbnb)).safeIncreaseAllowance(dividendAddr, wbnbAmount);
+        IERC20(address(wbnb)).forceApprove(dividendAddr, wbnbAmount);
         if (!IDividendDistributor(dividendAddr).deposit(wbnbAmount)) revert DividendDepositFailed();
     }
 
@@ -282,7 +282,7 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
         return string.concat(
             "MYX liquidity vault: converts tax revenue into MYX base-pool LP held by this vault (",
             Strings.toString(totalLpMinted),
-            " LP minted) and forwards harvested rebates to the token's dividend contract (",
+            " LP minted cumulatively; some may have been emergency-withdrawn) and forwards harvested rebates to the token's dividend contract (",
             Strings.toString(totalRewardsForwarded),
             " WBNB forwarded). Pending BNB: ",
             Strings.toString(pendingBnb),

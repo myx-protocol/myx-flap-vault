@@ -8,6 +8,7 @@ import {BeaconProxy} from "@openzeppelin/proxy/beacon/BeaconProxy.sol";
 import {UpgradeableBeacon} from "@openzeppelin/proxy/beacon/UpgradeableBeacon.sol";
 import {MyxVault} from "./MyxVault.sol";
 import {MarketId} from "./myx/IMyxPool.sol";
+import {IERC20Metadata} from "@openzeppelin/token/ERC20/extensions/IERC20Metadata.sol";
 
 /// @title MyxVaultFactory
 /// @notice Deploys MyxVault beacon proxies for the Flap VaultPortal. The factory itself is
@@ -32,6 +33,7 @@ contract MyxVaultFactory is VaultFactoryBaseV2 {
     error UpgradesLocked();
     error ConfigLengthMismatch();
     error ZeroFeedForNonWbnbToken(address baseToken);
+    error BaseTokenNotEighteenDecimals(address baseToken);
 
     event VaultCreated(address indexed vault, address indexed taxToken, address indexed creator, address baseToken);
     event VaultImplementationUpgraded(address newImplementation);
@@ -53,6 +55,10 @@ contract MyxVaultFactory is VaultFactoryBaseV2 {
             // call _readPrice(address(0)) and revert forever (factory is non-upgradeable).
             if (feeds[i] == address(0) && baseTokens[i] != _config.wbnb) {
                 revert ZeroFeedForNonWbnbToken(baseTokens[i]);
+            }
+            // All swap/LP math assumes 18-decimal base tokens (BSC norm: WBNB/BTCB/ETH all 18).
+            if (IERC20Metadata(baseTokens[i]).decimals() != 18) {
+                revert BaseTokenNotEighteenDecimals(baseTokens[i]);
             }
             isSupportedBaseToken[baseTokens[i]] = true;
             baseTokenFeeds[baseTokens[i]] = feeds[i];

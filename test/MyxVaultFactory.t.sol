@@ -165,4 +165,15 @@ contract MyxVaultFactoryTest is Test {
         vm.expectRevert(MyxVaultFactory.UpgradesLocked.selector);
         factory.upgradeVaultImplementation(newImpl);
     }
+
+    function test_constructor_rejectsNon18DecimalBase() public {
+        MockERC20Decimals usdc6 = new MockERC20Decimals("USDC", "USDC", 6);
+        MockAggregatorV3 usdc6Feed = new MockAggregatorV3(1e8, 8);
+        address[] memory bt = new address[](1);
+        bt[0] = address(usdc6);
+        address[] memory fd = new address[](1);
+        fd[0] = address(usdc6Feed);
+        vm.expectRevert(abi.encodeWithSelector(MyxVaultFactory.BaseTokenNotEighteenDecimals.selector, address(usdc6)));
+        new MyxVaultFactory(_baseConfig(), bt, fd);
+    }
 }
