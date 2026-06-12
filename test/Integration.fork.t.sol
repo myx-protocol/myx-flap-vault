@@ -50,13 +50,8 @@ contract MyxVaultForkTest is FlapBSCFixture {
         basePool = new MockBasePool(lpToken, usdt);
         poolManager = new MockPoolManager();
 
-        // Deploy OUR factory: WBNB-only whitelist (feeds[0] == address(0), wrap-only path),
-        // MYX side pointed at the mocks, WBNB/router/feeds pointed at REAL BSC addresses.
-        address[] memory baseTokens = new address[](1);
-        baseTokens[0] = WBNB;
-        address[] memory feeds = new address[](1);
-        feeds[0] = address(0); // WBNB needs no feed (wrap-only)
-
+        // Deploy OUR factory: MYX side pointed at the mocks,
+        // WBNB/router/feeds pointed at REAL BSC addresses.
         factory = new MyxVaultFactory(
             MyxVaultFactory.GlobalConfig({
                 poolManager: address(poolManager),
@@ -69,9 +64,7 @@ contract MyxVaultForkTest is FlapBSCFixture {
                 maxSlippageBps: 300,
                 minProcessAmount: 0.001 ether, // small so a modest trade clears it
                 maxPriceStaleness: 86_400 // wide tolerance: fork block may lag live feed updates
-            }),
-            baseTokens,
-            feeds
+            })
         );
 
         // Pre-register the WBNB pool in the mock so _ensurePoolExists() finds basePoolToken set
@@ -92,7 +85,7 @@ contract MyxVaultForkTest is FlapBSCFixture {
         // 1. Launch a REAL Flap V3 tax token through the REAL VaultPortal, passing OUR factory.
         //    The VaultPortal will call factory.newVault(...) — the factory's _getVaultPortal()
         //    resolves to this same VaultPortal on chainId 56, so the access check passes.
-        bytes memory vaultData = abi.encode(WBNB, marketId);
+        bytes memory vaultData = abi.encode(marketId);
         bytes32 salt = _findVanitySalt(VanityType.VANITY_7777, TOKEN_IMPL_TAXED_V3, PORTAL);
 
         IVaultPortalTypes.NewTokenV6WithVaultParams memory params =

@@ -10,11 +10,6 @@ contract DeployMyxVaultFactory is Script {
     function run() external {
         require(block.chainid == 97, "wrong chain");
         vm.startBroadcast();
-        address[] memory baseTokens = new address[](1);
-        baseTokens[0] = vm.envAddress("WBNB");
-        address[] memory feeds = new address[](1);
-        feeds[0] = address(0);
-
         MyxVaultFactory factory = new MyxVaultFactory(
             MyxVaultFactory.GlobalConfig({
                 poolManager: vm.envAddress("MYX_POOL_MANAGER"),
@@ -27,9 +22,7 @@ contract DeployMyxVaultFactory is Script {
                 maxSlippageBps: 300,
                 minProcessAmount: 0.01 ether,
                 maxPriceStaleness: 3600
-            }),
-            baseTokens,
-            feeds
+            })
         );
         console2.log("MyxVaultFactory:", address(factory));
         console2.log("Beacon:", address(factory.beacon()));

@@ -12,10 +12,8 @@ contract MyxVaultFactoryTest is Test {
     MyxVaultFactory factory;
     MockWBNB wbnb;
     MockERC20 usdt;
-    MockERC20 btcb;
     MockAggregatorV3 bnbFeed;
     MockAggregatorV3 usdtFeed;
-    MockAggregatorV3 btcbFeed;
     MockBasePool basePool;
     MockPoolManager poolManager;
     MockPancakeRouter router;
@@ -28,22 +26,13 @@ contract MyxVaultFactoryTest is Test {
         vm.chainId(56);
         wbnb = new MockWBNB();
         usdt = new MockERC20("Tether", "USDT");
-        btcb = new MockERC20("BTCB", "BTCB");
         bnbFeed = new MockAggregatorV3(600e8, 8);
         usdtFeed = new MockAggregatorV3(1e8, 8);
-        btcbFeed = new MockAggregatorV3(60_000e8, 8);
         basePool = new MockBasePool(new MockERC20("LP", "LP"), usdt);
         poolManager = new MockPoolManager();
         router = new MockPancakeRouter();
 
-        address[] memory baseTokens = new address[](2);
-        baseTokens[0] = address(wbnb);
-        baseTokens[1] = address(btcb);
-        address[] memory feeds = new address[](2);
-        feeds[0] = address(0); // WBNB path needs no feed
-        feeds[1] = address(btcbFeed);
-
-        factory = new MyxVaultFactory(_baseConfig(), baseTokens, feeds);
+        factory = new MyxVaultFactory(_baseConfig());
     }
 
     function _baseConfig() internal view returns (MyxVaultFactory.GlobalConfig memory) {
@@ -61,19 +50,19 @@ contract MyxVaultFactoryTest is Test {
         });
     }
 
-    function _vaultData(address base) internal view returns (bytes memory) {
-        return abi.encode(base, marketId);
+    function _vaultData() internal view returns (bytes memory) {
+        return abi.encode(marketId);
     }
 
     function test_newVault_onlyVaultPortal() public {
         vm.expectRevert();
-        factory.newVault(makeAddr("tax"), address(0), makeAddr("creator"), _vaultData(address(wbnb)));
+        factory.newVault(makeAddr("tax"), address(0), makeAddr("creator"), _vaultData());
     }
 
     function test_newVault_deploysInitializedProxy() public {
         vm.prank(VAULT_PORTAL);
         address vaultAddr =
-            factory.newVault(makeAddr("tax"), address(0), makeAddr("creator"), _vaultData(address(wbnb)));
+            factory.newVault(makeAddr("tax"), address(0), makeAddr("creator"), _vaultData());
         MyxVault v = MyxVault(payable(vaultAddr));
         assertEq(v.taxToken(), makeAddr("tax"));
         // v3: poolId is keyed by the tax token itself (buyback design)
@@ -91,10 +80,14 @@ contract MyxVaultFactoryTest is Test {
         );
     }
 
-    function test_newVault_rejectsUnsupportedBaseToken() public {
+    function test_newVault_emitsVaultCreated() public {
+        address taxToken = makeAddr("tax");
+        address creator = makeAddr("creator");
         vm.prank(VAULT_PORTAL);
-        vm.expectRevert(MyxVaultFactory.UnsupportedBaseToken.selector);
-        factory.newVault(makeAddr("tax"), address(0), makeAddr("creator"), _vaultData(makeAddr("junk")));
+        vm.recordLogs();
+        address vaultAddr = factory.newVault(taxToken, address(0), creator, _vaultData());
+        assertTrue(vaultAddr != address(0));
+        assertEq(MyxVault(payable(vaultAddr)).taxToken(), taxToken);
     }
 
     function test_isQuoteTokenSupported_onlyBnb() public view {
@@ -130,28 +123,6 @@ contract MyxVaultFactoryTest is Test {
         assertEq(factory.factorySpecVersion(), "v2.2");
     }
 
-    function test_constructor_rejectsZeroFeedForNonWbnb() public {
-        address[] memory bt = new address[](1);
-        bt[0] = address(btcb); // non-WBNB
-        address[] memory fd = new address[](1);
-        fd[0] = address(0);
-        vm.expectRevert(abi.encodeWithSelector(MyxVaultFactory.ZeroFeedForNonWbnbToken.selector, address(btcb)));
-        new MyxVaultFactory(_baseConfig(), bt, fd);
-    }
-
-    function test_constructor_rejectsLengthMismatch() public {
-        address[] memory bt = new address[](2);
-        bt[0] = address(wbnb);
-        bt[1] = address(btcb);
-        address[] memory fd = new address[](1);
-        fd[0] = address(0);
-        vm.expectRevert(MyxVaultFactory.ConfigLengthMismatch.selector);
-        new MyxVaultFactory(_baseConfig(), bt, fd);
-    }
-
-    // NOTE(v3-2): test_newVault_wiresBaseTokenFeed removed — the vault no longer stores
-    // baseToken/baseTokenUsdFeed (buyback design). Factory tests are rebuilt in v3-2.
-
     function test_lockVaultUpgrades_blocksFurtherUpgrades() public {
         address newImpl = address(new MyxVault());
         vm.prank(GUARDIAN);
@@ -161,14 +132,4 @@ contract MyxVaultFactoryTest is Test {
         factory.upgradeVaultImplementation(newImpl);
     }
 
-    function test_constructor_rejectsNon18DecimalBase() public {
-        MockERC20Decimals usdc6 = new MockERC20Decimals("USDC", "USDC", 6);
-        MockAggregatorV3 usdc6Feed = new MockAggregatorV3(1e8, 8);
-        address[] memory bt = new address[](1);
-        bt[0] = address(usdc6);
-        address[] memory fd = new address[](1);
-        fd[0] = address(usdc6Feed);
-        vm.expectRevert(abi.encodeWithSelector(MyxVaultFactory.BaseTokenNotEighteenDecimals.selector, address(usdc6)));
-        new MyxVaultFactory(_baseConfig(), bt, fd);
-    }
 }

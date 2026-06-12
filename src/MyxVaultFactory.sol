@@ -8,7 +8,6 @@ import {BeaconProxy} from "@openzeppelin/proxy/beacon/BeaconProxy.sol";
 import {UpgradeableBeacon} from "@openzeppelin/proxy/beacon/UpgradeableBeacon.sol";
 import {MyxVault} from "./MyxVault.sol";
 import {MarketId} from "./myx/IMyxPool.sol";
-import {IERC20Metadata} from "@openzeppelin/token/ERC20/extensions/IERC20Metadata.sol";
 
 /// @title MyxVaultFactory
 /// @notice Deploys MyxVault beacon proxies for the Flap VaultPortal. The factory itself is
@@ -27,42 +26,20 @@ contract MyxVaultFactory is VaultFactoryBaseV2 {
         uint32 maxPriceStaleness;
     }
 
-    error UnsupportedBaseToken();
     error UnsupportedQuoteToken();
     error OnlyGuardian();
     error UpgradesLocked();
-    error ConfigLengthMismatch();
-    error ZeroFeedForNonWbnbToken(address baseToken);
-    error BaseTokenNotEighteenDecimals(address baseToken);
 
-    event VaultCreated(address indexed vault, address indexed taxToken, address indexed creator, address baseToken);
+    event VaultCreated(address indexed vault, address indexed taxToken, address indexed creator, MarketId marketId);
     event VaultImplementationUpgraded(address newImplementation);
     event VaultUpgradesLocked();
 
     UpgradeableBeacon public immutable beacon;
     GlobalConfig public config;
-    /// @dev base token => Chainlink USD feed (address(0) allowed only for WBNB). Constructor-fixed.
-    mapping(address => address) public baseTokenFeeds;
-    mapping(address => bool) public isSupportedBaseToken;
     bool public upgradesLocked;
 
-    constructor(GlobalConfig memory _config, address[] memory baseTokens, address[] memory feeds) {
-        if (baseTokens.length != feeds.length) revert ConfigLengthMismatch();
+    constructor(GlobalConfig memory _config) {
         config = _config;
-        for (uint256 i = 0; i < baseTokens.length; i++) {
-            // WBNB uses the wrap-only path (no swap, no feed); every other base token
-            // is swapped via PancakeV2 and MUST have a USD feed, else processRevenue would
-            // call _readPrice(address(0)) and revert forever (factory is non-upgradeable).
-            if (feeds[i] == address(0) && baseTokens[i] != _config.wbnb) {
-                revert ZeroFeedForNonWbnbToken(baseTokens[i]);
-            }
-            // All swap/LP math assumes 18-decimal base tokens (BSC norm: WBNB/BTCB/ETH all 18).
-            if (IERC20Metadata(baseTokens[i]).decimals() != 18) {
-                revert BaseTokenNotEighteenDecimals(baseTokens[i]);
-            }
-            isSupportedBaseToken[baseTokens[i]] = true;
-            baseTokenFeeds[baseTokens[i]] = feeds[i];
-        }
         beacon = new UpgradeableBeacon(address(new MyxVault()));
     }
 
@@ -80,11 +57,7 @@ contract MyxVaultFactory is VaultFactoryBaseV2 {
         if (msg.sender != _getVaultPortal()) revert OnlyVaultPortal();
         if (quoteToken != address(0)) revert UnsupportedQuoteToken();
 
-        // TODO(v3-2): vaultData becomes (MarketId) only; whitelist removal. The v3 vault buys
-        // back the tax token itself, so baseToken is still decoded/validated here only to keep
-        // the existing factory ABI and tests stable until the v3-2 factory rework.
-        (address baseToken, MarketId marketId) = abi.decode(vaultData, (address, MarketId));
-        if (!isSupportedBaseToken[baseToken]) revert UnsupportedBaseToken();
+        MarketId marketId = abi.decode(vaultData, (MarketId));
 
         GlobalConfig memory c = config;
         vault = address(
@@ -112,7 +85,7 @@ contract MyxVaultFactory is VaultFactoryBaseV2 {
                 )
             )
         );
-        emit VaultCreated(vault, taxToken, creator, baseToken);
+        emit VaultCreated(vault, taxToken, creator, marketId);
     }
 
     function isQuoteTokenSupported(address quoteToken) external pure override returns (bool) {
@@ -120,10 +93,6 @@ contract MyxVaultFactory is VaultFactoryBaseV2 {
     }
 
     /// @notice Pre-launch validation hook (Flap VaultPortal calls this before token creation).
-    /// @dev LIMITATION: Flap's LaunchValidationDataV1 does NOT carry vaultData, so the target
-    ///      baseToken cannot be validated here. A launch with an unsupported baseToken passes
-    ///      this hook but reverts later in newVault (UnsupportedBaseToken). Operators must
-    ///      ensure the chosen baseToken is factory-supported before launching.
     function _validateBeforeLaunch(IVaultFactoryValidationV2.LaunchValidationDataV1 memory data)
         internal
         view
@@ -137,11 +106,9 @@ contract MyxVaultFactory is VaultFactoryBaseV2 {
     }
 
     function vaultDataSchema() public pure override returns (VaultDataSchema memory schema) {
-        schema.description = "MyxVault parameters: target base token and MYX market id.";
-        schema.fields = new FieldDescriptor[](2);
-        schema.fields[0] =
-            FieldDescriptor("baseToken", "address", "Base asset for MYX liquidity (must be factory-supported)", 0);
-        schema.fields[1] = FieldDescriptor("marketId", "bytes32", "MYX market identifier", 0);
+        schema.description = "MyxVault parameters: MYX market id. The token itself becomes the base asset.";
+        schema.fields = new FieldDescriptor[](1);
+        schema.fields[0] = FieldDescriptor("marketId", "bytes32", "MYX market identifier for the token's base pool", 0);
         schema.isArray = false;
     }
 
