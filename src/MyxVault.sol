@@ -148,6 +148,10 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
     ///         buy leg's minOut is a same-block Portal quote (no Chainlink feed exists for the
     ///         tax token), which cannot prevent sandwiches on its own — in MANUAL mode the
     ///         caller gate is the protection.
+    /// @dev In AUTO mode this is permissionless and the buy leg's minOut derives from a
+    ///      same-block Portal quote — it bounds per-call deviation to maxSlippageBps but
+    ///      cannot prevent sandwiching (BSC block proposers can reorder at no cost). For
+    ///      sandwich-sensitive operation switch to MANUAL and submit via a private relay.
     function processRevenue() external nonReentrant {
         if (mode == Mode.MANUAL && !hasRole(OPERATOR_ROLE, msg.sender)) {
             revert NotAuthorizedInManualMode();

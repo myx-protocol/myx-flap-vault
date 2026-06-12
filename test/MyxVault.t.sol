@@ -282,6 +282,50 @@ contract MyxVaultProcessTest is MyxVaultTestBase {
         assertEq(vault.pendingBnb(), 1 ether);
         assertEq(address(vault).balance, 1 ether);
     }
+
+    function test_setMode_roundTrip_autoRestoresPermissionless() public {
+        _fund(2 ether);
+
+        vm.prank(GUARDIAN);
+        vault.setMode(MyxVault.Mode.MANUAL);
+        address stranger = makeAddr("stranger");
+        vm.prank(stranger);
+        vm.expectRevert(MyxVault.NotAuthorizedInManualMode.selector);
+        vault.processRevenue();
+
+        vm.prank(GUARDIAN);
+        vault.setMode(MyxVault.Mode.AUTO);
+
+        vm.prank(stranger);
+        vault.processRevenue();
+        assertEq(basePool.depositCallCount(), 1);
+    }
+
+    function test_manual_newlyGrantedOperatorAllowed() public {
+        address newKeeper = makeAddr("newKeeper");
+        bytes32 opRole = vault.OPERATOR_ROLE();
+        vm.prank(GUARDIAN);
+        vault.grantRole(opRole, newKeeper);
+
+        vm.prank(GUARDIAN);
+        vault.setMode(MyxVault.Mode.MANUAL);
+
+        _fund(1 ether);
+
+        vm.prank(newKeeper);
+        vault.processRevenue();
+        assertEq(basePool.depositCallCount(), 1);
+    }
+
+    function test_processRevenue_belowMinimumAfterSuccess_reverts() public {
+        _fund(1 ether);
+        vault.processRevenue(); // default AUTO, succeeds, pendingBnb -> 0
+
+        // second call with pendingBnb == 0 must revert below-minimum
+        uint256 minAmt = vault.minProcessAmount();
+        vm.expectRevert(abi.encodeWithSelector(MyxVault.BelowMinimumProcessAmount.selector, 0, minAmt));
+        vault.processRevenue();
+    }
 }
 
 contract MyxVaultModeTest is MyxVaultTestBase {
