@@ -14,14 +14,18 @@ import {IWBNB} from "./dex/IWBNB.sol";
 import {IAggregatorV3} from "./oracle/IAggregatorV3.sol";
 import {IDividendDistributor} from "./dividend/IDividendDistributor.sol";
 import {IFlapTaxTokenV3} from "./flap/IFlapTaxTokenV3.sol";
+import {IPortalTradeV2} from "./flap/IPortal.sol";
 import {Strings} from "@openzeppelin/utils/Strings.sol";
 
 /// @title MyxVault
-/// @notice Flap vault that deposits tax revenue as MYX base-pool liquidity (LP held by
-///         the vault) and forwards harvested rebates to the token's Dividend contract.
+/// @notice Flap vault that buys back the tax token with tax revenue via the Flap Portal,
+///         deposits it as MYX base-pool liquidity (LP held by the vault) and forwards
+///         harvested rebates to the token's Dividend contract.
 /// @dev Invariants:
 ///      - receive() performs accounting only (Flap Rule 005), never external calls.
-///      - All swap minOut values are derived from Chainlink feeds inside the contract.
+///      - harvest swap minOut is derived from Chainlink feeds inside the contract; the
+///        buyback leg has no feed and is bounded by a same-block Portal quote, so
+///        processRevenue is OPERATOR_ROLE-gated instead of permissionless.
 ///      - Guardian roles cannot be revoked by any other account; only the guardian
 ///        itself may voluntarily renounce (Flap mandate).
 contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, ReentrancyGuardUpgradeable {
@@ -30,7 +34,6 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
     struct InitParams {
         address taxToken;
         address creator;
-        address baseToken;
         MarketId marketId;
         address poolManager;
         address basePool;
@@ -39,15 +42,15 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
         address quoteToken;
         address bnbUsdFeed;
         address usdtUsdFeed;
-        address baseTokenUsdFeed; // address(0) when baseToken == WBNB
         uint16 maxSlippageBps;
         uint256 minProcessAmount;
         uint32 maxPriceStaleness; // max seconds since a Chainlink feed update before it is rejected
     }
 
     bytes32 public constant EMERGENCY_ROLE = keccak256("EMERGENCY_ROLE");
+    bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");
     uint16 public constant BPS_DENOMINATOR = 10_000;
-    uint256 public constant SWAP_DEADLINE = 300; // seconds; bounds validator tx-holding window
+    uint256 public constant SWAP_DEADLINE = 300; // seconds; bounds validator tx-holding window (harvest)
 
     error CannotRevokeGuardianRole();
     error BelowMinimumProcessAmount(uint256 pending, uint256 minimum);
@@ -55,6 +58,7 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
     error MarketNotInitialized();
     error DividendDepositFailed();
     error ZeroDividendContract();
+    error ZeroQuote();
 
     event RevenueReceived(uint256 amount, uint256 pendingTotal);
     event RevenueProcessed(uint256 bnbAmount, uint256 baseAmount, uint256 lpMinted);
@@ -65,7 +69,6 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
 
     address public taxToken;
     address public creator;
-    address public baseToken;
     MarketId public marketId;
     PoolId public poolId;
     IMyxPoolManager public poolManager;
@@ -75,7 +78,6 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
     IERC20 public quoteToken;
     IAggregatorV3 public bnbUsdFeed;
     IAggregatorV3 public usdtUsdFeed;
-    IAggregatorV3 public baseTokenUsdFeed;
     uint16 public maxSlippageBps;
     uint256 public minProcessAmount;
     uint32 public maxPriceStaleness;
@@ -85,7 +87,7 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
     uint256 public totalRewardsForwarded;
 
     /// @dev Reserved storage to allow inserting parent mixins or new variables in upgrades.
-    uint256[35] private __gap;
+    uint256[37] private __gap;
 
     constructor() {
         _disableInitializers();
@@ -97,9 +99,8 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
 
         taxToken = p.taxToken;
         creator = p.creator;
-        baseToken = p.baseToken;
         marketId = p.marketId;
-        poolId = MyxPoolId.derive(p.marketId, p.baseToken);
+        poolId = MyxPoolId.derive(p.marketId, p.taxToken);
         poolManager = IMyxPoolManager(p.poolManager);
         basePool = IMyxBasePool(p.basePool);
         swapRouter = IPancakeRouterV2(p.swapRouter);
@@ -107,7 +108,6 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
         quoteToken = IERC20(p.quoteToken);
         bnbUsdFeed = IAggregatorV3(p.bnbUsdFeed);
         usdtUsdFeed = IAggregatorV3(p.usdtUsdFeed);
-        baseTokenUsdFeed = IAggregatorV3(p.baseTokenUsdFeed);
         maxSlippageBps = p.maxSlippageBps;
         minProcessAmount = p.minProcessAmount;
         maxPriceStaleness = p.maxPriceStaleness;
@@ -116,6 +116,8 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
         _grantRole(DEFAULT_ADMIN_ROLE, guardian);
         _grantRole(EMERGENCY_ROLE, guardian);
         _grantRole(EMERGENCY_ROLE, p.creator);
+        _grantRole(OPERATOR_ROLE, guardian);
+        _grantRole(OPERATOR_ROLE, p.creator);
     }
 
     /// @dev Flap Rule 005: accounting only. No external calls, no loops, never reverts.
@@ -130,48 +132,55 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
         super.revokeRole(role, account);
     }
 
-    /// @notice Converts accumulated BNB into base-pool liquidity. Permissionless by design;
-    ///         MEV protection comes from internally computed swap minOut (never caller input).
-    function processRevenue() external nonReentrant {
+    /// @notice Converts accumulated BNB into MYX base-pool liquidity by buying back the tax
+    ///         token via the Flap Portal. Operator-gated: the buy leg's minOut is a same-block
+    ///         Portal quote (no Chainlink feed exists for the tax token), which cannot prevent
+    ///         sandwiches on its own — the caller gate is the real protection.
+    function processRevenue() external nonReentrant onlyRole(OPERATOR_ROLE) {
         uint256 amount = pendingBnb;
         if (amount < minProcessAmount) revert BelowMinimumProcessAmount(amount, minProcessAmount);
         pendingBnb = 0;
 
-        uint256 baseAmount = _toBaseToken(amount);
+        uint256 received = _buyTaxToken(amount);
         _ensurePoolExists();
 
-        IERC20(baseToken).forceApprove(address(basePool), baseAmount);
+        IERC20(taxToken).forceApprove(address(basePool), received);
         // minAmountOut = 0: LP mint is oracle-priced upstream (no AMM spot to sandwich);
-        // the swap leg in _toBaseToken carries the slippage protection.
-        uint256 lpOut = basePool.deposit(poolId, baseAmount, 0, address(this), address(this));
+        // the buy leg carries the Portal-level minOut bound and is operator-gated.
+        uint256 lpOut = basePool.deposit(poolId, received, 0, address(this), address(this));
         totalLpMinted += lpOut;
 
-        emit RevenueProcessed(amount, baseAmount, lpOut);
+        emit RevenueProcessed(amount, received, lpOut);
     }
 
-    /// @dev Uses a direct [WBNB, baseToken] PancakeV2 path. The factory MUST only admit base
-    ///      tokens that have a liquid direct WBNB pair; tokens routed via an intermediate would
-    ///      make the feed-derived minOut revert every call. Multi-hop path support is future work.
-    /// @dev BNB → baseToken. WBNB base: pure wrap. Other bases: wrap then swap via PancakeV2.
-    ///      minOut is derived from Chainlink feeds; slippage guard is never caller-supplied.
-    function _toBaseToken(uint256 bnbAmount) internal returns (uint256 baseAmount) {
-        wbnb.deposit{value: bnbAmount}();
-        if (baseToken == address(wbnb)) {
-            return bnbAmount;
-        }
-        // fair amount from feeds: base = bnbAmount * (BNB/USD) / (BASE/USD); both feeds 8 dec, tokens 18 dec
-        uint256 bnbUsd = _readPrice(bnbUsdFeed);
-        uint256 baseUsd = _readPrice(baseTokenUsdFeed);
-        uint256 fairOut = (bnbAmount * bnbUsd) / baseUsd;
-        uint256 minOut = (fairOut * (BPS_DENOMINATOR - maxSlippageBps)) / BPS_DENOMINATOR;
+    /// @dev BNB → taxToken via the Flap Portal (bonding curve or DEX phase, Portal routes).
+    ///      minOut is a same-block quote bound — it caps single-call deviation but cannot
+    ///      prevent sandwiches; the real protection is the OPERATOR_ROLE gate on the caller.
+    ///      Returns the BALANCE DELTA, not the Portal's return value: DEX-phase buys land
+    ///      net of the token's own transfer tax (docs/phase0-v3-findings.md).
+    function _buyTaxToken(uint256 bnbAmount) internal returns (uint256 received) {
+        IPortalTradeV2 portal = IPortalTradeV2(_getPortal());
+        uint256 quoted = portal.quoteExactInput(
+            IPortalTradeV2.QuoteExactInputParams({
+                inputToken: address(0),
+                outputToken: taxToken,
+                inputAmount: bnbAmount
+            })
+        );
+        if (quoted == 0) revert ZeroQuote();
+        uint256 minOut = (quoted * (BPS_DENOMINATOR - maxSlippageBps)) / BPS_DENOMINATOR;
 
-        address[] memory path = new address[](2);
-        path[0] = address(wbnb);
-        path[1] = baseToken;
-        IERC20(address(wbnb)).forceApprove(address(swapRouter), bnbAmount);
-        uint256[] memory amounts =
-            swapRouter.swapExactTokensForTokens(bnbAmount, minOut, path, address(this), block.timestamp + SWAP_DEADLINE);
-        baseAmount = amounts[amounts.length - 1];
+        uint256 balanceBefore = IERC20(taxToken).balanceOf(address(this));
+        portal.swapExactInput{value: bnbAmount}(
+            IPortalTradeV2.ExactInputParams({
+                inputToken: address(0),
+                outputToken: taxToken,
+                inputAmount: bnbAmount,
+                minOutputAmount: minOut,
+                permitData: ""
+            })
+        );
+        received = IERC20(taxToken).balanceOf(address(this)) - balanceBefore;
     }
 
     function _readPrice(IAggregatorV3 feed) internal view returns (uint256) {
@@ -187,7 +196,7 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
         // basePoolToken is the definitive deposit-readiness signal: myx deployPool
         // atomically deploys the LP token, so a registered pool always has it set.
         if (pool.basePoolToken == address(0)) {
-            poolManager.deployPool(IMyxPoolManager.DeployPoolParams({marketId: marketId, baseToken: baseToken}));
+            poolManager.deployPool(IMyxPoolManager.DeployPoolParams({marketId: marketId, baseToken: taxToken}));
             emit PoolDeployed(poolId);
         }
     }
@@ -280,13 +289,13 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
 
     function description() public view override returns (string memory) {
         return string.concat(
-            "MYX liquidity vault: converts tax revenue into MYX base-pool LP held by this vault (",
+            "MYX liquidity vault: buys back the token with tax revenue via the Flap Portal and provides it as MYX base-pool liquidity held by this vault (",
             Strings.toString(totalLpMinted),
             " LP minted cumulatively; some may have been emergency-withdrawn) and forwards harvested rebates to the token's dividend contract (",
             Strings.toString(totalRewardsForwarded),
             " WBNB forwarded). Pending BNB: ",
             Strings.toString(pendingBnb),
-            ". processRevenue() and harvest() are permissionless."
+            ". processRevenue() is operator-only; harvest() is permissionless."
         );
     }
 
@@ -309,7 +318,8 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
         schema.methods[1].outputs[0] = FieldDescriptor("amount", "uint256", "BNB amount", 18);
 
         schema.methods[2].name = "processRevenue";
-        schema.methods[2].description = "Convert pending BNB into MYX base-pool liquidity. Anyone can call.";
+        schema.methods[2].description =
+            "Convert pending BNB into MYX base-pool liquidity by buying back the token. Operator only.";
         schema.methods[2].isWriteMethod = true;
 
         schema.methods[3].name = "harvest";

@@ -106,7 +106,10 @@ contract MyxVaultForkTest is FlapBSCFixture {
         MyxVault vault = MyxVault(payable(info.vault));
         assertTrue(address(vault) != address(0), "vault not resolved");
         assertEq(vault.taxToken(), token, "vault taxToken mismatch");
-        assertEq(vault.baseToken(), WBNB, "vault baseToken mismatch");
+        // TODO(v3-3): rework the fork flow for the v3 buyback design — processRevenue is now
+        // operator-gated and buys the tax token via the real Portal; the poolId is keyed by
+        // the tax token. This line is a compile-only fix; the runtime flow below is stale.
+        assertEq(PoolId.unwrap(vault.poolId()), PoolId.unwrap(MyxPoolId.derive(marketId, token)), "vault poolId mismatch");
 
         // 2. Trade to generate tax: buy on the bonding curve, then sell half back.
         vm.deal(address(this), 10 ether);

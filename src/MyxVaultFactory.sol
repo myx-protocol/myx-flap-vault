@@ -80,6 +80,9 @@ contract MyxVaultFactory is VaultFactoryBaseV2 {
         if (msg.sender != _getVaultPortal()) revert OnlyVaultPortal();
         if (quoteToken != address(0)) revert UnsupportedQuoteToken();
 
+        // TODO(v3-2): vaultData becomes (MarketId) only; whitelist removal. The v3 vault buys
+        // back the tax token itself, so baseToken is still decoded/validated here only to keep
+        // the existing factory ABI and tests stable until the v3-2 factory rework.
         (address baseToken, MarketId marketId) = abi.decode(vaultData, (address, MarketId));
         if (!isSupportedBaseToken[baseToken]) revert UnsupportedBaseToken();
 
@@ -93,7 +96,6 @@ contract MyxVaultFactory is VaultFactoryBaseV2 {
                         MyxVault.InitParams({
                             taxToken: taxToken,
                             creator: creator,
-                            baseToken: baseToken,
                             marketId: marketId,
                             poolManager: c.poolManager,
                             basePool: c.basePool,
@@ -102,7 +104,6 @@ contract MyxVaultFactory is VaultFactoryBaseV2 {
                             quoteToken: c.quoteToken,
                             bnbUsdFeed: c.bnbUsdFeed,
                             usdtUsdFeed: c.usdtUsdFeed,
-                            baseTokenUsdFeed: baseTokenFeeds[baseToken],
                             maxSlippageBps: c.maxSlippageBps,
                             minProcessAmount: c.minProcessAmount,
                             maxPriceStaleness: c.maxPriceStaleness

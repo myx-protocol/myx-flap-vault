@@ -4,6 +4,7 @@ pragma solidity ^0.8.26;
 import {ERC20} from "@openzeppelin/token/ERC20/ERC20.sol";
 import {IERC20} from "@openzeppelin/token/ERC20/IERC20.sol";
 import {IMyxBasePool, IMyxPoolManager, PoolMetadata, PoolId, MarketId} from "../../src/myx/IMyxPool.sol";
+import {IPortalTradeV2} from "../../src/flap/IPortal.sol";
 
 contract MockERC20 is ERC20 {
     constructor(string memory n, string memory s) ERC20(n, s) {}
@@ -83,6 +84,31 @@ contract MockTaxToken is ERC20 {
     address public dividendContract;
     constructor(address _dividend) ERC20("Mock Tax Token", "MTT") { dividendContract = _dividend; }
     function setDividendContract(address d) external { dividendContract = d; }
+    /// @dev Required so MockPortal can mint the tax token as a buy output.
+    function mint(address to, uint256 amount) external { _mint(to, amount); }
+}
+
+/// @dev Buys outputToken at a fixed rate (out = in * rateNum / rateDen), minting MockTaxToken
+///      to the buyer. taxBps simulates the DEX-phase transfer tax: the buyer receives
+///      out * (10000 - taxBps) / 10000 while quoteExactInput still quotes the gross amount.
+contract MockPortal {
+    uint256 public rateNum = 1;
+    uint256 public rateDen = 1;
+    uint16 public taxBps;
+    function setRate(uint256 num, uint256 den) external { rateNum = num; rateDen = den; }
+    function setTaxBps(uint16 t) external { taxBps = t; }
+
+    function quoteExactInput(IPortalTradeV2.QuoteExactInputParams calldata p) external view returns (uint256) {
+        return (p.inputAmount * rateNum) / rateDen;
+    }
+
+    function swapExactInput(IPortalTradeV2.ExactInputParams calldata p) external payable returns (uint256 out) {
+        require(p.inputToken == address(0) && msg.value == p.inputAmount, "MockPortal: BNB in only");
+        out = (p.inputAmount * rateNum) / rateDen;
+        require(out >= p.minOutputAmount, "MockPortal: INSUFFICIENT_OUTPUT_AMOUNT");
+        uint256 net = (out * (10_000 - taxBps)) / 10_000;
+        MockTaxToken(p.outputToken).mint(msg.sender, net);
+    }
 }
 
 /// @dev Mints LP 1:1 for deposits; pays rebates in quote token; tracks calls for assertions.

@@ -4,6 +4,7 @@ pragma solidity ^0.8.26;
 import {Test} from "forge-std/Test.sol";
 import {MyxVault} from "../src/MyxVault.sol";
 import {MarketId, PoolId, MyxPoolId, IMyxBasePool, PoolMetadata} from "../src/myx/IMyxPool.sol";
+import {IPortalTradeV2} from "../src/flap/IPortal.sol";
 import {ERC1967Proxy} from "@openzeppelin/proxy/ERC1967/ERC1967Proxy.sol";
 import "./mocks/Mocks.sol";
 
@@ -11,11 +12,11 @@ contract MyxVaultTestBase is Test {
     MyxVault vault;
     MockWBNB wbnb;
     MockERC20 usdt;
-    MockERC20 baseToken; // non-WBNB base for swap-path tests
     MockERC20 lpToken;
     MockBasePool basePool;
     MockPoolManager poolManager;
     MockPancakeRouter router;
+    MockPortal portal;
     MockAggregatorV3 bnbUsdFeed;
     MockAggregatorV3 usdtUsdFeed;
     MockDividendDistributor dividend;
@@ -24,13 +25,14 @@ contract MyxVaultTestBase is Test {
     address creator = makeAddr("creator");
     // Guardian address hardcoded in VaultBase for chainId 56; tests etch chainid 56 via vm.chainId.
     address constant GUARDIAN = 0x9e27098dcD8844bcc6287a557E0b4D09C86B8a4b;
+    // Portal address hardcoded in VaultBase for chainId 56; MockPortal code is etched there.
+    address constant PORTAL = 0xe2cE6ab80874Fa9Fa2aAE65D277Dd6B8e65C9De0;
     MarketId marketId = MarketId.wrap(bytes32(uint256(1)));
 
     function setUp() public virtual {
         vm.chainId(56);
         wbnb = new MockWBNB();
         usdt = new MockERC20("Tether", "USDT");
-        baseToken = new MockERC20("Base", "BASE");
         lpToken = new MockERC20("MYX LP", "MLP");
         basePool = new MockBasePool(lpToken, usdt);
         poolManager = new MockPoolManager();
@@ -40,7 +42,15 @@ contract MyxVaultTestBase is Test {
         dividend = new MockDividendDistributor(address(wbnb));
         taxToken = new MockTaxToken(address(dividend));
 
-        vault = _deployVault(_initParams(address(wbnb)));
+        // The vault resolves the Portal via VaultBase._getPortal() (hardcoded per chainid),
+        // so the mock must live at the BSC mainnet Portal address. vm.etch copies CODE but
+        // not STORAGE: rateNum/rateDen are zero after etch and MUST be re-initialized.
+        MockPortal portalImpl = new MockPortal();
+        vm.etch(PORTAL, address(portalImpl).code);
+        portal = MockPortal(PORTAL);
+        portal.setRate(1, 1);
+
+        vault = _deployVault(_initParams());
     }
 
     function _deployVault(MyxVault.InitParams memory p) internal returns (MyxVault) {
@@ -50,10 +60,9 @@ contract MyxVaultTestBase is Test {
         return MyxVault(payable(address(proxy)));
     }
 
-    function _initParams(address base) internal view returns (MyxVault.InitParams memory p) {
+    function _initParams() internal view returns (MyxVault.InitParams memory p) {
         p.taxToken = address(taxToken);
         p.creator = creator;
-        p.baseToken = base;
         p.marketId = marketId;
         p.poolManager = address(poolManager);
         p.basePool = address(basePool);
@@ -71,13 +80,13 @@ contract MyxVaultTestBase is Test {
 contract MyxVaultInitTest is MyxVaultTestBase {
     function test_initialize_storesConfig() public view {
         assertEq(vault.taxToken(), address(taxToken));
-        assertEq(vault.baseToken(), address(wbnb));
-        assertEq(PoolId.unwrap(vault.poolId()), PoolId.unwrap(MyxPoolId.derive(marketId, address(wbnb))));
+        // v3: the pool is keyed by the tax token itself (buyback design)
+        assertEq(PoolId.unwrap(vault.poolId()), PoolId.unwrap(MyxPoolId.derive(marketId, address(taxToken))));
     }
 
     function test_initialize_revertsOnSecondCall() public {
         vm.expectRevert();
-        vault.initialize(_initParams(address(wbnb)));
+        vault.initialize(_initParams());
     }
 
     function test_receive_accountsOnly() public {
@@ -108,6 +117,11 @@ contract MyxVaultGuardianTest is MyxVaultTestBase {
         assertTrue(vault.hasRole(vault.EMERGENCY_ROLE(), creator));
     }
 
+    function test_operatorRoleGrantedToCreatorAndGuardian() public view {
+        assertTrue(vault.hasRole(vault.OPERATOR_ROLE(), creator));
+        assertTrue(vault.hasRole(vault.OPERATOR_ROLE(), GUARDIAN));
+    }
+
     function test_revokeGuardianRole_reverts() public {
         bytes32 role = vault.EMERGENCY_ROLE();
         vm.prank(GUARDIAN); // even the admin itself cannot revoke the guardian
@@ -130,16 +144,18 @@ contract MyxVaultGuardianTest is MyxVaultTestBase {
     }
 }
 
-contract MyxVaultProcessWbnbTest is MyxVaultTestBase {
+contract MyxVaultProcessTest is MyxVaultTestBase {
     function setUp() public override {
         super.setUp();
-        // register the WBNB pool as already existing
+        // register the tax-token pool as already existing
         PoolMetadata memory meta;
         meta.marketId = marketId;
-        meta.poolId = MyxPoolId.derive(marketId, address(wbnb));
-        meta.baseToken = address(wbnb);
+        meta.poolId = MyxPoolId.derive(marketId, address(taxToken));
+        meta.baseToken = address(taxToken);
         meta.basePoolToken = address(lpToken);
         poolManager.setPool(meta.poolId, meta);
+        // 1 BNB buys 1000 tax tokens on the mock Portal
+        portal.setRate(1000, 1);
     }
 
     function _fund(uint256 amount) internal {
@@ -148,23 +164,74 @@ contract MyxVaultProcessWbnbTest is MyxVaultTestBase {
         assertTrue(ok);
     }
 
-    function test_processRevenue_wrapsAndDeposits() public {
+    function test_processRevenue_buysAndDeposits() public {
         _fund(1 ether);
+        vm.prank(creator);
         vault.processRevenue();
         assertEq(vault.pendingBnb(), 0);
         assertEq(basePool.depositCallCount(), 1);
-        assertEq(basePool.lastDepositAmount(), 1 ether);
+        assertEq(basePool.lastDepositAmount(), 1000 ether);
         assertEq(basePool.lastDepositRecipient(), address(vault)); // LP held by vault
-        assertEq(lpToken.balanceOf(address(vault)), 1 ether);
-        assertEq(vault.totalLpMinted(), 1 ether);
+        assertEq(lpToken.balanceOf(address(vault)), 1000 ether);
+        assertEq(vault.totalLpMinted(), 1000 ether);
     }
 
-    function test_processRevenue_revertsBelowMinimum() public {
+    function test_processRevenue_strangerReverts() public {
+        _fund(1 ether);
+        vm.prank(makeAddr("stranger"));
+        vm.expectRevert(); // AccessControl revert
+        vault.processRevenue();
+        assertEq(vault.pendingBnb(), 1 ether); // untouched
+    }
+
+    function test_processRevenue_guardianAllowed() public {
+        _fund(1 ether);
+        vm.prank(GUARDIAN);
+        vault.processRevenue();
+        assertEq(basePool.depositCallCount(), 1);
+    }
+
+    function test_processRevenue_belowMinimum_reverts() public {
         _fund(0.05 ether); // below 0.1 ether minProcessAmount
+        vm.prank(creator);
         vm.expectRevert(
             abi.encodeWithSelector(MyxVault.BelowMinimumProcessAmount.selector, 0.05 ether, 0.1 ether)
         );
         vault.processRevenue();
+    }
+
+    function test_processRevenue_dexPhaseTax_accountsBalanceDelta() public {
+        portal.setTaxBps(400); // 4% DEX-phase transfer tax: gross 1000, net 960
+        _fund(1 ether);
+        vm.prank(creator);
+        vault.processRevenue();
+        // deposit must use the balance delta (net), never the Portal's gross output
+        assertEq(basePool.lastDepositAmount(), 960 ether);
+        assertEq(lpToken.balanceOf(address(vault)), 960 ether);
+    }
+
+    function test_processRevenue_zeroQuote_reverts() public {
+        portal.setRate(0, 1); // Portal quotes zero output
+        _fund(1 ether);
+        vm.prank(creator);
+        vm.expectRevert(MyxVault.ZeroQuote.selector);
+        vault.processRevenue();
+        assertEq(vault.pendingBnb(), 1 ether); // retained for retry
+    }
+
+    function test_processRevenue_swapReverts_retainsBnb() public {
+        _fund(1 ether);
+        vm.mockCallRevert(
+            PORTAL,
+            abi.encodeWithSelector(IPortalTradeV2.swapExactInput.selector),
+            "PORTAL_FAIL"
+        );
+        vm.prank(creator);
+        vm.expectRevert("PORTAL_FAIL");
+        vault.processRevenue();
+        // state rolled back: BNB safely retained for retry
+        assertEq(vault.pendingBnb(), 1 ether);
+        assertEq(address(vault).balance, 1 ether);
     }
 
     function test_processRevenue_failedDepositLeavesBnbPending() public {
@@ -174,18 +241,12 @@ contract MyxVaultProcessWbnbTest is MyxVaultTestBase {
             abi.encodeWithSelector(IMyxBasePool.deposit.selector),
             "POOL_PAUSED"
         );
+        vm.prank(creator);
         vm.expectRevert();
         vault.processRevenue();
         // state rolled back: BNB safely retained for retry
         assertEq(vault.pendingBnb(), 1 ether);
         assertEq(address(vault).balance, 1 ether);
-    }
-
-    function test_processRevenue_callableByAnyone() public {
-        _fund(1 ether);
-        vm.prank(makeAddr("randomCaller"));
-        vault.processRevenue();
-        assertEq(basePool.depositCallCount(), 1);
     }
 }
 
@@ -199,6 +260,7 @@ contract MyxVaultAutoDeployPoolTest is MyxVaultTestBase {
     function test_processRevenue_deploysPoolWhenMissing() public {
         // no setPool() — pool does not exist yet
         _fund(1 ether);
+        vm.prank(creator);
         vault.processRevenue();
         assertEq(poolManager.deployPoolCallCount(), 1);
         assertEq(basePool.depositCallCount(), 1);
@@ -206,10 +268,11 @@ contract MyxVaultAutoDeployPoolTest is MyxVaultTestBase {
 
     function test_processRevenue_skipsDeployWhenPoolExists() public {
         PoolMetadata memory meta;
-        meta.baseToken = address(wbnb);
+        meta.baseToken = address(taxToken);
         meta.basePoolToken = address(lpToken);
-        poolManager.setPool(MyxPoolId.derive(marketId, address(wbnb)), meta);
+        poolManager.setPool(MyxPoolId.derive(marketId, address(taxToken)), meta);
         _fund(1 ether);
+        vm.prank(creator);
         vault.processRevenue();
         assertEq(poolManager.deployPoolCallCount(), 0);
     }
@@ -217,6 +280,7 @@ contract MyxVaultAutoDeployPoolTest is MyxVaultTestBase {
     function test_processRevenue_marketMissing_revertsAndRetainsBnb() public {
         poolManager.setMarketExists(false);
         _fund(1 ether);
+        vm.prank(creator);
         vm.expectRevert("MockPoolManager: market missing");
         vault.processRevenue();
         assertEq(vault.pendingBnb(), 1 ether); // safely retained for retry after governance creates market
@@ -277,6 +341,22 @@ contract MyxVaultHarvestTest is MyxVaultTestBase {
         vm.expectRevert(MyxVault.ZeroDividendContract.selector);
         vault.harvest();
     }
+
+    function test_harvest_revertsOnStaleBnbFeed() public {
+        basePool.setRebate(600 ether);
+        bnbUsdFeed.setAnswer(0);
+        vm.expectRevert(abi.encodeWithSelector(MyxVault.StalePrice.selector, address(bnbUsdFeed)));
+        vault.harvest();
+    }
+
+    function test_harvest_revertsOnOutdatedUsdtFeed() public {
+        // feed answer is positive but last update is older than maxPriceStaleness
+        basePool.setRebate(600 ether);
+        usdtUsdFeed.setUpdatedAt(1);
+        vm.warp(100000);
+        vm.expectRevert(abi.encodeWithSelector(MyxVault.StalePrice.selector, address(usdtUsdFeed)));
+        vault.harvest();
+    }
 }
 
 contract MyxVaultEmergencyTest is MyxVaultTestBase {
@@ -310,75 +390,14 @@ contract MyxVaultEmergencyTest is MyxVaultTestBase {
     }
 }
 
-contract MyxVaultProcessSwapTest is MyxVaultTestBase {
-    MockAggregatorV3 baseFeed;
-    MyxVault swapVault;
-
-    function setUp() public override {
-        super.setUp();
-        baseFeed = new MockAggregatorV3(60_000e8, 8); // base = $60k (BTC-like)
-        MyxVault.InitParams memory p = _initParams(address(baseToken));
-        p.baseTokenUsdFeed = address(baseFeed);
-        swapVault = _deployVault(p);
-        // mock router rate: 1 WBNB ($600) = 0.01 base ($60k) → num=1, den=100
-        router.setRate(1, 100);
-    }
-
-    function _fund(uint256 amount) internal {
-        vm.deal(address(this), amount);
-        (bool ok,) = address(swapVault).call{value: amount}("");
-        assertTrue(ok);
-    }
-
-    function test_processRevenue_swapsToBaseThenDeposits() public {
-        _fund(1 ether);
-        swapVault.processRevenue();
-        // 1 BNB → 0.01 base at fair rate; deposited into pool
-        assertEq(basePool.lastDepositAmount(), 0.01 ether);
-        assertEq(swapVault.pendingBnb(), 0);
-    }
-
-    function test_processRevenue_revertsWhenSwapWorseThanSlippageBound() public {
-        // fair = 0.01 base/BNB; bound = 0.0097 (3%); router pays only 0.005 → must revert
-        router.setRate(1, 200);
-        _fund(1 ether);
-        vm.expectRevert("MockRouter: INSUFFICIENT_OUTPUT_AMOUNT");
-        swapVault.processRevenue();
-        assertEq(swapVault.pendingBnb(), 1 ether); // retained for retry
-    }
-
-    function test_processRevenue_revertsOnStaleFeed() public {
-        baseFeed.setAnswer(0);
-        _fund(1 ether);
-        vm.expectRevert(abi.encodeWithSelector(MyxVault.StalePrice.selector, address(baseFeed)));
-        swapVault.processRevenue();
-    }
-
-    function test_processRevenue_revertsOnStaleBnbFeed() public {
-        bnbUsdFeed.setAnswer(0);
-        _fund(1 ether);
-        vm.expectRevert(abi.encodeWithSelector(MyxVault.StalePrice.selector, address(bnbUsdFeed)));
-        swapVault.processRevenue();
-    }
-
-    function test_processRevenue_revertsOnOutdatedBaseFeed() public {
-        // base feed answer is positive but last update is older than maxPriceStaleness
-        baseFeed.setUpdatedAt(1); // far in the past relative to fork/test timestamp
-        vm.warp(100000);
-        _fund(1 ether);
-        vm.expectRevert(abi.encodeWithSelector(MyxVault.StalePrice.selector, address(baseFeed)));
-        swapVault.processRevenue();
-    }
-}
-
 contract MyxVaultViewsTest is MyxVaultTestBase {
     function setUp() public override {
         super.setUp();
         // Register the pool so userLpShare can discover basePoolToken == address(lpToken)
         PoolMetadata memory meta;
         meta.marketId = marketId;
-        meta.poolId = MyxPoolId.derive(marketId, address(wbnb));
-        meta.baseToken = address(wbnb);
+        meta.poolId = MyxPoolId.derive(marketId, address(taxToken));
+        meta.baseToken = address(taxToken);
         meta.basePoolToken = address(lpToken);
         poolManager.setPool(meta.poolId, meta);
     }

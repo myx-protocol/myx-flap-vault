@@ -4,7 +4,7 @@ pragma solidity ^0.8.26;
 import {Test} from "forge-std/Test.sol";
 import {MyxVaultFactory} from "../src/MyxVaultFactory.sol";
 import {MyxVault} from "../src/MyxVault.sol";
-import {MarketId} from "../src/myx/IMyxPool.sol";
+import {MarketId, PoolId, MyxPoolId} from "../src/myx/IMyxPool.sol";
 import {IVaultFactoryValidationV2} from "../src/flap/IVaultFactory.sol";
 import "./mocks/Mocks.sol";
 
@@ -76,15 +76,16 @@ contract MyxVaultFactoryTest is Test {
             factory.newVault(makeAddr("tax"), address(0), makeAddr("creator"), _vaultData(address(wbnb)));
         MyxVault v = MyxVault(payable(vaultAddr));
         assertEq(v.taxToken(), makeAddr("tax"));
-        assertEq(v.baseToken(), address(wbnb));
+        // v3: poolId is keyed by the tax token itself (buyback design)
+        assertEq(PoolId.unwrap(v.poolId()), PoolId.unwrap(MyxPoolId.derive(marketId, makeAddr("tax"))));
         assertEq(v.creator(), makeAddr("creator"));
         vm.expectRevert();
         v.initialize(
             MyxVault.InitParams({
-                taxToken: address(1), creator: address(1), baseToken: address(1),
+                taxToken: address(1), creator: address(1),
                 marketId: marketId, poolManager: address(1), basePool: address(1),
                 swapRouter: address(1), wbnb: address(1), quoteToken: address(1),
-                bnbUsdFeed: address(1), usdtUsdFeed: address(1), baseTokenUsdFeed: address(1),
+                bnbUsdFeed: address(1), usdtUsdFeed: address(1),
                 maxSlippageBps: 0, minProcessAmount: 0, maxPriceStaleness: 0
             })
         );
@@ -148,14 +149,8 @@ contract MyxVaultFactoryTest is Test {
         new MyxVaultFactory(_baseConfig(), bt, fd);
     }
 
-    function test_newVault_wiresBaseTokenFeed() public {
-        vm.prank(VAULT_PORTAL);
-        address vaultAddr =
-            factory.newVault(makeAddr("tax"), address(0), makeAddr("creator"), _vaultData(address(btcb)));
-        MyxVault v = MyxVault(payable(vaultAddr));
-        assertEq(address(v.baseTokenUsdFeed()), address(btcbFeed));
-        assertEq(v.baseToken(), address(btcb));
-    }
+    // NOTE(v3-2): test_newVault_wiresBaseTokenFeed removed — the vault no longer stores
+    // baseToken/baseTokenUsdFeed (buyback design). Factory tests are rebuilt in v3-2.
 
     function test_lockVaultUpgrades_blocksFurtherUpgrades() public {
         address newImpl = address(new MyxVault());
