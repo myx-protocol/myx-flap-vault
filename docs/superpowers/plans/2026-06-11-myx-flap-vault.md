@@ -1965,3 +1965,44 @@ git commit -m "feat: add factory deployment scripts for bnb testnet and mainnet"
 1. **Task 0 may invalidate Task 8's dividend-forwarding assumption.** If the Dividend contract rejects external deposits, stop and re-plan Task 8 (fallback: vault-internal snapshot distribution — significant scope change requiring user sign-off).
 2. **Fork test RPC flakiness**: pin a block with `--fork-block-number` if public-RPC instability causes nondeterminism.
 3. **OZ v4.9.6 vs v5 API drift**: this repo pins v4.9.6 — `ReentrancyGuardUpgradeable` lives under `security/`, `UpgradeableBeacon` constructor takes only the implementation address. Do not copy v5-style imports from elsewhere.
+
+---
+
+# v3 Rework Addendum (2026-06-12)
+
+The flow was redesigned AFTER Tasks 0-14 completed (design doc v3): tax BNB now buys back
+THE TAX TOKEN ITSELF via the Flap Portal and deposits it as MYX base liquidity. The task
+bodies above describe the v2 implementation as executed; this addendum records the v3 delta.
+Code blocks in Tasks 5/7/11 are historical — the source of truth is the contracts themselves.
+
+## What changed (commits c5a8b63, 446aadb, 1dc21b2, c608dee)
+
+| Area | v2 (as executed above) | v3 (current) |
+|---|---|---|
+| Buy leg | wrap WBNB / Pancake swap to whitelisted base, Chainlink minOut | `IPortalTradeV2.swapExactInput{value}` BUY (0 → taxToken); minOut = same-block `quoteExactInput` × (1 - maxSlippageBps); **balance-delta accounting** (DEX-phase buys land net of transfer tax) |
+| Base asset | factory-whitelisted (WBNB/BTCB + feeds, 18-dec enforced) | the tax token itself; `poolId = derive(marketId, taxToken)`; auto-deploy is the main path |
+| processRevenue | permissionless | **OPERATOR_ROLE** (creator + guardian; guardian as DEFAULT_ADMIN can grant more) — the tax token has no external price feed, so a same-block quote cannot prevent sandwiches; matches VaultBase's prescribed pattern for buyback-style operations |
+| harvest | unchanged | unchanged (USDT→WBNB Pancake leg keeps Chainlink staleness-checked minOut; permissionless) |
+| Factory | base whitelist + feed registry + decimals guard | `vaultData = abi.encode(MarketId)` only; whitelist machinery removed; GlobalConfig unchanged |
+| InitParams | 15 fields | 13 fields (baseToken, baseTokenUsdFeed removed) |
+
+## v3 verification evidence
+
+- **phase0-v3-findings.md**: vault→MYX pool transferFrom is UNTAXED (Flap V3 taxes only
+  registered-pool counterparties; `pools` set is immutable post-initialize) — deposit leg
+  needs no shortfall handling. Portal BUY lands full on the bonding curve, net on DEX phase
+  → balance-delta accounting. decimals == 18 confirmed.
+- **Fork e2e (real BSC)**: launch → trade → dispatch (Rule 005 live) → operator-pranked
+  processRevenue executing a REAL Portal bonding-curve buyback → auto-deployPool → deposit.
+  Observed: quoteExactInput == received balance delta EXACTLY (BC-phase tax is taken on the
+  BNB side; quote/swap share the same basis); 5% slippage bound absorbed zero deviation.
+- **Spec-checker delta audit** (docs/spec-checker-findings.md, v3 section): no Critical/High;
+  Rule 003 operator-gating matches VaultBase guidance; guardian holds OPERATOR_ROLE
+  irrevocably (new test `test_revokeGuardianOperatorRole_reverts`).
+
+## Final state
+
+- 49 non-fork tests + 1 fork e2e, all green. `forge build` clean.
+- Accepted/advisory items: Rule 004 custom errors (Medium, UI ergonomics); operator txs
+  should use a private relay and small batches (same-block quote bounds intra-call deviation
+  only); donated tokens unsweepable without upgrade (Rule 009 proxy exception).
