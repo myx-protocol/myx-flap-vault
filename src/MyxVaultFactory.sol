@@ -31,6 +31,7 @@ contract MyxVaultFactory is VaultFactoryBaseV2 {
     error OnlyGuardian();
     error UpgradesLocked();
     error ConfigLengthMismatch();
+    error ZeroFeedForNonWbnbToken(address baseToken);
 
     event VaultCreated(address indexed vault, address indexed taxToken, address indexed creator, address baseToken);
     event VaultImplementationUpgraded(address newImplementation);
@@ -47,6 +48,12 @@ contract MyxVaultFactory is VaultFactoryBaseV2 {
         if (baseTokens.length != feeds.length) revert ConfigLengthMismatch();
         config = _config;
         for (uint256 i = 0; i < baseTokens.length; i++) {
+            // WBNB uses the wrap-only path (no swap, no feed); every other base token
+            // is swapped via PancakeV2 and MUST have a USD feed, else processRevenue would
+            // call _readPrice(address(0)) and revert forever (factory is non-upgradeable).
+            if (feeds[i] == address(0) && baseTokens[i] != _config.wbnb) {
+                revert ZeroFeedForNonWbnbToken(baseTokens[i]);
+            }
             isSupportedBaseToken[baseTokens[i]] = true;
             baseTokenFeeds[baseTokens[i]] = feeds[i];
         }
@@ -105,6 +112,11 @@ contract MyxVaultFactory is VaultFactoryBaseV2 {
         return quoteToken == address(0); // native BNB only
     }
 
+    /// @notice Pre-launch validation hook (Flap VaultPortal calls this before token creation).
+    /// @dev LIMITATION: Flap's LaunchValidationDataV1 does NOT carry vaultData, so the target
+    ///      baseToken cannot be validated here. A launch with an unsupported baseToken passes
+    ///      this hook but reverts later in newVault (UnsupportedBaseToken). Operators must
+    ///      ensure the chosen baseToken is factory-supported before launching.
     function _validateBeforeLaunch(IVaultFactoryValidationV2.LaunchValidationDataV1 memory data)
         internal
         view

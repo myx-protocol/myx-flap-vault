@@ -43,22 +43,22 @@ contract MyxVaultFactoryTest is Test {
         feeds[0] = address(0); // WBNB path needs no feed
         feeds[1] = address(btcbFeed);
 
-        factory = new MyxVaultFactory(
-            MyxVaultFactory.GlobalConfig({
-                poolManager: address(poolManager),
-                basePool: address(basePool),
-                swapRouter: address(router),
-                wbnb: address(wbnb),
-                quoteToken: address(usdt),
-                bnbUsdFeed: address(bnbFeed),
-                usdtUsdFeed: address(usdtFeed),
-                maxSlippageBps: 300,
-                minProcessAmount: 0.1 ether,
-                maxPriceStaleness: 3600
-            }),
-            baseTokens,
-            feeds
-        );
+        factory = new MyxVaultFactory(_baseConfig(), baseTokens, feeds);
+    }
+
+    function _baseConfig() internal view returns (MyxVaultFactory.GlobalConfig memory) {
+        return MyxVaultFactory.GlobalConfig({
+            poolManager: address(poolManager),
+            basePool: address(basePool),
+            swapRouter: address(router),
+            wbnb: address(wbnb),
+            quoteToken: address(usdt),
+            bnbUsdFeed: address(bnbFeed),
+            usdtUsdFeed: address(usdtFeed),
+            maxSlippageBps: 300,
+            minProcessAmount: 0.1 ether,
+            maxPriceStaleness: 3600
+        });
     }
 
     function _vaultData(address base) internal view returns (bytes memory) {
@@ -127,5 +127,42 @@ contract MyxVaultFactoryTest is Test {
 
     function test_factorySpecVersion() public view {
         assertEq(factory.factorySpecVersion(), "v2.2");
+    }
+
+    function test_constructor_rejectsZeroFeedForNonWbnb() public {
+        address[] memory bt = new address[](1);
+        bt[0] = address(btcb); // non-WBNB
+        address[] memory fd = new address[](1);
+        fd[0] = address(0);
+        vm.expectRevert(abi.encodeWithSelector(MyxVaultFactory.ZeroFeedForNonWbnbToken.selector, address(btcb)));
+        new MyxVaultFactory(_baseConfig(), bt, fd);
+    }
+
+    function test_constructor_rejectsLengthMismatch() public {
+        address[] memory bt = new address[](2);
+        bt[0] = address(wbnb);
+        bt[1] = address(btcb);
+        address[] memory fd = new address[](1);
+        fd[0] = address(0);
+        vm.expectRevert(MyxVaultFactory.ConfigLengthMismatch.selector);
+        new MyxVaultFactory(_baseConfig(), bt, fd);
+    }
+
+    function test_newVault_wiresBaseTokenFeed() public {
+        vm.prank(VAULT_PORTAL);
+        address vaultAddr =
+            factory.newVault(makeAddr("tax"), address(0), makeAddr("creator"), _vaultData(address(btcb)));
+        MyxVault v = MyxVault(payable(vaultAddr));
+        assertEq(address(v.baseTokenUsdFeed()), address(btcbFeed));
+        assertEq(v.baseToken(), address(btcb));
+    }
+
+    function test_lockVaultUpgrades_blocksFurtherUpgrades() public {
+        address newImpl = address(new MyxVault());
+        vm.prank(GUARDIAN);
+        factory.lockVaultUpgrades();
+        vm.prank(GUARDIAN);
+        vm.expectRevert(MyxVaultFactory.UpgradesLocked.selector);
+        factory.upgradeVaultImplementation(newImpl);
     }
 }
