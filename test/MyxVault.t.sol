@@ -611,6 +611,44 @@ contract MyxVaultTriggerTest is MyxVaultTestBase {
         assertEq(vault.pendingBnb(), 1);
     }
 
+    function test_trigger_modeSwitchedToAuto_completesCycleButDoesNotReschedule() public {
+        // Loop is running in TRIGGERED mode with a trigger in-flight. The creator switches to AUTO
+        // mid-cycle. The in-flight trigger must still complete its current cycle (harvest + buyback)
+        // but MUST NOT re-arm the loop, so switching away from TRIGGERED cleanly winds it down.
+        basePool.setRebate(600 ether);
+        _fund(1 ether);
+        vault.scheduleTrigger(); // id 1
+        assertEq(vault.pendingTriggerId(), 1);
+
+        // operator/creator decides to abandon automation
+        vm.prank(creator);
+        vault.setMode(MyxVault.Mode.AUTO);
+
+        triggerService.fire(address(vault), 1);
+
+        // current cycle still settled rewards and ran the buyback...
+        assertEq(dividend.totalDeposited(), 600 ether);
+        assertEq(basePool.depositCallCount(), 1);
+        assertGt(vault.totalLpMinted(), 0);
+        // ...but the loop did NOT re-arm: no new trigger scheduled, no extra fee skimmed.
+        assertEq(vault.pendingTriggerId(), 0);
+    }
+
+    function test_trigger_modeSwitchedToManual_doesNotReschedule() public {
+        // Same wind-down guarantee for the MANUAL target mode.
+        _fund(1 ether);
+        vault.scheduleTrigger(); // id 1
+        assertEq(vault.pendingTriggerId(), 1);
+
+        vm.prank(creator);
+        vault.setMode(MyxVault.Mode.MANUAL);
+
+        triggerService.fire(address(vault), 1);
+
+        // loop wound down: no reschedule
+        assertEq(vault.pendingTriggerId(), 0);
+    }
+
     function _freshParams() internal returns (MyxVault.InitParams memory p) {
         // a tax token whose pool key is not pre-registered in poolManager
         MockTaxToken freshTax = new MockTaxToken(address(dividend));

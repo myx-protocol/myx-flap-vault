@@ -297,15 +297,24 @@ contract MyxVault is
         // trades, which create dividend holders, so totalShares>0 by the time BNB accumulates.
         _harvestInternal(); // always settle rewards; never reverts on an empty rebate
 
-        uint256 fee = IFlapTriggerService(triggerService).getFee();
-        // reschedule the next cycle, paying the fee from pendingBnb (the only BNB the vault holds)
-        if (pendingBnb >= fee) {
-            pendingBnb -= fee;
-            _scheduleNext(fee);
-        } else {
-            // not enough BNB to pay for the next trigger: the automation loop stops here and
-            // must be restarted via scheduleTrigger() once new tax revenue arrives.
-            emit LoopStalled(pendingBnb);
+        // Reschedule ONLY while still in TRIGGERED mode. If a setMode(AUTO|MANUAL) landed while this
+        // trigger was in-flight, the current cycle's harvest+buyback still complete (harmless), but
+        // the loop is NOT re-armed — so switching away from TRIGGERED cleanly winds the automation
+        // down after the in-flight trigger instead of self-perpetuating forever (and draining
+        // pendingBnb on trigger fees against the operator's intent). pendingTriggerId was already
+        // consumed in trigger(), so leaving it at 0 here makes scheduleTrigger() the explicit
+        // restart path once TRIGGERED is re-selected.
+        if (mode == Mode.TRIGGERED) {
+            uint256 fee = IFlapTriggerService(triggerService).getFee();
+            // reschedule the next cycle, paying the fee from pendingBnb (the only BNB the vault holds)
+            if (pendingBnb >= fee) {
+                pendingBnb -= fee;
+                _scheduleNext(fee);
+            } else {
+                // not enough BNB to pay for the next trigger: the automation loop stops here and
+                // must be restarted via scheduleTrigger() once new tax revenue arrives.
+                emit LoopStalled(pendingBnb);
+            }
         }
         // buy back with whatever BNB remains, if it clears the threshold
         uint256 bought = 0;

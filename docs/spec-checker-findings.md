@@ -155,3 +155,83 @@ No leftover whitelist state, imports, errors, or script parameters: `src/`, `scr
 | Low/Info | 3 | R-02 donated-token note; N-01 operator-grant authority note; v1 schema-coverage note (carried) |
 
 **No Critical or High findings. v3 rework is spec-compliant; suite green at 49/49 non-fork tests.**
+
+## v4 Delta Audit (2026-06-12)
+
+**Scope of delta:** commits `293fdc7` (distribute rebates directly as `dividendToken`; remove swap + price-feed deps), `22d9641` (TRIGGERED mode + Flap `TriggerService` automation), `8f71fce` (gate trigger loop on a deployed pool; loop-stall visibility), `8f0c9d4` (factory dividend-token precheck; triggered-mode fork e2e), plus doc commits `9849165`/`853b150`. Re-audited `src/MyxVault.sol` + `src/MyxVaultFactory.sol` against rules 001–009. **Rule 008 is now IN SCOPE** (v4 integrates `IFlapTriggerService`/`ITriggerReceiver`); it was N/A in v1/v3.
+
+**Test result:** `forge build` green; `forge test --no-match-path test/Integration.fork.t.sol` → **80 passed, 0 failed** (78 pre-existing + 2 added by this audit). Fork e2e (`--fork-url https://bsc-dataseed.binance.org`) → **2 passed, 0 failed** (`test_endToEnd_launchTradeDispatchProcess`, `test_endToEnd_triggeredMode`; real-Portal triggered callback ≈ 0.54M gas, under the 2M cap).
+
+### Rule 008 verdict — **PASS** (now in-scope)
+
+Trigger-service integration (`MyxVault.trigger` / `_runCycle` / `_scheduleNext` / `scheduleTrigger` / `ensurePoolDeployed`) is fully compliant with Rule 008:
+
+| Rule 008 requirement | Severity | Verdict | Evidence (`MyxVault.sol`) |
+|----------------------|----------|---------|---------------------------|
+| Callback sender validation — `trigger()` rejects non-service callers | **Critical** | **PASS** | `:280` `if (msg.sender != triggerService) revert OnlyTriggerService();` (first statement, before any state change) |
+| Request replay protection — id bound, single in-flight, consumed before external calls | **High** | **PASS** | `pendingTriggerId` bound in `_scheduleNext` (`:323`); `trigger()` checks `requestId == pendingTriggerId && requestId != 0` (`:281`) then sets `pendingTriggerId = 0` **before** `_runCycle()` external calls (`:282`). Re-firing a consumed id reverts `UnknownTrigger` (test `test_trigger_unknownRequestId_reverts`, `test_trigger_runsCycleAndReschedules` replay assertion). `scheduleTrigger` blocks a second concurrent schedule (`TriggerAlreadyScheduled`, `:334`) |
+| Delay-aware execution — re-derive market-sensitive bounds at callback time, re-check thresholds | **High** | **PASS** | Buyback `minOut` is re-derived from a **fresh same-block `quoteExactInput`** inside `_buyTaxToken` at callback time (`:206-214`) — no scheduling-time price is reused; `minProcessAmount` is re-checked in `_runCycle` (`:312`) so a below-threshold remainder safely SKIPS the buyback instead of forcing it |
+| Callback ≤ 2M gas — bounded, deterministic, no heavy ops in the callback | **High** | **PASS** | Measured ≈ 0.48M (mock, `test_trigger_gasUnderCallbackCap` asserts < 2M) / ≈ 0.54M (real-Portal fork). The heavy myx `deployPool` is gated OUT of the callback: `scheduleTrigger` refuses to start the loop until the pool exists (`PoolNotDeployed`, `:333`), and `deployPool` runs out-of-band via permissionless `ensurePoolDeployed()` (`:343-345`). Callback has no unbounded loop / unbounded storage writes |
+| Reentrancy + bounded effects on callback path | **Medium** | **PASS** | `trigger` / `scheduleTrigger` / `ensurePoolDeployed` are all `nonReentrant`; they share the one `ReentrancyGuardUpgradeable` slot with `processRevenue` / `harvest` / `emergencyWithdraw` / `emergencySweepBnb`, so the tax-token transfer hook (`setShare`) cannot reenter any state-mutating path |
+
+**Failure-recovery posture (consistent with anti-fallback principle):** consuming `pendingTriggerId` before the external calls means a reverting `_runCycle` (e.g. `DividendDepositFailed` when `totalShares == 0`) restores nothing automatically — the service records the callback `FAILED` and **anyone** can `retryTrigger()` (no gas cap) or restart via `scheduleTrigger()` once a new request is needed. No silent fallback path was added. This coupling is documented in-code (`_harvestInternal` / `_runCycle` natspec) and accepted.
+
+### Per-rule delta verdicts (rules touched by v4)
+
+| Rule | Delta verdict | Evidence |
+|------|---------------|----------|
+| 001 — Inheritance / `vaultUISchema()` / `description()` accurate for 3 modes + direct distribution | **PASS** | `description()` (`:401-413`) states Portal buyback, vault-held LP, direct dividend distribution, and the live mode via `_modeLabel()` (TRIGGERED/AUTO/MANUAL, `:416-420`); `vaultUISchema` (`:422-456`) `processRevenue` method text documents all three modes and that TRIGGERED also runs automatically; `harvest` marked "Anyone can call." Both accurate post-v4 |
+| 001 — Guardian holds every privileged role incl. `OPERATOR_ROLE`; irrevocable | **PASS** | `initialize` grants guardian `DEFAULT_ADMIN_ROLE` + `EMERGENCY_ROLE` + `OPERATOR_ROLE` (`:133-136`); `revokeRole` override is **role-agnostic** — reverts for any `account == _getGuardian()` (`:150-153`), so `OPERATOR_ROLE` is covered. `setMode` is creator-or-Guardian (`:194`), so the Guardian can always override a creator that parks the vault in an unwanted mode |
+| 001 — No DOS via dev parameter manipulation | **PASS** | Still no post-init economic setters; `maxSlippageBps` / `minProcessAmount` / `triggerService` / `triggerInterval` all frozen at `initialize` from the factory `config` (set once in the factory constructor, no setter). `setMode` only toggles the trigger model, cannot brick user funds (AUTO is the permissionless liveness fallback) |
+| 002 — Factory structural compliance; precheck + GlobalConfig changes | **PASS** | `GlobalConfig` added `triggerService` + `triggerInterval`, removed the v3 feed/swap fields (`MyxVaultFactory.sol:16-23`); `newVault` still portal-gated (`:58`), native-quote-only (`:59`), `vaultDataSchema` single `bytes32 marketId` matches `abi.decode(vaultData,(MarketId))` (`:61`). `_validateBeforeLaunch` precheck rejects native-BNB dividend and the self-dividend magic (`:99-111`) — a lightweight launch-time guard, NOT a whitelist; exact `dividendToken`↔market consistency is enforced at runtime in the vault. Factory still non-upgradeable; beacon upgrade `onlyGuardian` + lockable. Zero-commission posture unchanged (v1 §1) |
+| 003 — Fairness / sandwich-risk across 3 modes + permissionless harvest | **PASS (M-02 advisory carried)** | `processRevenue` operator-gated in TRIGGERED/MANUAL, permissionless in AUTO (`:167`); the buyback `minOut` is a same-block quote bound that cannot stop a sandwich on its own (honestly documented in-code) — in TRIGGERED/MANUAL the caller gate is the protection, in AUTO it is the accepted liveness/MEV trade-off (M-02, carried from v3). **harvest is now MEV-free**: v4 removed the USDT→WBNB swap, so harvest is a claim + direct `dividendToken` deposit with **no swap and therefore no sandwich surface** — making it permissionless in all modes is sound. No mutable privileged knob can pre-condition a sandwich |
+| 004 — Literal `require` strings | **FAIL (Medium, unchanged)** | v4 kept custom errors and added trigger errors (`OnlyTriggerService`, `UnknownTrigger`, `TriggerAlreadyScheduled`, `PoolNotDeployed`, `:62-67`). Disposition unchanged from v1 §2 (documented, not fixed — Medium per task scope). The single literal `require` is `emergencySweepBnb` (`"BNB_SWEEP_FAILED"`, `:374`) |
+| 005 — `receive()` ≤ 1M gas | **PASS (no regression)** | `receive()` untouched by v4 (`:144-147`): `pendingBnb += msg.value` + event, no external call/loop/delegatecall; `test_receive_gasUnder1M` green |
+| 006 — Integration tests cover v4 flows | **PASS** | New `MyxVaultTriggerTest` suite covers schedule bootstrap, already-scheduled / insufficient-BNB / not-TRIGGERED-mode / pool-not-deployed reverts, only-service callback, unknown-id replay, full cycle + reschedule, harvest backstop below buyback threshold, callback gas < 2M, loop-stall emission, permissionless `ensurePoolDeployed`; `MyxVaultHarvestTest` covers direct distribution + the 3 misconfig reverts; fork e2e adds a real-Portal triggered-mode path (`8f0c9d4`). **2 tests added by this audit** for the mode-switch wind-down fix (below) |
+| 007 — AI oracle | **N/A (unchanged)** | No `IFlapAIProvider` / `FlapAIConsumerBase` import or callback |
+| 009 — Emergency controls | **PASS (upgradeable exception, unchanged)** | Vault still `BeaconProxy`-deployed; upgrade authority guardian-only + lockable; bonus `emergencyWithdraw` / `emergencySweepBnb` unchanged (both `nonReentrant`, `EMERGENCY_ROLE`) |
+
+### Part 2 — holistic v4 findings & dispositions
+
+#### H-01 (High — FIXED this audit): mode switch did not wind down the TRIGGERED loop (`_runCycle` rescheduled regardless of mode)
+
+**Finding.** `trigger()` validated only the caller and the request id — it had no mode check — and `_runCycle` **unconditionally** rescheduled the next trigger via `_scheduleNext`. State trace: vault in TRIGGERED with a trigger in-flight (`pendingTriggerId = N`, fee already reserved) → creator/Guardian calls `setMode(AUTO)` (or `MANUAL`); `setMode` only writes `mode` and does not touch `pendingTriggerId` → the backend later fires `trigger(N)` → `_runCycle` re-armed the loop with a fresh `requestTrigger{value: fee}`, **re-binding `pendingTriggerId` even though the vault was no longer in TRIGGERED mode**. Consequence: switching away from TRIGGERED did NOT stop the automation; it self-perpetuated indefinitely, skimming a trigger fee from `pendingBnb` every cycle against the operator's intent — defeating the Guardian's documented ability to "翻回 AUTO 防 creator grief" (design doc §0.1) and, in AUTO, running the timed callback and the permissionless path in parallel.
+
+**Fix (`MyxVault.sol` `_runCycle`).** Gated the reschedule block on `if (mode == Mode.TRIGGERED)`. An in-flight trigger that fires after a `setMode(AUTO|MANUAL)` still completes its current cycle (harvest + conditional buyback are harmless), but the loop is **not** re-armed — `pendingTriggerId` was already consumed in `trigger()` so it stays `0`, making `scheduleTrigger()` the explicit restart path once TRIGGERED is re-selected. This is exactly the wind-down behavior the operator expects. No silent fallback added.
+
+**Regression tests added.** `test_trigger_modeSwitchedToAuto_completesCycleButDoesNotReschedule` (asserts harvest + buyback ran, `pendingTriggerId == 0` afterward) and `test_trigger_modeSwitchedToManual_doesNotReschedule`.
+
+#### F-01 (Info — verified safe, no change): `harvest()` on an undeployed pool reverts cleanly, never misroutes
+
+The harvest direct-distribution invariant is `pool.quoteToken == dividend.dividendToken()`, enforced in `_forwardToDividend` via `DividendTokenMismatch` (`:354`). If `getPool(poolId).quoteToken == address(0)` (pool not yet deployed) and someone calls `harvest()` directly, `rewardToken = address(0)` and `IERC20(address(0)).balanceOf(address(this))` reverts (call to a codeless address) — **empirically confirmed**: harvest reverts with empty data, moves no funds, cannot misroute. The triggered path can never hit this (`scheduleTrigger` gates on `PoolNotDeployed`; `_processInternal` calls `_ensurePoolExists`); only a direct permissionless `harvest()` on a brand-new vault reaches it, and it fails safely. The empty revert reason is a minor UX nit (Info), not a funds risk.
+
+#### F-02 (Info — verified safe): trigger-fee accounting has no double-spend or stranded BNB across the state space
+
+`pendingBnb` is pure accounting: every inflow is `receive()`'s `pendingBnb += msg.value`; every outflow decrements it exactly once and sends exactly that value. Verified paths: (a) `scheduleTrigger` decrements `pendingBnb -= fee` once, then `_scheduleNext` sends `fee` but does **not** decrement again (no double-decrement); (b) `_runCycle` decrements `pendingBnb -= fee` once before `_scheduleNext`, and the subsequent buyback reads `pendingBnb` **after** the fee deduction so the fee is correctly excluded from the buy amount; (c) `_processInternal` zeroes `pendingBnb` then sends the prior amount (balanced); (d) a reverting `requestTrigger` rolls back the whole tx (no try/catch), so a fee decrement can never strand without the matching send. `emergencySweepBnb` drains the full `address(this).balance` and zeroes `pendingBnb` — consistent. Mid-cycle dispatch (a new `receive()` inflow) can only land between txs and merely augments `pendingBnb` for the next cycle; the tax-token `setShare` hook during the buy transfers no BNB and is reentrancy-blocked. No double-spend, no stranded BNB.
+
+#### F-03 (Info — advisory, no change): zero-address `triggerService` is recoverable, not a brick
+
+If a custom/testnet deploy sets `config.triggerService = address(0)`, a vault in the default TRIGGERED mode cannot start its loop — `scheduleTrigger` → `IFlapTriggerService(address(0)).getFee()` reverts (codeless call). This is **fully recoverable**: `setMode(AUTO|MANUAL)` never touches `triggerService`, so the operator falls back to the permissionless/operator path and no funds are stranded. The mainnet deploy script defaults `triggerService` to the canonical `0xcf4EE2…a7F9` and testnet reads it from `FLAP_TRIGGER_SERVICE`, so this only arises from an explicit env misconfig. **Disposition: accepted as Info.** A cheap fail-fast guard in `initialize` (`require(p.triggerService != address(0), "triggerService=0")`) would convert a confusing runtime revert into a clear deploy-time failure; recommended but optional and out of the Critical/High remediation scope. Not added to avoid touching the init surface without product sign-off.
+
+#### F-04 (Info — verified clean): storage layout / `__gap` is collision-free post add/remove
+
+`forge inspect MyxVault storage` confirms: each upgradeable parent retains its own gap (`Initializable` slot 0; OZ ancestor gaps `__gap[50]` at slots 1 and 51; `AccessControlUpgradeable._roles` slot 101 + `__gap[49]`; `ReentrancyGuardUpgradeable._status` slot 151 + `__gap[49]`) — **no parent collision**. MyxVault's own vars occupy slots 201–212; `mode` (1B) + `triggerService` (20B) + `triggerInterval` (8B) pack into slot 211, `pendingTriggerId` at 212, `__gap[40]` from slot 213. The v4 add (triggerService/triggerInterval) and remove (6 feed/swap slots) net out with the comment's `gap 42→40` bookkeeping. Since the contract is **not yet deployed**, the field reorder is moot for upgrade safety anyway. Clean.
+
+### Changes made by this audit
+
+| Change | File | Rationale |
+|--------|------|-----------|
+| Gate `_runCycle` reschedule on `mode == Mode.TRIGGERED` | `src/MyxVault.sol` | H-01: a `setMode(AUTO\|MANUAL)` with a trigger in-flight must wind the loop down, not re-arm it |
+| Added `test_trigger_modeSwitchedToAuto_completesCycleButDoesNotReschedule` | `test/MyxVault.t.sol` | Regression for H-01: in-flight trigger completes its cycle but `pendingTriggerId` stays 0 |
+| Added `test_trigger_modeSwitchedToManual_doesNotReschedule` | `test/MyxVault.t.sol` | Regression for H-01: same wind-down for the MANUAL target |
+
+### v4 delta severity roll-up
+
+| Severity | Count | Items |
+|----------|-------|-------|
+| Critical | 0 | — |
+| High     | 1 | H-01 mode-switch reschedule coupling — **FIXED + regression-tested** |
+| Medium   | 2 | Rule 004 custom errors (carried, unchanged); M-02 mempool sandwich advisory (carried, accepted, operational mitigation) |
+| Low/Info | 4 | F-01 harvest-on-undeployed-pool reverts-safely note; F-02 BNB-accounting clean note; F-03 zero-`triggerService` recoverable advisory; F-04 storage/gap clean note |
+
+**Rule 008 (now in-scope): PASS. One High found and FIXED (H-01). All other delta findings are Info/accepted. Suite green at 80/80 non-fork + 2/2 fork e2e.**
