@@ -2006,3 +2006,33 @@ Code blocks in Tasks 5/7/11 are historical — the source of truth is the contra
 - Accepted/advisory items: Rule 004 custom errors (Medium, UI ergonomics); operator txs
   should use a private relay and small batches (same-block quote bounds intra-call deviation
   only); donated tokens unsweepable without upgrade (Rule 009 proxy exception).
+
+---
+
+# v4 Rework Addendum (2026-06-12)
+
+Built on top of v3. Three user-directed changes; design source of truth is
+docs/flap-vault-integration-design.md §0 (v4) + the contracts.
+
+## What changed (commits 293fdc7, 22d9641, 8f71fce, 8f0c9d4, 657678e + docs)
+
+| Area | v3 | v4 |
+|---|---|---|
+| Modes | AUTO / MANUAL (default AUTO) | **TRIGGERED (default)** / AUTO / MANUAL. TRIGGERED self-schedules via Flap TriggerService callbacks; AUTO permissionless; MANUAL operator-only. processRevenue public entry: AUTO=anyone, else=OPERATOR_ROLE. harvest permissionless in all modes. |
+| harvest distribution | claim USDT rebate → Pancake swap USDT→WBNB (Chainlink minOut) → Dividend.deposit(WBNB) | **claim rebate (= pool quote = the token's dividendToken) → Dividend.deposit() DIRECTLY.** No swap, no feeds. Invariant `pool.quoteToken == dividend.dividendToken()` enforced at runtime. |
+| Dependencies | Portal + myx + Dividend + Pancake + Chainlink | **Portal + myx + Dividend + TriggerService** (removed swapRouter/wbnb/quoteToken/bnbUsdFeed/usdtUsdFeed/maxPriceStaleness/_readPrice/SWAP_DEADLINE). |
+| Automation | manual/keeper | `trigger(uint256)` (ITriggerReceiver, Rule 008 compliant) runs harvest backstop + reschedule + conditional buyback; `scheduleTrigger()` bootstrap (gated on pool deployed); `ensurePoolDeployed()` moves heavy deployPool out of the 2M callback; trigger fee paid from pendingBnb. |
+| Factory | — | `_validateBeforeLaunch` rejects native(0)/self-magic dividendToken (lightweight, no whitelist); GlobalConfig +triggerService/+triggerInterval, −feed/swap fields. |
+
+## Verification
+
+- 80 non-fork tests + 2 real-BSC-fork e2e (manual buyback path + **triggered path against the live TriggerService**: real getFee 0.0002 BNB, real request ids 3044→3045, callback gas 542K < 2M). All green.
+- spec-checker: **Rule 008 now in-scope → PASS** (caller check, replay protection, fresh-quote re-validation, ≤2M gas via pool-deploy gate, nonReentrant). Full delta audit in docs/spec-checker-findings.md.
+- Final holistic review fixed H-01 (mode switch did not wind down the trigger loop → `_runCycle` reschedule now gated on `mode == TRIGGERED`).
+
+## Phase-0-v4 open items (network/myx-BSC required)
+
+- ERC20(USDT) dividend `deposit(uint256)` permissionless when dividendBps>0 (verified on WBNB instances; not on USDT+dividendBps>0 combo — network hard-blocked this session).
+- USDT-dividend claim pays USDT directly (inferred: unwrap only when dividendToken==weth).
+- Real myx deployPool gas ≤ 2M (fork-measure once myx ships on BSC).
+- myx has quote=USDT / quote=USDC markets (deployment prerequisite).
