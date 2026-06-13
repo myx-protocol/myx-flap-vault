@@ -103,8 +103,37 @@ contract MyxVaultFactoryTest is Test {
     function test_validateBeforeLaunch_acceptsBnbQuote() public view {
         IVaultFactoryValidationV2.LaunchValidationDataV1 memory data;
         data.quoteToken = address(0);
+        // dividendToken must be a real ERC20 (native BNB / self-dividend are rejected); use USDT.
+        data.dividendToken = address(usdt);
         (bool ok,) = factory.onBeforeLaunch(abi.encode(data));
         assertTrue(ok);
+    }
+
+    function test_validateBeforeLaunch_rejectsNativeDividend() public view {
+        IVaultFactoryValidationV2.LaunchValidationDataV1 memory data;
+        data.quoteToken = address(0); // valid BNB quote
+        data.dividendToken = address(0); // native BNB dividend — unsupported
+        (bool ok, string memory reason) = factory.onBeforeLaunch(abi.encode(data));
+        assertFalse(ok);
+        assertGt(bytes(reason).length, 0);
+    }
+
+    function test_validateBeforeLaunch_rejectsSelfDividend() public view {
+        IVaultFactoryValidationV2.LaunchValidationDataV1 memory data;
+        data.quoteToken = address(0); // valid BNB quote
+        data.dividendToken = 0xfEEDFEEDfeEDFEedFEEdFEEDFeEdfEEdFeEdFEEd; // self-dividend magic
+        (bool ok, string memory reason) = factory.onBeforeLaunch(abi.encode(data));
+        assertFalse(ok);
+        assertGt(bytes(reason).length, 0);
+    }
+
+    function test_validateBeforeLaunch_acceptsErc20Dividend() public view {
+        IVaultFactoryValidationV2.LaunchValidationDataV1 memory data;
+        data.quoteToken = address(0); // valid BNB quote
+        data.dividendToken = address(usdt); // real ERC20 dividend
+        (bool ok, string memory reason) = factory.onBeforeLaunch(abi.encode(data));
+        assertTrue(ok);
+        assertEq(bytes(reason).length, 0);
     }
 
     function test_upgradeOnlyGuardian() public {

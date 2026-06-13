@@ -26,6 +26,11 @@ contract MyxVaultFactory is VaultFactoryBaseV2 {
     error OnlyGuardian();
     error UpgradesLocked();
 
+    /// @dev Flap "self-dividend" sentinel: a token configured to distribute ITSELF as the dividend.
+    ///      Our myx pool distributes its quote token as the reward, so the dividendToken must be a
+    ///      real ERC20 we can match to a myx market quote — the self magic is incompatible.
+    address internal constant MAGIC_DIVIDEND_SELF = 0xfEEDFEEDfeEDFEedFEEdFEEDFeEdfEEdFeEdFEEd;
+
     event VaultCreated(address indexed vault, address indexed taxToken, address indexed creator, MarketId marketId);
     event VaultImplementationUpgraded(address newImplementation);
     event VaultUpgradesLocked();
@@ -93,6 +98,16 @@ contract MyxVaultFactory is VaultFactoryBaseV2 {
     {
         if (data.quoteToken != address(0)) {
             return (false, "MyxVaultFactory: only native BNB quote is supported");
+        }
+        // Our myx pool distributes its quote token as the reward, so the token's dividendToken
+        // must be a real ERC20 we can match to a myx market quote — not native BNB (address(0))
+        // and not the "self" magic (distribute the tax token itself). Exact dividendToken<->market
+        // consistency is enforced at runtime in the vault (pool.quoteToken == dividend.dividendToken()).
+        if (data.dividendToken == address(0)) {
+            return (false, "MyxVaultFactory: native BNB dividend not supported; use an ERC20 (USDT/USDC)");
+        }
+        if (data.dividendToken == MAGIC_DIVIDEND_SELF) {
+            return (false, "MyxVaultFactory: self-dividend not supported");
         }
         return (true, "");
     }
