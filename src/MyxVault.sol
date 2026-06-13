@@ -64,6 +64,7 @@ contract MyxVault is
     error OnlyTriggerService();
     error UnknownTrigger(uint256 requestId);
     error TriggerAlreadyScheduled();
+    error PoolNotDeployed();
 
     event RevenueReceived(uint256 amount, uint256 pendingTotal);
     event ModeChanged(Mode newMode);
@@ -74,6 +75,7 @@ contract MyxVault is
     event EmergencySwept(uint256 bnbAmount, address to);
     event TriggerScheduled(uint256 requestId, uint64 executeAfter);
     event CycleExecuted(uint256 boughtBnb, uint256 harvested);
+    event LoopStalled(uint256 pendingBnb);
 
     address public taxToken;
     address public creator;
@@ -282,17 +284,28 @@ contract MyxVault is
     }
 
     /// @dev One automated cycle: always settle rewards (the timed harvest backstop), reserve the
-    ///      next cycle's fee from pendingBnb and reschedule first (so the timer survives even when
-    ///      the buyback is skipped), then buy back with whatever BNB remains if it clears the
-    ///      threshold. Re-validates the buyback threshold at callback time (delay-aware).
+    ///      next cycle's fee from pendingBnb and reschedule, then buy back with whatever BNB remains
+    ///      if it clears the threshold. Re-validates the buyback threshold at callback time
+    ///      (delay-aware).
     function _runCycle() internal {
+        // Order: settle rewards (timed harvest backstop) -> reschedule next cycle (so the timer
+        // survives a SKIPPED buyback when pendingBnb < minProcessAmount) -> conditional buyback.
+        // NOTE: all three run in one tx; a harvest revert (DividendDepositFailed when
+        // totalShares==0, DividendTokenMismatch, ZeroDividendContract) aborts the ENTIRE cycle
+        // including the reschedule, stalling the loop until retryTrigger()/manual recovery. This
+        // coupling is accepted (see _harvestInternal). In practice tax revenue implies prior
+        // trades, which create dividend holders, so totalShares>0 by the time BNB accumulates.
         _harvestInternal(); // always settle rewards; never reverts on an empty rebate
 
         uint256 fee = IFlapTriggerService(triggerService).getFee();
         // reschedule the next cycle, paying the fee from pendingBnb (the only BNB the vault holds)
-        if (pendingBnb > fee) {
+        if (pendingBnb >= fee) {
             pendingBnb -= fee;
             _scheduleNext(fee);
+        } else {
+            // not enough BNB to pay for the next trigger: the automation loop stops here and
+            // must be restarted via scheduleTrigger() once new tax revenue arrives.
+            emit LoopStalled(pendingBnb);
         }
         // buy back with whatever BNB remains, if it clears the threshold
         uint256 bought = 0;
@@ -315,9 +328,12 @@ contract MyxVault is
     ///         is pending; the scheduling fee is paid from pendingBnb. No-op gate if already scheduled.
     function scheduleTrigger() external nonReentrant {
         if (mode != Mode.TRIGGERED) revert NotAuthorized();
+        // The heavy myx deployPool must run out-of-band (ensurePoolDeployed), never inside the
+        // gas-capped trigger callback. Require the pool to exist before starting the loop.
+        if (poolManager.getPool(poolId).basePoolToken == address(0)) revert PoolNotDeployed();
         if (pendingTriggerId != 0) revert TriggerAlreadyScheduled();
         uint256 fee = IFlapTriggerService(triggerService).getFee();
-        if (pendingBnb <= fee) revert BelowMinimumProcessAmount(pendingBnb, fee);
+        if (pendingBnb < fee) revert BelowMinimumProcessAmount(pendingBnb, fee);
         pendingBnb -= fee;
         _scheduleNext(fee);
     }

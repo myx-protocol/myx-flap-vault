@@ -434,6 +434,8 @@ contract MyxVaultModeTest is MyxVaultTestBase {
 }
 
 contract MyxVaultTriggerTest is MyxVaultTestBase {
+    event LoopStalled(uint256 pendingBnb);
+
     function setUp() public override {
         super.setUp();
         // Register the tax-token pool with quoteToken == usdt == dividend.dividendToken()
@@ -569,6 +571,44 @@ contract MyxVaultTriggerTest is MyxVaultTestBase {
         vm.prank(makeAddr("stranger"));
         fresh.ensurePoolDeployed();
         assertEq(poolManager.deployPoolCallCount(), 1);
+    }
+
+    function test_scheduleTrigger_revertsIfPoolNotDeployed() public {
+        // Fresh vault whose myx pool is NOT pre-registered: scheduleTrigger must refuse to start
+        // the loop until the heavy deployPool has run out-of-band via ensurePoolDeployed().
+        MyxVault fresh = _deployVault(_freshParams());
+        vm.deal(address(this), 1 ether);
+        (bool ok,) = address(fresh).call{value: 1 ether}(""); // pendingBnb > fee
+        assertTrue(ok);
+
+        vm.expectRevert(MyxVault.PoolNotDeployed.selector);
+        fresh.scheduleTrigger();
+
+        // deploy the pool out-of-band (permissionless), then the loop can start
+        fresh.ensurePoolDeployed();
+        fresh.scheduleTrigger();
+        assertEq(fresh.pendingTriggerId(), 1);
+    }
+
+    function test_runCycle_emitsLoopStalledWhenUnderfunded() public {
+        // Start the loop with pendingBnb just above fee, then raise the fee above the remaining
+        // pendingBnb so the in-cycle reschedule cannot afford the next trigger: the loop stalls.
+        uint256 fee = triggerService.getFee();
+        _fund(fee + 1); // pendingBnb = fee + 1: enough for the first schedule, nothing left after
+        vault.scheduleTrigger(); // id 1, deducts one fee -> pendingBnb = 1 wei
+        assertEq(vault.pendingTriggerId(), 1);
+        assertEq(vault.pendingBnb(), 1);
+
+        // raise the fee above the 1 wei remainder so the reschedule branch is skipped
+        triggerService.setFee(1 ether);
+
+        vm.expectEmit(true, true, true, true, address(vault));
+        emit LoopStalled(1);
+        triggerService.fire(address(vault), 1);
+
+        // loop stopped: no new trigger scheduled, pendingBnb left for a manual restart
+        assertEq(vault.pendingTriggerId(), 0);
+        assertEq(vault.pendingBnb(), 1);
     }
 
     function _freshParams() internal returns (MyxVault.InitParams memory p) {
