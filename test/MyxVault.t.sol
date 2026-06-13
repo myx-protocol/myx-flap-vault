@@ -3,7 +3,7 @@ pragma solidity ^0.8.26;
 
 import {Test} from "forge-std/Test.sol";
 import {MyxVault} from "../src/MyxVault.sol";
-import {MarketId, PoolId, MyxPoolId, IMyxBasePool, PoolMetadata} from "../src/myx/IMyxPool.sol";
+import {MarketId, PoolId, MyxPoolId, MyxMarketId, IMyxBasePool, PoolMetadata} from "../src/myx/IMyxPool.sol";
 import {IPortalTradeV2} from "../src/flap/IPortal.sol";
 import {ERC1967Proxy} from "@openzeppelin/proxy/ERC1967/ERC1967Proxy.sol";
 import "./mocks/Mocks.sol";
@@ -28,12 +28,16 @@ contract MyxVaultTestBase is Test {
     address constant GUARDIAN = 0x9e27098dcD8844bcc6287a557E0b4D09C86B8a4b;
     // Portal address hardcoded in VaultBase for chainId 56; MockPortal code is etched there.
     address constant PORTAL = 0xe2cE6ab80874Fa9Fa2aAE65D277Dd6B8e65C9De0;
-    MarketId marketId = MarketId.wrap(bytes32(uint256(1)));
+    // v4-5: the vault derives marketId on-chain from (block.chainid, marketQuoteToken). Tests run on
+    // chainId 56 with usdt as the launch quote token, so the expected marketId mirrors that derivation.
+    // Assigned in setUp() after usdt is constructed.
+    MarketId marketId;
 
     function setUp() public virtual {
         vm.chainId(56);
         wbnb = new MockWBNB();
         usdt = new MockERC20("Tether", "USDT");
+        marketId = MyxMarketId.derive(uint64(56), address(usdt));
         lpToken = new MockERC20("MYX LP", "MLP");
         basePool = new MockBasePool(lpToken, usdt);
         poolManager = new MockPoolManager();
@@ -68,7 +72,7 @@ contract MyxVaultTestBase is Test {
     function _initParams() internal view returns (MyxVault.InitParams memory p) {
         p.taxToken = address(taxToken);
         p.creator = creator;
-        p.marketId = marketId;
+        p.marketQuoteToken = address(usdt);
         p.poolManager = address(poolManager);
         p.basePool = address(basePool);
         p.maxSlippageBps = 300;          // 3%
@@ -81,8 +85,35 @@ contract MyxVaultTestBase is Test {
 contract MyxVaultInitTest is MyxVaultTestBase {
     function test_initialize_storesConfig() public view {
         assertEq(vault.taxToken(), address(taxToken));
-        // v3: the pool is keyed by the tax token itself (buyback design)
-        assertEq(PoolId.unwrap(vault.poolId()), PoolId.unwrap(MyxPoolId.derive(marketId, address(taxToken))));
+        // v4-5: the launch param is the market quote token; the vault derives marketId on-chain
+        // from (block.chainid, quoteToken), then poolId from (marketId, taxToken).
+        assertEq(vault.marketQuoteToken(), address(usdt));
+        MarketId expectedMarketId = MyxMarketId.derive(uint64(56), address(usdt));
+        assertEq(MarketId.unwrap(vault.marketId()), MarketId.unwrap(expectedMarketId));
+        assertEq(
+            PoolId.unwrap(vault.poolId()),
+            PoolId.unwrap(MyxPoolId.derive(expectedMarketId, address(taxToken)))
+        );
+    }
+
+    function test_initialize_revertsOnZeroQuoteToken() public {
+        MyxVault.InitParams memory p = _initParams();
+        p.marketQuoteToken = address(0);
+        MyxVault impl = new MyxVault();
+        bytes memory initData = abi.encodeCall(MyxVault.initialize, (p));
+        vm.expectRevert(MyxVault.ZeroMarketQuoteToken.selector);
+        new ERC1967Proxy(address(impl), initData);
+    }
+
+    /// @dev Locks the on-chain derivation: marketId = keccak256(chainId, quoteToken) and the pool
+    ///      key derives from it. Guards against any drift from the myx MarketKey/PoolKey hashing.
+    function test_derivedMarketId_matchesPoolKey() public view {
+        MarketId expectedMarketId = MyxMarketId.derive(uint64(56), address(usdt));
+        assertEq(MarketId.unwrap(vault.marketId()), MarketId.unwrap(expectedMarketId));
+        assertEq(
+            PoolId.unwrap(vault.poolId()),
+            PoolId.unwrap(MyxPoolId.derive(expectedMarketId, address(taxToken)))
+        );
     }
 
     function test_initialize_revertsOnSecondCall() public {
@@ -654,7 +685,7 @@ contract MyxVaultTriggerTest is MyxVaultTestBase {
         MockTaxToken freshTax = new MockTaxToken(address(dividend));
         p.taxToken = address(freshTax);
         p.creator = creator;
-        p.marketId = marketId;
+        p.marketQuoteToken = address(usdt);
         p.poolManager = address(poolManager);
         p.basePool = address(basePool);
         p.maxSlippageBps = 300;
@@ -842,5 +873,38 @@ contract MyxVaultViewsTest is MyxVaultTestBase {
     function test_vaultUISchema_describesMethods() public view {
         assertEq(vault.vaultUISchema().vaultType, "MyxVault");
         assertGt(vault.vaultUISchema().methods.length, 0);
+    }
+}
+
+/// @dev Inlined verbatim from myx-contract-v2 src/types/MarketKey.sol so this suite can assert,
+///      without depending on the myx repo, that MyxMarketId.derive matches the upstream marketId.
+struct RefMarketKey {
+    uint64 chainId;
+    address quoteToken;
+}
+
+library RefMarketIdLib {
+    function toId(RefMarketKey memory marketKey) internal pure returns (MarketId marketId) {
+        assembly ("memory-safe") {
+            marketId := keccak256(marketKey, 0x40)
+        }
+    }
+}
+
+/// @notice Locks the empirical equivalence MyxMarketId.derive == myx MarketIdLib.toId (concrete + fuzz).
+contract MyxMarketIdEquivalenceTest is Test {
+    using RefMarketIdLib for RefMarketKey;
+
+    function test_derive_matchesMyxToId_concrete() public pure {
+        address quote = 0x55d398326f99059fF775485246999027B3197955; // BSC USDT
+        MarketId got = MyxMarketId.derive(uint64(56), quote);
+        MarketId want = RefMarketIdLib.toId(RefMarketKey({chainId: 56, quoteToken: quote}));
+        assertEq(MarketId.unwrap(got), MarketId.unwrap(want));
+    }
+
+    function testFuzz_derive_matchesMyxToId(uint64 chainId, address quote) public pure {
+        MarketId got = MyxMarketId.derive(chainId, quote);
+        MarketId want = RefMarketIdLib.toId(RefMarketKey({chainId: chainId, quoteToken: quote}));
+        assertEq(MarketId.unwrap(got), MarketId.unwrap(want));
     }
 }

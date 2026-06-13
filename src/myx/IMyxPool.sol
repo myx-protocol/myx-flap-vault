@@ -11,6 +11,16 @@ library MyxPoolId {
     }
 }
 
+/// @dev Mirrors myx-contract-v2 MarketKey hashing: marketId = keccak256(abi.encode(uint64 chainId, quoteToken)).
+///      Verified equivalent to myx MarketIdLib.toId (fuzz 256 + concrete): myx hashes the
+///      {uint64 chainId; address quoteToken} struct via keccak256(marketKey, 0x40), i.e. the two
+///      32-byte ABI-encoded words — identical to abi.encode(uint64, address).
+library MyxMarketId {
+    function derive(uint64 chainId, address quoteToken) internal pure returns (MarketId) {
+        return MarketId.wrap(keccak256(abi.encode(chainId, quoteToken)));
+    }
+}
+
 /// @dev Subset of myx PoolMetadata — field order must match upstream struct exactly.
 struct PoolMetadata {
     MarketId marketId;

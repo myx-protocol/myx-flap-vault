@@ -7,7 +7,6 @@ import {VaultDataSchema, FieldDescriptor} from "./flap/IVaultSchemasV1.sol";
 import {BeaconProxy} from "@openzeppelin/proxy/beacon/BeaconProxy.sol";
 import {UpgradeableBeacon} from "@openzeppelin/proxy/beacon/UpgradeableBeacon.sol";
 import {MyxVault} from "./MyxVault.sol";
-import {MarketId} from "./myx/IMyxPool.sol";
 
 /// @title MyxVaultFactory
 /// @notice Deploys MyxVault beacon proxies for the Flap VaultPortal. The factory itself is
@@ -31,7 +30,9 @@ contract MyxVaultFactory is VaultFactoryBaseV2 {
     ///      real ERC20 we can match to a myx market quote — the self magic is incompatible.
     address internal constant MAGIC_DIVIDEND_SELF = 0xfEEDFEEDfeEDFEedFEEdFEEDFeEdfEEdFeEdFEEd;
 
-    event VaultCreated(address indexed vault, address indexed taxToken, address indexed creator, MarketId marketId);
+    event VaultCreated(
+        address indexed vault, address indexed taxToken, address indexed creator, address marketQuoteToken
+    );
     event VaultImplementationUpgraded(address newImplementation);
     event VaultUpgradesLocked();
 
@@ -58,7 +59,9 @@ contract MyxVaultFactory is VaultFactoryBaseV2 {
         if (msg.sender != _getVaultPortal()) revert OnlyVaultPortal();
         if (quoteToken != address(0)) revert UnsupportedQuoteToken();
 
-        MarketId marketId = abi.decode(vaultData, (MarketId));
+        // vaultData is the market quote token (= the token's dividendToken). The vault derives the
+        // myx marketId from it on-chain (keccak256(chainId, quoteToken)); zero is rejected there.
+        address marketQuoteToken = abi.decode(vaultData, (address));
 
         GlobalConfig memory c = config;
         vault = address(
@@ -70,7 +73,7 @@ contract MyxVaultFactory is VaultFactoryBaseV2 {
                         MyxVault.InitParams({
                             taxToken: taxToken,
                             creator: creator,
-                            marketId: marketId,
+                            marketQuoteToken: marketQuoteToken,
                             poolManager: c.poolManager,
                             basePool: c.basePool,
                             maxSlippageBps: c.maxSlippageBps,
@@ -82,7 +85,7 @@ contract MyxVaultFactory is VaultFactoryBaseV2 {
                 )
             )
         );
-        emit VaultCreated(vault, taxToken, creator, marketId);
+        emit VaultCreated(vault, taxToken, creator, marketQuoteToken);
     }
 
     function isQuoteTokenSupported(address quoteToken) external pure override returns (bool) {
@@ -113,9 +116,19 @@ contract MyxVaultFactory is VaultFactoryBaseV2 {
     }
 
     function vaultDataSchema() public pure override returns (VaultDataSchema memory schema) {
-        schema.description = "MyxVault parameters: MYX market id. The token itself becomes the base asset.";
+        schema.description =
+            "MyxVault parameter: the myx market quote token, which MUST equal this token's dividendToken "
+            "(USDT or USDC). The vault derives the myx market and base pool from it on-chain, so LP rebates "
+            "(paid in this quote token) distribute to holders directly. Pass the same ERC20 address you set "
+            "as the token's dividendToken.";
         schema.fields = new FieldDescriptor[](1);
-        schema.fields[0] = FieldDescriptor("marketId", "bytes32", "MYX market identifier for the token's base pool", 0);
+        schema.fields[0] = FieldDescriptor(
+            "quoteToken",
+            "address",
+            "ERC20 quote/dividend token (e.g. USDT or USDC). Must equal the token's dividendToken; the vault "
+            "derives marketId = keccak256(chainId, quoteToken) and the base pool from it.",
+            0
+        );
         schema.isArray = false;
     }
 

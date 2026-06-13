@@ -4,7 +4,7 @@ pragma solidity ^0.8.26;
 import {Test} from "forge-std/Test.sol";
 import {MyxVaultFactory} from "../src/MyxVaultFactory.sol";
 import {MyxVault} from "../src/MyxVault.sol";
-import {MarketId, PoolId, MyxPoolId} from "../src/myx/IMyxPool.sol";
+import {MarketId, PoolId, MyxPoolId, MyxMarketId} from "../src/myx/IMyxPool.sol";
 import {IVaultFactoryValidationV2} from "../src/flap/IVaultFactory.sol";
 import "./mocks/Mocks.sol";
 
@@ -21,12 +21,15 @@ contract MyxVaultFactoryTest is Test {
 
     address constant VAULT_PORTAL = 0x90497450f2a706f1951b5bdda52B4E5d16f34C06; // BSC mainnet
     address constant GUARDIAN = 0x9e27098dcD8844bcc6287a557E0b4D09C86B8a4b;
-    MarketId marketId = MarketId.wrap(bytes32(uint256(1)));
+    // v4-5: the launch param is the market quote token; the vault derives marketId on-chain.
+    // Assigned in setUp() once usdt exists; tests run on chainId 56.
+    MarketId marketId;
 
     function setUp() public {
         vm.chainId(56);
         wbnb = new MockWBNB();
         usdt = new MockERC20("Tether", "USDT");
+        marketId = MyxMarketId.derive(uint64(56), address(usdt));
         bnbFeed = new MockAggregatorV3(600e8, 8);
         usdtFeed = new MockAggregatorV3(1e8, 8);
         basePool = new MockBasePool(new MockERC20("LP", "LP"), usdt);
@@ -49,7 +52,9 @@ contract MyxVaultFactoryTest is Test {
     }
 
     function _vaultData() internal view returns (bytes memory) {
-        return abi.encode(marketId);
+        // v4-5: vaultData carries the market quote token (= the token's dividendToken); the vault
+        // derives marketId = keccak256(chainId, quoteToken) and the pool key from it on-chain.
+        return abi.encode(address(usdt));
     }
 
     function test_newVault_onlyVaultPortal() public {
@@ -63,28 +68,45 @@ contract MyxVaultFactoryTest is Test {
             factory.newVault(makeAddr("tax"), address(0), makeAddr("creator"), _vaultData());
         MyxVault v = MyxVault(payable(vaultAddr));
         assertEq(v.taxToken(), makeAddr("tax"));
-        // v3: poolId is keyed by the tax token itself (buyback design)
+        // v4-5: marketId is derived from the quote token (usdt) and chainid; poolId keys off the tax token.
+        assertEq(v.marketQuoteToken(), address(usdt));
         assertEq(PoolId.unwrap(v.poolId()), PoolId.unwrap(MyxPoolId.derive(marketId, makeAddr("tax"))));
         assertEq(v.creator(), makeAddr("creator"));
         vm.expectRevert();
         v.initialize(
             MyxVault.InitParams({
                 taxToken: address(1), creator: address(1),
-                marketId: marketId, poolManager: address(1), basePool: address(1),
+                marketQuoteToken: address(usdt), poolManager: address(1), basePool: address(1),
                 maxSlippageBps: 0, minProcessAmount: 0,
                 triggerService: address(1), triggerInterval: 0
             })
         );
     }
 
+    event VaultCreated(
+        address indexed vault, address indexed taxToken, address indexed creator, address marketQuoteToken
+    );
+
     function test_newVault_emitsVaultCreated() public {
         address taxToken = makeAddr("tax");
         address creator = makeAddr("creator");
         vm.prank(VAULT_PORTAL);
-        vm.recordLogs();
+        // v4-5: VaultCreated's last param is the market quote token from vaultData (= usdt).
+        // vault/taxToken/creator are indexed; assert only the non-indexed marketQuoteToken data.
+        vm.expectEmit(false, true, true, false);
+        emit VaultCreated(address(0), taxToken, creator, address(usdt));
         address vaultAddr = factory.newVault(taxToken, address(0), creator, _vaultData());
         assertTrue(vaultAddr != address(0));
         assertEq(MyxVault(payable(vaultAddr)).taxToken(), taxToken);
+        assertEq(MyxVault(payable(vaultAddr)).marketQuoteToken(), address(usdt));
+    }
+
+    function test_newVault_revertsOnZeroQuoteToken() public {
+        // A launcher passing abi.encode(address(0)) as vaultData must be rejected by the vault's
+        // initializer (ZeroMarketQuoteToken), bubbling up through the factory's BeaconProxy deploy.
+        vm.prank(VAULT_PORTAL);
+        vm.expectRevert(MyxVault.ZeroMarketQuoteToken.selector);
+        factory.newVault(makeAddr("tax"), address(0), makeAddr("creator"), abi.encode(address(0)));
     }
 
     function test_isQuoteTokenSupported_onlyBnb() public view {

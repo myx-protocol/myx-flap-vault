@@ -8,7 +8,7 @@ import {AccessControlUpgradeable} from "@openzeppelin-contracts-upgradeable/acce
 import {ReentrancyGuardUpgradeable} from "@openzeppelin-contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
 import {IERC20} from "@openzeppelin/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/token/ERC20/utils/SafeERC20.sol";
-import {MarketId, PoolId, MyxPoolId, PoolMetadata, IMyxPoolManager, IMyxBasePool} from "./myx/IMyxPool.sol";
+import {MarketId, PoolId, MyxPoolId, MyxMarketId, PoolMetadata, IMyxPoolManager, IMyxBasePool} from "./myx/IMyxPool.sol";
 import {IDividendDistributor} from "./dividend/IDividendDistributor.sol";
 import {IFlapTaxTokenV3} from "./flap/IFlapTaxTokenV3.sol";
 import {IPortalTradeV2} from "./flap/IPortal.sol";
@@ -40,7 +40,7 @@ contract MyxVault is
     struct InitParams {
         address taxToken;
         address creator;
-        MarketId marketId;
+        address marketQuoteToken;
         address poolManager;
         address basePool;
         uint16 maxSlippageBps;
@@ -54,6 +54,7 @@ contract MyxVault is
     uint16 public constant BPS_DENOMINATOR = 10_000;
 
     error CannotRevokeGuardianRole();
+    error ZeroMarketQuoteToken();
     error BelowMinimumProcessAmount(uint256 pending, uint256 minimum);
     error DividendDepositFailed();
     error DividendTokenMismatch(address poolQuote, address dividendToken);
@@ -79,6 +80,10 @@ contract MyxVault is
 
     address public taxToken;
     address public creator;
+    /// @notice The myx market quote token (= the token's dividendToken, e.g. USDT/USDC). The launch
+    ///         param; the vault derives marketId from it on-chain so the dividendToken == pool-quote
+    ///         == reward invariant is automatic.
+    address public marketQuoteToken;
     MarketId public marketId;
     PoolId public poolId;
     IMyxPoolManager public poolManager;
@@ -108,7 +113,8 @@ contract MyxVault is
     ///      usdtUsdFeed, maxPriceStaleness) from storage; gap bumped 36 -> 42 to keep the
     ///      total reserved layout tidy (contract not yet deployed). v4-2 added triggerService +
     ///      triggerInterval (one packed slot) and pendingTriggerId (one slot); gap 42 -> 40.
-    uint256[40] private __gap;
+    ///      v4-5 added marketQuoteToken (one slot); gap 40 -> 39.
+    uint256[39] private __gap;
 
     constructor() {
         _disableInitializers();
@@ -120,8 +126,14 @@ contract MyxVault is
 
         taxToken = p.taxToken;
         creator = p.creator;
-        marketId = p.marketId;
-        poolId = MyxPoolId.derive(p.marketId, p.taxToken);
+        // The launch param is the market quote token (= the token's dividendToken). Derive the myx
+        // marketId on-chain (marketId = keccak256(chainId, quoteToken), verified equivalent to myx
+        // MarketIdLib.toId), then the base pool key from it. This makes the dividendToken ==
+        // pool-quote == reward invariant automatic — no opaque id, no myx query, no hardcoding.
+        if (p.marketQuoteToken == address(0)) revert ZeroMarketQuoteToken();
+        marketQuoteToken = p.marketQuoteToken;
+        marketId = MyxMarketId.derive(uint64(block.chainid), p.marketQuoteToken);
+        poolId = MyxPoolId.derive(marketId, p.taxToken);
         poolManager = IMyxPoolManager(p.poolManager);
         basePool = IMyxBasePool(p.basePool);
         maxSlippageBps = p.maxSlippageBps;

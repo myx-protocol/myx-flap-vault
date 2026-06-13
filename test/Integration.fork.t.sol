@@ -11,7 +11,7 @@ import {IFlapTriggerService} from "../src/flap/IFlapTriggerService.sol";
 
 import {MyxVault} from "../src/MyxVault.sol";
 import {MyxVaultFactory} from "../src/MyxVaultFactory.sol";
-import {MarketId, PoolId, MyxPoolId, PoolMetadata} from "../src/myx/IMyxPool.sol";
+import {MarketId, PoolId, MyxPoolId, MyxMarketId, PoolMetadata} from "../src/myx/IMyxPool.sol";
 
 import {MockERC20, MockBasePool, MockPoolManager} from "./mocks/Mocks.sol";
 
@@ -42,8 +42,10 @@ contract MyxVaultForkTest is FlapBSCFixture {
     // and as the mock pool's quoteToken so harvest reads a real ERC20 (zero balance no-op).
     address internal constant BSC_USDT = 0x55d398326f99059fF775485246999027B3197955;
 
-    // MYX market identifier for the launched token's base pool.
-    MarketId internal marketId = MarketId.wrap(bytes32(uint256(1)));
+    // v4-5: the vault derives the MYX marketId on-chain from (block.chainid, quoteToken). The launch
+    // passes BSC_USDT as the quote token (= the launched token's dividendToken), so the expected
+    // marketId mirrors keccak256(56, BSC_USDT). chainId 56 holds on the BSC mainnet fork.
+    MarketId internal marketId = MyxMarketId.derive(uint64(56), BSC_USDT);
 
     // ── Our deployments on the fork ───────────────────────────────────────────
     MyxVaultFactory internal factory;
@@ -103,8 +105,9 @@ contract MyxVaultForkTest is FlapBSCFixture {
         // 1. Launch a REAL Flap V3 tax token through the REAL VaultPortal, passing OUR factory.
         //    The VaultPortal will call factory.newVault(...) — the factory's _getVaultPortal()
         //    resolves to this same VaultPortal on chainId 56, so the access check passes.
-        //    vaultData carries the single v3 field: the MYX market id.
-        bytes memory vaultData = abi.encode(marketId);
+        //    vaultData carries the single v4-5 field: the market quote token (= dividendToken).
+        //    The vault derives marketId = keccak256(chainId, BSC_USDT) and the pool key from it.
+        bytes memory vaultData = abi.encode(BSC_USDT);
         bytes32 salt = _findVanitySalt(VanityType.VANITY_7777, TOKEN_IMPL_TAXED_V3, PORTAL);
 
         IVaultPortalTypes.NewTokenV6WithVaultParams memory params =
