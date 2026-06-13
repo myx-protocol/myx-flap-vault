@@ -1,9 +1,47 @@
 # MYX × Flap Vault 接入设计
 
-> 状态：v4（三模式 + Trigger 自动化 + dividendToken 直分）
+> 状态：**v5（质押分红：甩掉 Dividend 合约，stake-to-earn）**
 > 日期：2026-06-12
 > 方向：myx 作为 Flap 的 Vault 开发者，在 BSC 内同链对接
-> 机制：税收 → 经 Flap Portal 买回 tax token → 以 tax token 加 base 流动性 → LP 由 vault 持有 → LP 奖励(= dividendToken)直接灌入原生 Dividend 合约按持币比例分
+> 机制：税收 → 经 Flap Portal 买回 tax token → 加 myx base 流动性 → LP 由 vault 持有 → LP 奖励(USDT)按**质押量**分给质押者，vault 内 `claim()` 领取
+
+---
+
+## 0′. v5 变更摘要（当前权威设计，取代 v4 的 harvest/Dividend 部分）
+
+**保留 v4**：三模式（TRIGGERED 默认 / AUTO / MANUAL）+ Trigger 自动化、Portal 买回 tax token 加 myx LP、vaultData 传 quoteToken → vault 推导 marketId（`keccak256(abi.encode(uint64(chainid), quoteToken))`）、emergency。
+
+**v5 改动 = 奖励分配从「灌 Flap 原生 Dividend」改成「vault 内质押分红」**：
+
+### 0′.1 为什么换：四不可兼得
+"不依赖 Dividend 合约 + 持币即分(被动) + 全链上 + 公平按比例"四者不可同时满足——公平的持币即分本质需要 transfer hook，而 vault 是 market（收 mktBps）不是 token 的 dividend 合约、拿不到转账回调，ERC20 也无历史余额。直接按 `balanceOf/totalSupply` 分会被「领取→转新地址→再领」刷穿（资损）。用户选择放弃「持币即分」→ **质押模型**（质押=自建 hook，全链上公平）。
+
+### 0′.2 质押分红会计（MasterChef / Synthetix accRewardPerShare 模式）
+- 状态：`totalStaked`、`stakedBalance[user]`（显式计数器，质押/赎回时更新）、`accRewardPerShare`（每质押 1 token 累积 USDT，放大 `1e18`）、`rewardDebt[user]`、`accruedReward[user]`（已结算待领）、`undistributed`（零质押窗口缓冲）。
+- harvest 拿到 `R` USDT：`toDistribute = R + undistributed`；若 `totalStaked>0` 则 `accRewardPerShare += toDistribute*1e18/totalStaked; undistributed=0`，否则 `undistributed = toDistribute`（不丢、不除零）。
+- 结算（stake/unstake/claim 入口先跑）：`accruedReward[user] += stakedBalance[user]*accRewardPerShare/1e18 - rewardDebt[user]`；改 stakedBalance 后 `rewardDebt[user] = stakedBalance[user]*accRewardPerShare/1e18`。
+- **关键不变量（用户强调）**：新质押者 `rewardDebt` 按当前 `accRewardPerShare` 设定 → 只分到质押之后新增的奖励，**领不走存量**。pending(刚质押)=0。
+
+### 0′.3 函数
+| 函数 | 行为 |
+|---|---|
+| `stake(uint256 amount)` | `taxToken.transferFrom` 进 vault，**按余额差值入账**（fee-on-transfer 防御；vault↔用户转账已验证免税）；结算 + 更新份额/debt |
+| `unstake(uint256 amount)` | 结算 + 转回 tax token（**无锁**，随时可取）；更新份额/debt |
+| `claim()` | 结算 + 把 `accruedReward[user]` 的 USDT 转给用户 |
+| `pendingReward(address) view` | 可领 USDT = accrued + 未结算部分 |
+| `stakedBalanceOf(address)` / `totalStaked()` view | 质押查询 |
+
+### 0′.4 奖励币 = USDT，彻底删依赖
+奖励直接是 myx 池 quote（USDT），**不 swap、不碰 WBNB、不碰 Chainlink feed、不碰 Flap 原生 Dividend**。删除：`IDividendDistributor`、`_forwardToDividend`、`IFlapTaxTokenV3.dividendContract`、`DividendTokenMismatch/ZeroDividendContract/DividendDepositFailed`、`userLpShare`。harvest 简化为：`claimUserRebate(USDT)` → `_distribute(usdtAmount)`（折入 accRewardPerShare）。
+
+### 0′.5 fee-on-transfer 安全
+质押的是 tax token。phase0-v3 已验证：Flap V3 token 只对「注册池对手方」抽税，vault 不是注册池 → stake/unstake(用户↔vault)免税。stake 仍用余额差值入账兜底。质押的 tax token 与 processRevenue 买回的 tax token 互不干扰（买回的当 tx 立即存进 myx LP；`totalStaked` 是独立计数器）。
+
+### 0′.6 工厂校验放宽
+v5 不依赖 token 的 dividend 配置 → 删除 `_validateBeforeLaunch` 里 `dividendToken==0`/`self-magic` 两条拦截，仅保留 `quoteToken==address(0)`（Flap 必须 BNB quote）。发币时 dividendToken/dividendBps 随便填（不用），不再有 swap-path / 校验拦截。
+
+### 0′.7 经济飞轮
+税 → 买回 token（价格支撑）+ myx LP → LP 赚 USDT → 质押者分 USDT；质押锁住流通量、进一步支撑价格。
 
 ---
 
