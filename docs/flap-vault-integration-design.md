@@ -31,7 +31,7 @@ v3 已落地（三模式之前为 AUTO/MANUAL 两模式、harvest 走 USDT→WBN
 - LP rebate 奖励币 = 池 quote = dividendToken。
 - harvest：`claimUserRebate`（拿到 dividendToken）→ `require(getPool(poolId).quoteToken == IDividend(div).dividendToken())` → `forceApprove(div, amt)` → `IDividend(div).deposit(amt)`（已验证单参 `deposit(uint256)→bool` 拉取 dividendToken）→ 持币者在原生 Dividend 领取。
 - **整条消除**：USDT→WBNB Pancake swap、`swapRouter`、`wbnb`、`bnbUsdFeed`、`usdtUsdFeed`、`maxPriceStaleness`、`_readPrice`、`SWAP_DEADLINE`。vault 依赖收缩为 Portal + myx + Dividend + TriggerService。
-- **misconfig 失败路径**：若 launcher 让 marketId 的 quote ≠ dividendToken，harvest revert（dividendToken 滞留 vault，可 `emergencyWithdraw` 救援）；factory `_validateBeforeLaunch` 预检 `dividendToken ∈ {USDT, USDC}` 快速失败。
+- **misconfig 失败路径**：若 launcher 让 marketId 的 quote ≠ dividendToken，harvest revert（dividendToken 滞留 vault，可 `emergencyWithdraw` 救援）。factory `_validateBeforeLaunch` 只做轻量预检（拒绝 `dividendToken == address(0)` 原生 BNB 与 self-magic `0xfEED…fEED`，无 USDT/USDC 白名单——避免重引注册表）；exact dividendToken↔marketId 一致性由 vault 运行时 `pool.quoteToken == dividend.dividendToken()` 强制（不符即 revert，资金安全）。
 
 ### 0.3 deployPool 时机 + 触发费来源
 
