@@ -1,9 +1,50 @@
 # MYX × Flap Vault 接入设计
 
-> 状态：v3（流程变更：买回 tax token 本身作为 base）
+> 状态：v4（三模式 + Trigger 自动化 + dividendToken 直分）
 > 日期：2026-06-12
 > 方向：myx 作为 Flap 的 Vault 开发者，在 BSC 内同链对接
-> 机制：税收 → 经 Flap Portal 买回 tax token → 以 tax token 加 base 流动性 → LP 由 vault 持有 → 按持币比例回流奖励
+> 机制：税收 → 经 Flap Portal 买回 tax token → 以 tax token 加 base 流动性 → LP 由 vault 持有 → LP 奖励(= dividendToken)直接灌入原生 Dividend 合约按持币比例分
+
+---
+
+## 0. v4 变更摘要（相对 v3）
+
+v3 已落地（三模式之前为 AUTO/MANUAL 两模式、harvest 走 USDT→WBNB swap）。v4 在其上做三处改动：
+
+### 0.1 三模式：`enum Mode { TRIGGERED, AUTO, MANUAL }`，默认 **TRIGGERED**
+
+| 模式 | processRevenue / harvest 由谁驱动 | 用途 |
+|---|---|---|
+| **TRIGGERED（默认）** | Flap `TriggerService` 后端定时回调 vault 的 `trigger(requestId)`，vault 每轮自我重排下一次 | hands-off 全自动；后端非公开 mempool，MEV 面小于 AUTO |
+| **AUTO（无许可）** | 任意人/keeper 直接调 | TriggerService 停摆时的活性兜底 |
+| **MANUAL（需权限）** | 仅 `OPERATOR_ROLE` | tax token 无外部喂价、需人工控时机防夹时 |
+
+- `setMode` 由 creator / Guardian 切换。
+- **TriggerService**（BSC 主网 `0xcf4EE25035CF883895110f367F5BA8172416a7F9`）：`getFee()`≈0.0002 BNB/次，`getMaxCallbackGas()`=**2,000,000**（已链上读取确认，用户确认足够含 deployPool）。
+- `trigger(uint256)` 实现 `ITriggerReceiver`：`require(msg.sender == triggerService)` + nonReentrant + 校验 requestId 绑定 + 重排下一次（Rule 008 强制）。
+- **bootstrap**：`requestTrigger` 是外部调用，**禁止放进 `receive()`**（Rule 005）；TRIGGERED 模式由一个公开 `scheduleTrigger()`（无 pending 时任意人可触发首次排程）启动，之后回调内链式自排。
+
+### 0.2 harvest 直分 dividendToken（砍掉整条 swap + feed）
+
+**核心不变量**：myx 池的 **quote token == 该 Flap token 的 dividendToken**（USDT 或 USDC）。
+- 发币时 `dividendToken` 选 USDT → 用 quote=USDT 的 myx market；选 USDC → 用 quote=USDC 的 market。
+- LP rebate 奖励币 = 池 quote = dividendToken。
+- harvest：`claimUserRebate`（拿到 dividendToken）→ `require(getPool(poolId).quoteToken == IDividend(div).dividendToken())` → `forceApprove(div, amt)` → `IDividend(div).deposit(amt)`（已验证单参 `deposit(uint256)→bool` 拉取 dividendToken）→ 持币者在原生 Dividend 领取。
+- **整条消除**：USDT→WBNB Pancake swap、`swapRouter`、`wbnb`、`bnbUsdFeed`、`usdtUsdFeed`、`maxPriceStaleness`、`_readPrice`、`SWAP_DEADLINE`。vault 依赖收缩为 Portal + myx + Dividend + TriggerService。
+- **misconfig 失败路径**：若 launcher 让 marketId 的 quote ≠ dividendToken，harvest revert（dividendToken 滞留 vault，可 `emergencyWithdraw` 救援）；factory `_validateBeforeLaunch` 预检 `dividendToken ∈ {USDT, USDC}` 快速失败。
+
+### 0.3 deployPool 时机 + 触发费来源
+
+- **deployPool 懒执行**：首次 processRevenue 时建池（2M gas 足够，用户确认）。**不能在 `newVault` 时建**——彼时 taxToken 尚未部署（CREATE2 预测地址），myx `deployPool` 读 `decimals()` 会 revert。
+- 安全阀：额外暴露无许可 `ensurePoolDeployed()`，可把建池的重 gas 从首次 triggered processRevenue 里拆出来单独做。
+- **触发费从 pendingBnb 出**：要求 `pendingBnb >= minProcessAmount`（阈值 > 单次 getFee + 有意义的买回额）；排程下一次 trigger 的 `getFee()` 从 vault 的 BNB 余额扣，相应递减 pendingBnb 记账。pendingBnb 枯竭 → trigger 停排 → 退化到 AUTO 无许可兜底。
+
+### 0.4 待证（Phase-0-v4，网络/myx-BSC 可达后补）
+
+- ERC20(USDT) dividend 实例：`deposit(uint256)` 在 `dividendBps > 0` 时是否仍 permissionless（phase0 在 WBNB 实例已证无 caller gate，但未测 dividendBps>0 + 非 WBNB 组合）。
+- USDT dividend 实例 claim 是否直转 USDT（推断：unwrap 仅在 `dividendToken==weth` 时；USDT 直转）。
+- 真实 deployPool gas 是否 ≤ 2M（myx 上 BSC 后 fork 实测）。
+- myx 是否有 quote=USDC / quote=USDT 的 market（部署前置）。
 
 ---
 
