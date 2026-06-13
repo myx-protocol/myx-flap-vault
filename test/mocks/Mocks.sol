@@ -5,6 +5,7 @@ import {ERC20} from "@openzeppelin/token/ERC20/ERC20.sol";
 import {IERC20} from "@openzeppelin/token/ERC20/IERC20.sol";
 import {IMyxBasePool, IMyxPoolManager, PoolMetadata, PoolId, MarketId} from "../../src/myx/IMyxPool.sol";
 import {IPortalTradeV2} from "../../src/flap/IPortal.sol";
+import {IFlapTriggerService, ITriggerReceiver} from "../../src/flap/IFlapTriggerService.sol";
 
 contract MockERC20 is ERC20 {
     constructor(string memory n, string memory s) ERC20(n, s) {}
@@ -159,6 +160,30 @@ contract MockBasePool is IMyxBasePool {
 
     function pendingUserRebates(PoolId, address, uint256) external view returns (uint256, uint256) {
         return (rebateToPay, 0);
+    }
+}
+
+/// @dev Minimal stand-in for the Flap TriggerService: charges a fee on requestTrigger,
+///      mints sequential request ids, and exposes a `fire` helper so tests can invoke the
+///      receiver's callback AS the service (msg.sender == this), mirroring the real backend.
+contract MockTriggerService {
+    uint256 public fee = 0.0002 ether;
+    uint256 public nextId = 1;
+    uint256 public lastExecuteAfter;
+
+    function setFee(uint256 f) external { fee = f; }
+    function getFee() external view returns (uint256) { return fee; }
+    function getMaxCallbackGas() external pure returns (uint256) { return 2_000_000; }
+
+    function requestTrigger(uint64 executeAfter) external payable returns (uint256) {
+        require(msg.value >= fee, "MockTrigger: fee");
+        lastExecuteAfter = executeAfter;
+        return nextId++;
+    }
+
+    /// @dev test helper: invoke the receiver's callback AS the service (msg.sender == this)
+    function fire(address receiver, uint256 requestId) external {
+        ITriggerReceiver(receiver).trigger(requestId);
     }
 }
 

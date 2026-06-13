@@ -12,6 +12,7 @@ import {MarketId, PoolId, MyxPoolId, PoolMetadata, IMyxPoolManager, IMyxBasePool
 import {IDividendDistributor} from "./dividend/IDividendDistributor.sol";
 import {IFlapTaxTokenV3} from "./flap/IFlapTaxTokenV3.sol";
 import {IPortalTradeV2} from "./flap/IPortal.sol";
+import {IFlapTriggerService, ITriggerReceiver} from "./flap/IFlapTriggerService.sol";
 import {Strings} from "@openzeppelin/utils/Strings.sol";
 
 /// @title MyxVault
@@ -27,7 +28,13 @@ import {Strings} from "@openzeppelin/utils/Strings.sol";
 ///        OPERATOR_ROLE. setMode is creator/Guardian-only.
 ///      - Guardian roles cannot be revoked by any other account; only the guardian
 ///        itself may voluntarily renounce (Flap mandate).
-contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, ReentrancyGuardUpgradeable {
+contract MyxVault is
+    VaultBaseV2,
+    Initializable,
+    AccessControlUpgradeable,
+    ReentrancyGuardUpgradeable,
+    ITriggerReceiver
+{
     using SafeERC20 for IERC20;
 
     struct InitParams {
@@ -38,6 +45,8 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
         address basePool;
         uint16 maxSlippageBps;
         uint256 minProcessAmount;
+        address triggerService;
+        uint64 triggerInterval;
     }
 
     bytes32 public constant EMERGENCY_ROLE = keccak256("EMERGENCY_ROLE");
@@ -50,8 +59,11 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
     error DividendTokenMismatch(address poolQuote, address dividendToken);
     error ZeroDividendContract();
     error ZeroQuote();
-    error NotAuthorizedInManualMode();
+    error NotAuthorized();
     error NotModeAdmin();
+    error OnlyTriggerService();
+    error UnknownTrigger(uint256 requestId);
+    error TriggerAlreadyScheduled();
 
     event RevenueReceived(uint256 amount, uint256 pendingTotal);
     event ModeChanged(Mode newMode);
@@ -60,6 +72,8 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
     event Harvested(uint256 rebateAmount, uint256 forwarded);
     event EmergencyWithdrawal(uint256 lpAmount, uint256 amountOut, address to);
     event EmergencySwept(uint256 bnbAmount, address to);
+    event TriggerScheduled(uint256 requestId, uint64 executeAfter);
+    event CycleExecuted(uint256 boughtBnb, uint256 harvested);
 
     address public taxToken;
     address public creator;
@@ -70,18 +84,29 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
     uint16 public maxSlippageBps;
     uint256 public minProcessAmount;
 
-    enum Mode { AUTO, MANUAL }
+    enum Mode { TRIGGERED, AUTO, MANUAL }
 
     uint256 public pendingBnb;
     uint256 public totalLpMinted;
     uint256 public totalRewardsForwarded;
     Mode public mode;
 
+    /// @notice Flap TriggerService used to schedule the automated TRIGGERED cycle. Config-driven
+    ///         (NOT hardcoded): BSC mainnet is 0xcf4EE25035CF883895110f367F5BA8172416a7F9 but the
+    ///         testnet address is supplied at deploy time.
+    address public triggerService;
+    /// @notice Seconds between automated cycles (executeAfter = block.timestamp + triggerInterval).
+    uint64 public triggerInterval;
+    /// @notice The single in-flight trigger request id; 0 means no cycle is scheduled. Bound to
+    ///         the next intended cycle and consumed atomically in trigger() (replay protection).
+    uint256 public pendingTriggerId;
+
     /// @dev Reserved storage to allow inserting parent mixins or new variables in upgrades.
     ///      v4 removed 6 address/feed slots (swapRouter, wbnb, quoteToken, bnbUsdFeed,
     ///      usdtUsdFeed, maxPriceStaleness) from storage; gap bumped 36 -> 42 to keep the
-    ///      total reserved layout tidy (contract not yet deployed).
-    uint256[42] private __gap;
+    ///      total reserved layout tidy (contract not yet deployed). v4-2 added triggerService +
+    ///      triggerInterval (one packed slot) and pendingTriggerId (one slot); gap 42 -> 40.
+    uint256[40] private __gap;
 
     constructor() {
         _disableInitializers();
@@ -99,6 +124,8 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
         basePool = IMyxBasePool(p.basePool);
         maxSlippageBps = p.maxSlippageBps;
         minProcessAmount = p.minProcessAmount;
+        triggerService = p.triggerService;
+        triggerInterval = p.triggerInterval;
 
         address guardian = _getGuardian();
         _grantRole(DEFAULT_ADMIN_ROLE, guardian);
@@ -107,8 +134,8 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
         _grantRole(OPERATOR_ROLE, guardian);
         _grantRole(OPERATOR_ROLE, p.creator);
 
-        // BeaconProxy storage is zero so AUTO=0 is already the default; set explicitly for readability.
-        mode = Mode.AUTO;
+        // BeaconProxy storage is zero so TRIGGERED=0 is already the default; set for readability.
+        mode = Mode.TRIGGERED;
     }
 
     /// @dev Flap Rule 005: accounting only. No external calls, no loops, never reverts.
@@ -124,21 +151,26 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
     }
 
     /// @notice Converts accumulated BNB into MYX base-pool liquidity by buying back the tax
-    ///         token via the Flap Portal. In AUTO mode this is permissionless (a keeper makes
-    ///         it effectively automatic); in MANUAL mode only OPERATOR_ROLE may call it. The
-    ///         buy leg's minOut is a same-block Portal quote (no Chainlink feed exists for the
-    ///         tax token), which cannot prevent sandwiches on its own — in MANUAL mode the
-    ///         caller gate is the protection.
+    ///         token via the Flap Portal. Access is mode-gated: AUTO is permissionless (a keeper
+    ///         makes it effectively automatic); TRIGGERED and MANUAL restrict it to OPERATOR_ROLE
+    ///         (in TRIGGERED, the automated path runs via the trigger() callback). The buy leg's
+    ///         minOut is a same-block Portal quote (no Chainlink feed exists for the tax token),
+    ///         which cannot prevent sandwiches on its own — in TRIGGERED/MANUAL the caller gate
+    ///         is the protection.
     /// @dev In AUTO mode this is permissionless and the buy leg's minOut derives from a
     ///      same-block Portal quote — it bounds per-call deviation to maxSlippageBps but
     ///      cannot prevent sandwiching (BSC block proposers can reorder at no cost). For
-    ///      sandwich-sensitive operation switch to MANUAL and submit via a private relay.
+    ///      sandwich-sensitive operation switch to MANUAL/TRIGGERED and submit via a private relay.
     function processRevenue() external nonReentrant {
-        if (mode == Mode.MANUAL && !hasRole(OPERATOR_ROLE, msg.sender)) {
-            revert NotAuthorizedInManualMode();
-        }
+        if (mode != Mode.AUTO && !hasRole(OPERATOR_ROLE, msg.sender)) revert NotAuthorized();
+        if (pendingBnb < minProcessAmount) revert BelowMinimumProcessAmount(pendingBnb, minProcessAmount);
+        _processInternal();
+    }
+
+    /// @dev The buyback body, callable from the public entrypoint (after the mode/min gate) and
+    ///      from the triggered _runCycle (after its own min gate). Consumes all pendingBnb.
+    function _processInternal() internal {
         uint256 amount = pendingBnb;
-        if (amount < minProcessAmount) revert BelowMinimumProcessAmount(amount, minProcessAmount);
         pendingBnb = 0;
 
         uint256 received = _buyTaxToken(amount);
@@ -153,7 +185,8 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
         emit RevenueProcessed(amount, received, lpOut);
     }
 
-    /// @notice Switch between AUTO (permissionless processRevenue) and MANUAL (operator-only).
+    /// @notice Switch between TRIGGERED (automated via the Flap TriggerService, operator-only
+    ///         manual fallback), AUTO (permissionless processRevenue) and MANUAL (operator-only).
     /// @dev Restricted to creator or Guardian. Guardian retains access per the Flap mandate.
     function setMode(Mode newMode) external {
         if (msg.sender != creator && msg.sender != _getGuardian()) revert NotModeAdmin();
@@ -202,8 +235,20 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
     }
 
     /// @notice Claims accumulated LP rebates and distributes them directly to holders via the
-    ///         token's native Dividend contract. Permissionless.
+    ///         token's native Dividend contract. Permissionless in ALL modes (post-v4 it has no
+    ///         swap/MEV surface — just claim + direct deposit).
     function harvest() external nonReentrant {
+        _harvestInternal();
+    }
+
+    /// @dev The harvest body, callable from the public entrypoint and from the triggered cycle.
+    ///      Early-returns when there is nothing to claim (resilient backstop). It CAN still revert
+    ///      on a misconfigured vault (DividendTokenMismatch / ZeroDividendContract /
+    ///      DividendDepositFailed); in TRIGGERED mode such a revert bricks the whole _runCycle and
+    ///      the loop must be recovered via retryTrigger()/manual scheduleTrigger(). This coupling
+    ///      is accepted by design (a misconfigured vault is a dead vault) — no silent fallback is
+    ///      added (anti-fallback principle).
+    function _harvestInternal() internal {
         basePool.claimUserRebate(poolId, address(this), address(this));
         // The pool's quote token IS the reward token AND the token's configured dividendToken
         // (enforced in _forwardToDividend), so the claimed rebate is distributed directly.
@@ -213,6 +258,74 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
         _forwardToDividend(rewardToken, amount);
         totalRewardsForwarded += amount;
         emit Harvested(amount, amount);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    //  TRIGGERED automation (Flap TriggerService / ITriggerReceiver)
+    //  Rule 008 compliance: caller validation (Critical), requestId replay protection
+    //  (High), bounded deterministic callback under the 2M gas cap (High), nonReentrant.
+    //  Market re-validation: the buyback minOut is re-derived from a fresh same-block Portal
+    //  quote inside _buyTaxToken at callback time (no scheduling-time price is reused), and the
+    //  minProcessAmount gate is re-checked in _runCycle — so the callback never forces a stale
+    //  or below-threshold action.
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    /// @inheritdoc ITriggerReceiver
+    /// @dev Rule 008: validate the caller is the official TriggerService, reject unknown/replayed
+    ///      requestIds, and consume the request id BEFORE any external call so a revert restores
+    ///      it (allowing a legit retryTrigger by anyone, no-gas-cap).
+    function trigger(uint256 requestId) external override nonReentrant {
+        if (msg.sender != triggerService) revert OnlyTriggerService();
+        if (requestId == 0 || requestId != pendingTriggerId) revert UnknownTrigger(requestId);
+        pendingTriggerId = 0; // consume before external calls; a revert restores it for retryTrigger
+        _runCycle();
+    }
+
+    /// @dev One automated cycle: always settle rewards (the timed harvest backstop), reserve the
+    ///      next cycle's fee from pendingBnb and reschedule first (so the timer survives even when
+    ///      the buyback is skipped), then buy back with whatever BNB remains if it clears the
+    ///      threshold. Re-validates the buyback threshold at callback time (delay-aware).
+    function _runCycle() internal {
+        _harvestInternal(); // always settle rewards; never reverts on an empty rebate
+
+        uint256 fee = IFlapTriggerService(triggerService).getFee();
+        // reschedule the next cycle, paying the fee from pendingBnb (the only BNB the vault holds)
+        if (pendingBnb > fee) {
+            pendingBnb -= fee;
+            _scheduleNext(fee);
+        }
+        // buy back with whatever BNB remains, if it clears the threshold
+        uint256 bought = 0;
+        if (pendingBnb >= minProcessAmount) {
+            bought = pendingBnb;
+            _processInternal();
+        }
+        emit CycleExecuted(bought, 0);
+    }
+
+    /// @dev Requests the next trigger from the service, paying `fee`, and binds its id.
+    function _scheduleNext(uint256 fee) internal {
+        uint64 executeAfter = uint64(block.timestamp + triggerInterval);
+        uint256 id = IFlapTriggerService(triggerService).requestTrigger{value: fee}(executeAfter);
+        pendingTriggerId = id;
+        emit TriggerScheduled(id, executeAfter);
+    }
+
+    /// @notice Starts (or restarts) the TRIGGERED automation loop. Anyone may call when no trigger
+    ///         is pending; the scheduling fee is paid from pendingBnb. No-op gate if already scheduled.
+    function scheduleTrigger() external nonReentrant {
+        if (mode != Mode.TRIGGERED) revert NotAuthorized();
+        if (pendingTriggerId != 0) revert TriggerAlreadyScheduled();
+        uint256 fee = IFlapTriggerService(triggerService).getFee();
+        if (pendingBnb <= fee) revert BelowMinimumProcessAmount(pendingBnb, fee);
+        pendingBnb -= fee;
+        _scheduleNext(fee);
+    }
+
+    /// @notice Deploys the myx pool for this token if missing, so the heavy deployPool gas is not
+    ///         paid inside a triggered processRevenue callback. Permissionless.
+    function ensurePoolDeployed() external nonReentrant {
+        _ensurePoolExists();
     }
 
     /// @dev Distributes the reward directly: the myx pool's quote token MUST equal the Flap
@@ -278,9 +391,16 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
             " distributed). Pending BNB: ",
             Strings.toString(pendingBnb),
             ". harvest() is permissionless. processRevenue() trigger mode: ",
-            mode == Mode.AUTO ? "AUTO (permissionless)" : "MANUAL (operator-only)",
+            _modeLabel(),
             "."
         );
+    }
+
+    /// @dev Human-readable label for the current processRevenue trigger mode.
+    function _modeLabel() internal view returns (string memory) {
+        if (mode == Mode.TRIGGERED) return "TRIGGERED (automated via Flap TriggerService, operator-only manual)";
+        if (mode == Mode.AUTO) return "AUTO (permissionless)";
+        return "MANUAL (operator-only)";
     }
 
     function vaultUISchema() public pure override returns (VaultUISchema memory schema) {
@@ -303,7 +423,7 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
 
         schema.methods[2].name = "processRevenue";
         schema.methods[2].description =
-            "Convert pending BNB into MYX base-pool liquidity by buying back the token. Permissionless in AUTO mode, operator-only in MANUAL mode.";
+            "Convert pending BNB into MYX base-pool liquidity by buying back the token. Permissionless in AUTO mode; operator-only in TRIGGERED and MANUAL modes (TRIGGERED also runs automatically via the Flap TriggerService).";
         schema.methods[2].isWriteMethod = true;
 
         schema.methods[3].name = "harvest";
@@ -316,6 +436,6 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
         schema.methods[4].inputs = new FieldDescriptor[](1);
         schema.methods[4].inputs[0] = FieldDescriptor("user", "address", "Holder address", 0);
         schema.methods[4].outputs = new FieldDescriptor[](1);
-        schema.methods[4].outputs[0] = FieldDescriptor("amount", "uint256", "Claimable WBNB amount", 18);
+        schema.methods[4].outputs[0] = FieldDescriptor("amount", "uint256", "Claimable dividend amount", 18);
     }
 }

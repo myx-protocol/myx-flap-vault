@@ -68,7 +68,12 @@ contract MyxVaultForkTest is FlapBSCFixture {
                 // 5%: the buyback minOut is bounded by a pre-trade same-block Portal quote,
                 // so the bound must absorb the curve impact of the vault's own buy.
                 maxSlippageBps: 500,
-                minProcessAmount: 0.001 ether // small so a modest trade clears it
+                minProcessAmount: 0.001 ether, // small so a modest trade clears it
+                // Real Flap TriggerService on BSC mainnet (chainId 56); the fork test exercises
+                // the v3 processRevenue path, not the triggered loop, so this only needs to be
+                // a valid config value for the constructor.
+                triggerService: 0xcf4EE25035CF883895110f367F5BA8172416a7F9,
+                triggerInterval: 1 hours
             })
         );
 

@@ -21,6 +21,7 @@ contract MyxVaultTestBase is Test {
     MockAggregatorV3 usdtUsdFeed;
     MockDividendDistributor dividend;
     MockTaxToken taxToken;
+    MockTriggerService triggerService;
 
     address creator = makeAddr("creator");
     // Guardian address hardcoded in VaultBase for chainId 56; tests etch chainid 56 via vm.chainId.
@@ -44,6 +45,7 @@ contract MyxVaultTestBase is Test {
         // (pool.quoteToken == dividend.dividendToken()) holds.
         dividend = new MockDividendDistributor(address(usdt));
         taxToken = new MockTaxToken(address(dividend));
+        triggerService = new MockTriggerService();
 
         // The vault resolves the Portal via VaultBase._getPortal() (hardcoded per chainid),
         // so the mock must live at the BSC mainnet Portal address. vm.etch copies CODE but
@@ -71,6 +73,8 @@ contract MyxVaultTestBase is Test {
         p.basePool = address(basePool);
         p.maxSlippageBps = 300;          // 3%
         p.minProcessAmount = 0.1 ether;  // BNB
+        p.triggerService = address(triggerService);
+        p.triggerInterval = 1 hours;
     }
 }
 
@@ -190,12 +194,14 @@ contract MyxVaultProcessTest is MyxVaultTestBase {
         assertEq(vault.totalLpMinted(), 1000 ether);
     }
 
-    function test_defaultMode_isAuto() public view {
-        assertTrue(vault.mode() == MyxVault.Mode.AUTO);
+    function test_defaultMode_isTriggered() public view {
+        assertTrue(vault.mode() == MyxVault.Mode.TRIGGERED);
     }
 
     function test_auto_anyoneCanProcess() public {
-        // default AUTO mode: processRevenue is permissionless
+        // AUTO mode: processRevenue is permissionless (default is now TRIGGERED).
+        vm.prank(GUARDIAN);
+        vault.setMode(MyxVault.Mode.AUTO);
         _fund(1 ether);
         vm.prank(makeAddr("stranger"));
         vault.processRevenue();
@@ -208,7 +214,7 @@ contract MyxVaultProcessTest is MyxVaultTestBase {
         vault.setMode(MyxVault.Mode.MANUAL);
         _fund(1 ether);
         vm.prank(stranger);
-        vm.expectRevert(MyxVault.NotAuthorizedInManualMode.selector);
+        vm.expectRevert(MyxVault.NotAuthorized.selector);
         vault.processRevenue();
         assertEq(vault.pendingBnb(), 1 ether); // untouched
     }
@@ -295,7 +301,7 @@ contract MyxVaultProcessTest is MyxVaultTestBase {
         vault.setMode(MyxVault.Mode.MANUAL);
         address stranger = makeAddr("stranger");
         vm.prank(stranger);
-        vm.expectRevert(MyxVault.NotAuthorizedInManualMode.selector);
+        vm.expectRevert(MyxVault.NotAuthorized.selector);
         vault.processRevenue();
 
         vm.prank(GUARDIAN);
@@ -324,10 +330,12 @@ contract MyxVaultProcessTest is MyxVaultTestBase {
 
     function test_processRevenue_belowMinimumAfterSuccess_reverts() public {
         _fund(1 ether);
-        vault.processRevenue(); // default AUTO, succeeds, pendingBnb -> 0
+        vm.prank(creator); // default mode is TRIGGERED: operator-only
+        vault.processRevenue(); // succeeds, pendingBnb -> 0
 
         // second call with pendingBnb == 0 must revert below-minimum
         uint256 minAmt = vault.minProcessAmount();
+        vm.prank(creator);
         vm.expectRevert(abi.encodeWithSelector(MyxVault.BelowMinimumProcessAmount.selector, 0, minAmt));
         vault.processRevenue();
     }
@@ -335,6 +343,69 @@ contract MyxVaultProcessTest is MyxVaultTestBase {
 
 contract MyxVaultModeTest is MyxVaultTestBase {
     event ModeChanged(MyxVault.Mode newMode);
+
+    function setUp() public override {
+        super.setUp();
+        // register the tax-token pool as already existing so processRevenue can deposit
+        PoolMetadata memory meta;
+        meta.marketId = marketId;
+        meta.poolId = MyxPoolId.derive(marketId, address(taxToken));
+        meta.baseToken = address(taxToken);
+        meta.basePoolToken = address(lpToken);
+        poolManager.setPool(meta.poolId, meta);
+        portal.setRate(1000, 1);
+    }
+
+    function _fund(uint256 amount) internal {
+        vm.deal(address(this), amount);
+        (bool ok,) = address(vault).call{value: amount}("");
+        assertTrue(ok);
+    }
+
+    function test_defaultMode_isTriggered() public view {
+        // enum order is { TRIGGERED, AUTO, MANUAL } => TRIGGERED == 0
+        assertEq(uint8(vault.mode()), 0);
+    }
+
+    function test_processRevenue_triggeredMode_operatorOnly() public {
+        // default mode is TRIGGERED: only OPERATOR_ROLE may call processRevenue
+        _fund(1 ether);
+        vm.prank(makeAddr("stranger"));
+        vm.expectRevert(MyxVault.NotAuthorized.selector);
+        vault.processRevenue();
+
+        vm.prank(creator); // creator holds OPERATOR_ROLE
+        vault.processRevenue();
+        assertEq(basePool.depositCallCount(), 1);
+    }
+
+    function test_processRevenue_autoMode_permissionless() public {
+        vm.prank(creator);
+        vault.setMode(MyxVault.Mode.AUTO);
+        _fund(1 ether);
+        vm.prank(makeAddr("stranger"));
+        vault.processRevenue();
+        assertEq(basePool.depositCallCount(), 1);
+    }
+
+    function test_processRevenue_manualMode_operatorOnly() public {
+        vm.prank(creator);
+        vault.setMode(MyxVault.Mode.MANUAL);
+        _fund(1 ether);
+        vm.prank(makeAddr("stranger"));
+        vm.expectRevert(MyxVault.NotAuthorized.selector);
+        vault.processRevenue();
+
+        vm.prank(creator);
+        vault.processRevenue();
+        assertEq(basePool.depositCallCount(), 1);
+    }
+
+    function test_setMode_onlyCreatorOrGuardian() public {
+        vm.prank(makeAddr("stranger"));
+        vm.expectRevert(MyxVault.NotModeAdmin.selector);
+        vault.setMode(MyxVault.Mode.AUTO);
+    }
 
     function test_setMode_creatorAllowed() public {
         vm.prank(creator);
@@ -359,6 +430,159 @@ contract MyxVaultModeTest is MyxVaultTestBase {
         emit ModeChanged(MyxVault.Mode.MANUAL);
         vm.prank(creator);
         vault.setMode(MyxVault.Mode.MANUAL);
+    }
+}
+
+contract MyxVaultTriggerTest is MyxVaultTestBase {
+    function setUp() public override {
+        super.setUp();
+        // Register the tax-token pool with quoteToken == usdt == dividend.dividendToken()
+        // so both the buyback (deposit) and the harvest (direct distribution) work in-cycle.
+        PoolMetadata memory meta;
+        meta.marketId = marketId;
+        meta.poolId = MyxPoolId.derive(marketId, address(taxToken));
+        meta.baseToken = address(taxToken);
+        meta.quoteToken = address(usdt);
+        meta.basePoolToken = address(lpToken);
+        poolManager.setPool(meta.poolId, meta);
+        portal.setRate(1000, 1); // 1 BNB -> 1000 tax tokens
+    }
+
+    function _fund(uint256 amount) internal {
+        vm.deal(address(this), amount);
+        (bool ok,) = address(vault).call{value: amount}("");
+        assertTrue(ok);
+    }
+
+    function test_scheduleTrigger_bootstraps() public {
+        _fund(1 ether);
+        uint256 fee = triggerService.getFee();
+        vault.scheduleTrigger();
+        assertEq(vault.pendingTriggerId(), 1);
+        assertEq(vault.pendingBnb(), 1 ether - fee);
+    }
+
+    function test_scheduleTrigger_revertsIfAlreadyScheduled() public {
+        _fund(1 ether);
+        vault.scheduleTrigger();
+        vm.expectRevert(MyxVault.TriggerAlreadyScheduled.selector);
+        vault.scheduleTrigger();
+    }
+
+    function test_scheduleTrigger_revertsIfInsufficientBnb() public {
+        // pendingBnb (0) <= fee
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                MyxVault.BelowMinimumProcessAmount.selector, 0, triggerService.getFee()
+            )
+        );
+        vault.scheduleTrigger();
+    }
+
+    function test_scheduleTrigger_revertsIfNotTriggeredMode() public {
+        vm.prank(creator);
+        vault.setMode(MyxVault.Mode.AUTO);
+        _fund(1 ether);
+        vm.expectRevert(MyxVault.NotAuthorized.selector);
+        vault.scheduleTrigger();
+    }
+
+    function test_trigger_onlyTriggerService() public {
+        _fund(1 ether);
+        vault.scheduleTrigger();
+        vm.prank(makeAddr("stranger"));
+        vm.expectRevert(MyxVault.OnlyTriggerService.selector);
+        vault.trigger(1);
+    }
+
+    function test_trigger_unknownRequestId_reverts() public {
+        _fund(1 ether);
+        vault.scheduleTrigger(); // id 1
+        vm.expectRevert(abi.encodeWithSelector(MyxVault.UnknownTrigger.selector, uint256(999)));
+        triggerService.fire(address(vault), 999);
+    }
+
+    function test_trigger_runsCycleAndReschedules() public {
+        basePool.setRebate(600 ether); // harvestable rebate
+        uint256 fee = triggerService.getFee();
+        _fund(1 ether); // well above minProcessAmount + fee
+        vault.scheduleTrigger(); // id 1, reserves one fee
+        assertEq(vault.pendingTriggerId(), 1);
+
+        triggerService.fire(address(vault), 1);
+
+        // harvest happened (rebate forwarded into the dividend contract)
+        assertEq(dividend.totalDeposited(), 600 ether);
+        // buyback happened (LP minted)
+        assertEq(basePool.depositCallCount(), 1);
+        assertGt(vault.totalLpMinted(), 0);
+        // next cycle rescheduled (id 2), and pendingBnb consumed by the buyback
+        assertEq(vault.pendingTriggerId(), 2);
+        assertEq(vault.pendingBnb(), 0);
+
+        // replay protection: firing id 1 again must revert (it has been consumed)
+        vm.expectRevert(abi.encodeWithSelector(MyxVault.UnknownTrigger.selector, uint256(1)));
+        triggerService.fire(address(vault), 1);
+    }
+
+    function test_trigger_harvestBackstopRunsEvenBelowBuybackThreshold() public {
+        uint256 fee = triggerService.getFee();
+        // pendingBnb strictly between fee and (minProcessAmount + fee) so that after the
+        // reschedule fee is deducted, the remainder is below minProcessAmount: buyback skipped.
+        uint256 funded = fee + 0.05 ether; // 0.05 < minProcessAmount (0.1)
+        _fund(funded);
+        basePool.setRebate(123 ether);
+        vault.scheduleTrigger(); // id 1, deducts one fee -> pendingBnb = 0.05 ether
+        assertEq(vault.pendingBnb(), 0.05 ether);
+
+        triggerService.fire(address(vault), 1);
+
+        // harvest backstop ran
+        assertEq(dividend.totalDeposited(), 123 ether);
+        // buyback skipped (remainder below minProcessAmount)
+        assertEq(basePool.depositCallCount(), 0);
+        // rescheduled, and another fee consumed from the 0.05 remainder
+        assertEq(vault.pendingTriggerId(), 2);
+        assertEq(vault.pendingBnb(), 0.05 ether - fee);
+    }
+
+    function test_trigger_gasUnderCallbackCap() public {
+        // Pool pre-registered (setUp) so no heavy deployPool runs inside the callback.
+        // NOTE: real myx deployPool gas is UNMEASURED (myx is not on BSC); the first
+        // triggered processRevenue per token may need an out-of-band ensurePoolDeployed().
+        basePool.setRebate(50 ether);
+        _fund(1 ether);
+        vault.scheduleTrigger(); // id 1
+
+        uint256 gasBefore = gasleft();
+        triggerService.fire(address(vault), 1);
+        uint256 used = gasBefore - gasleft();
+
+        assertLt(used, 2_000_000);
+        emit log_named_uint("trigger callback gas", used);
+    }
+
+    function test_ensurePoolDeployed_permissionless() public {
+        // Remove the pre-registered pool by deploying a fresh vault without setPool.
+        // Simpler: use a token whose pool is not registered. Here we re-init a vault.
+        MyxVault fresh = _deployVault(_freshParams());
+        vm.prank(makeAddr("stranger"));
+        fresh.ensurePoolDeployed();
+        assertEq(poolManager.deployPoolCallCount(), 1);
+    }
+
+    function _freshParams() internal returns (MyxVault.InitParams memory p) {
+        // a tax token whose pool key is not pre-registered in poolManager
+        MockTaxToken freshTax = new MockTaxToken(address(dividend));
+        p.taxToken = address(freshTax);
+        p.creator = creator;
+        p.marketId = marketId;
+        p.poolManager = address(poolManager);
+        p.basePool = address(basePool);
+        p.maxSlippageBps = 300;
+        p.minProcessAmount = 0.1 ether;
+        p.triggerService = address(triggerService);
+        p.triggerInterval = 1 hours;
     }
 }
 

@@ -17,7 +17,10 @@ contract DeployMyxVaultFactory is Script {
                 poolManager: vm.envAddress("MYX_POOL_MANAGER"),
                 basePool: vm.envAddress("MYX_BASE_POOL"),
                 maxSlippageBps: 300,
-                minProcessAmount: 0.01 ether
+                minProcessAmount: 0.01 ether,
+                // The Flap TriggerService testnet address is unknown; supply it via env.
+                triggerService: vm.envAddress("FLAP_TRIGGER_SERVICE"),
+                triggerInterval: uint64(vm.envOr("TRIGGER_INTERVAL", uint256(1 hours)))
             })
         );
         console2.log("MyxVaultFactory:", address(factory));

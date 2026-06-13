@@ -18,6 +18,8 @@ contract MyxVaultFactory is VaultFactoryBaseV2 {
         address basePool;
         uint16 maxSlippageBps;
         uint256 minProcessAmount;
+        address triggerService;
+        uint64 triggerInterval;
     }
 
     error UnsupportedQuoteToken();
@@ -67,7 +69,9 @@ contract MyxVaultFactory is VaultFactoryBaseV2 {
                             poolManager: c.poolManager,
                             basePool: c.basePool,
                             maxSlippageBps: c.maxSlippageBps,
-                            minProcessAmount: c.minProcessAmount
+                            minProcessAmount: c.minProcessAmount,
+                            triggerService: c.triggerService,
+                            triggerInterval: c.triggerInterval
                         })
                     )
                 )
