@@ -64,15 +64,16 @@ contract MockPancakeRouter {
 }
 
 contract MockDividendDistributor {
-    IERC20 public immutable wbnb;
+    address public dividendToken;
     uint256 public totalDeposited;
     bool public depositSucceeds = true;
     mapping(address => uint256) public pendingOf;
-    constructor(address _wbnb) { wbnb = IERC20(_wbnb); }
+    constructor(address _dividendToken) { dividendToken = _dividendToken; }
+    function setDividendToken(address t) external { dividendToken = t; }
     function setDepositSucceeds(bool v) external { depositSucceeds = v; }
     function deposit(uint256 amount) external returns (bool) {
         if (!depositSucceeds) return false; // mirrors real contract: false, not revert
-        wbnb.transferFrom(msg.sender, address(this), amount);
+        IERC20(dividendToken).transferFrom(msg.sender, address(this), amount);
         totalDeposited += amount;
         return true;
     }

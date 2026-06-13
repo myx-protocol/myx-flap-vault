@@ -39,14 +39,8 @@ contract MyxVaultFactoryTest is Test {
         return MyxVaultFactory.GlobalConfig({
             poolManager: address(poolManager),
             basePool: address(basePool),
-            swapRouter: address(router),
-            wbnb: address(wbnb),
-            quoteToken: address(usdt),
-            bnbUsdFeed: address(bnbFeed),
-            usdtUsdFeed: address(usdtFeed),
             maxSlippageBps: 300,
-            minProcessAmount: 0.1 ether,
-            maxPriceStaleness: 3600
+            minProcessAmount: 0.1 ether
         });
     }
 
@@ -73,9 +67,7 @@ contract MyxVaultFactoryTest is Test {
             MyxVault.InitParams({
                 taxToken: address(1), creator: address(1),
                 marketId: marketId, poolManager: address(1), basePool: address(1),
-                swapRouter: address(1), wbnb: address(1), quoteToken: address(1),
-                bnbUsdFeed: address(1), usdtUsdFeed: address(1),
-                maxSlippageBps: 0, minProcessAmount: 0, maxPriceStaleness: 0
+                maxSlippageBps: 0, minProcessAmount: 0
             })
         );
     }

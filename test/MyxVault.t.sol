@@ -39,7 +39,10 @@ contract MyxVaultTestBase is Test {
         router = new MockPancakeRouter();
         bnbUsdFeed = new MockAggregatorV3(600e8, 8);  // BNB = $600
         usdtUsdFeed = new MockAggregatorV3(1e8, 8);   // USDT = $1
-        dividend = new MockDividendDistributor(address(wbnb));
+        // v4: the pool's quote token IS the dividend token; the claimed rebate is distributed
+        // directly. Construct the dividend with dividendToken() == usdt so harvest's invariant
+        // (pool.quoteToken == dividend.dividendToken()) holds.
+        dividend = new MockDividendDistributor(address(usdt));
         taxToken = new MockTaxToken(address(dividend));
 
         // The vault resolves the Portal via VaultBase._getPortal() (hardcoded per chainid),
@@ -66,14 +69,8 @@ contract MyxVaultTestBase is Test {
         p.marketId = marketId;
         p.poolManager = address(poolManager);
         p.basePool = address(basePool);
-        p.swapRouter = address(router);
-        p.wbnb = address(wbnb);
-        p.quoteToken = address(usdt);
-        p.bnbUsdFeed = address(bnbUsdFeed);
-        p.usdtUsdFeed = address(usdtUsdFeed);
         p.maxSlippageBps = 300;          // 3%
         p.minProcessAmount = 0.1 ether;  // BNB
-        p.maxPriceStaleness = 3600; // 1 hour
     }
 }
 
@@ -87,6 +84,14 @@ contract MyxVaultInitTest is MyxVaultTestBase {
     function test_initialize_revertsOnSecondCall() public {
         vm.expectRevert();
         vault.initialize(_initParams());
+    }
+
+    function test_initialize_storesTrimmedConfig() public view {
+        // v4: feed/router/wbnb/quoteToken removed from InitParams; the surviving config persists.
+        assertEq(address(vault.poolManager()), address(poolManager));
+        assertEq(address(vault.basePool()), address(basePool));
+        assertEq(vault.maxSlippageBps(), 300);
+        assertEq(vault.minProcessAmount(), 0.1 ether);
     }
 
     function test_receive_accountsOnly() public {
@@ -397,31 +402,28 @@ contract MyxVaultAutoDeployPoolTest is MyxVaultTestBase {
 contract MyxVaultHarvestTest is MyxVaultTestBase {
     function setUp() public override {
         super.setUp();
-        // USDT → WBNB at fair rate: 600 USDT = 1 WBNB → num=1, den=600
-        router.setRate(1, 600);
+        // v4: harvest reads pool.quoteToken as the reward token. Register the pool so
+        // pool.quoteToken == usdt == dividend.dividendToken() — the direct-distribution invariant.
+        PoolMetadata memory meta;
+        meta.marketId = marketId;
+        meta.poolId = MyxPoolId.derive(marketId, address(taxToken));
+        meta.baseToken = address(taxToken);
+        meta.quoteToken = address(usdt);
+        meta.basePoolToken = address(lpToken);
+        poolManager.setPool(meta.poolId, meta);
     }
 
-    function test_harvest_claimsSwapsAndForwards() public {
+    function test_harvest_claimsAndDistributesDirectly() public {
         basePool.setRebate(600 ether); // 600 USDT pending
         vault.harvest();
-        // 600 USDT → 1 WBNB → forwarded to dividend
-        assertEq(dividend.totalDeposited(), 1 ether);
-        assertEq(vault.totalRewardsForwarded(), 1 ether);
+        // No swap: the claimed USDT goes straight into the dividend contract.
+        assertEq(dividend.totalDeposited(), 600 ether);
+        assertEq(vault.totalRewardsForwarded(), 600 ether);
         assertEq(usdt.balanceOf(address(vault)), 0);
-        assertEq(vault.totalRewardsForwarded(), dividend.totalDeposited());
     }
 
     function test_harvest_noRebate_noop() public {
         vault.harvest();
-        assertEq(dividend.totalDeposited(), 0);
-    }
-
-    function test_harvest_badSwapRate_revertsAndRetainsUsdt() public {
-        basePool.setRebate(600 ether);
-        router.setRate(1, 1200); // router pays half of fair → below 3% bound
-        vm.expectRevert("MockRouter: INSUFFICIENT_OUTPUT_AMOUNT");
-        vault.harvest();
-        // claim happened inside the reverted tx, so nothing left the vault overall
         assertEq(dividend.totalDeposited(), 0);
     }
 
@@ -434,12 +436,16 @@ contract MyxVaultHarvestTest is MyxVaultTestBase {
         assertEq(dividend.totalDeposited(), 0);
     }
 
-    function test_harvest_dustRebate_retainedNotForwarded() public {
-        // 500 wei USDT @ $1, BNB @ $600 → fairOut = 500*1e8/600e8 = 0 → skip, retain
-        basePool.setRebate(500);
+    function test_harvest_dividendTokenMismatch_reverts() public {
+        // invariant break: the dividend contract's token no longer matches the pool quote.
+        basePool.setRebate(600 ether);
+        address other = makeAddr("other");
+        dividend.setDividendToken(other);
+        vm.expectRevert(
+            abi.encodeWithSelector(MyxVault.DividendTokenMismatch.selector, address(usdt), other)
+        );
         vault.harvest();
         assertEq(dividend.totalDeposited(), 0);
-        assertEq(usdt.balanceOf(address(vault)), 500); // dust stays for next harvest
     }
 
     function test_harvest_zeroDividendContract_reverts() public {
@@ -449,20 +455,10 @@ contract MyxVaultHarvestTest is MyxVaultTestBase {
         vault.harvest();
     }
 
-    function test_harvest_revertsOnStaleBnbFeed() public {
-        basePool.setRebate(600 ether);
-        bnbUsdFeed.setAnswer(0);
-        vm.expectRevert(abi.encodeWithSelector(MyxVault.StalePrice.selector, address(bnbUsdFeed)));
+    function test_harvest_forwardedEqualsClaimed() public {
+        basePool.setRebate(123 ether);
         vault.harvest();
-    }
-
-    function test_harvest_revertsOnOutdatedUsdtFeed() public {
-        // feed answer is positive but last update is older than maxPriceStaleness
-        basePool.setRebate(600 ether);
-        usdtUsdFeed.setUpdatedAt(1);
-        vm.warp(100000);
-        vm.expectRevert(abi.encodeWithSelector(MyxVault.StalePrice.selector, address(usdtUsdFeed)));
-        vault.harvest();
+        assertEq(vault.totalRewardsForwarded(), dividend.totalDeposited());
     }
 }
 

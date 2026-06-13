@@ -16,14 +16,8 @@ contract MyxVaultFactory is VaultFactoryBaseV2 {
     struct GlobalConfig {
         address poolManager;
         address basePool;
-        address swapRouter;
-        address wbnb;
-        address quoteToken;
-        address bnbUsdFeed;
-        address usdtUsdFeed;
         uint16 maxSlippageBps;
         uint256 minProcessAmount;
-        uint32 maxPriceStaleness;
     }
 
     error UnsupportedQuoteToken();
@@ -72,14 +66,8 @@ contract MyxVaultFactory is VaultFactoryBaseV2 {
                             marketId: marketId,
                             poolManager: c.poolManager,
                             basePool: c.basePool,
-                            swapRouter: c.swapRouter,
-                            wbnb: c.wbnb,
-                            quoteToken: c.quoteToken,
-                            bnbUsdFeed: c.bnbUsdFeed,
-                            usdtUsdFeed: c.usdtUsdFeed,
                             maxSlippageBps: c.maxSlippageBps,
-                            minProcessAmount: c.minProcessAmount,
-                            maxPriceStaleness: c.maxPriceStaleness
+                            minProcessAmount: c.minProcessAmount
                         })
                     )
                 )

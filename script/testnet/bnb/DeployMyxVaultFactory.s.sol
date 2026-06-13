@@ -5,7 +5,9 @@ import {Script, console2} from "forge-std/Script.sol";
 import {MyxVaultFactory} from "../../../src/MyxVaultFactory.sol";
 
 /// @notice Deploys MyxVaultFactory on BNB testnet (chainId 97).
-///         All MYX/DEX/feed addresses come from env to avoid hardcoding unverified ones.
+///         MYX addresses come from env to avoid hardcoding unverified ones. v4 removed the
+///         DEX router, WBNB, quote token and Chainlink feed config: harvest distributes the
+///         pool quote token directly as the dividend token (no swap, no feeds).
 contract DeployMyxVaultFactory is Script {
     function run() external {
         require(block.chainid == 97, "wrong chain");
@@ -14,14 +16,8 @@ contract DeployMyxVaultFactory is Script {
             MyxVaultFactory.GlobalConfig({
                 poolManager: vm.envAddress("MYX_POOL_MANAGER"),
                 basePool: vm.envAddress("MYX_BASE_POOL"),
-                swapRouter: vm.envAddress("PANCAKE_ROUTER"),
-                wbnb: vm.envAddress("WBNB"),
-                quoteToken: vm.envAddress("MYX_QUOTE_TOKEN"),
-                bnbUsdFeed: vm.envAddress("BNB_USD_FEED"),
-                usdtUsdFeed: vm.envAddress("USDT_USD_FEED"),
                 maxSlippageBps: 300,
-                minProcessAmount: 0.01 ether,
-                maxPriceStaleness: 3600
+                minProcessAmount: 0.01 ether
             })
         );
         console2.log("MyxVaultFactory:", address(factory));

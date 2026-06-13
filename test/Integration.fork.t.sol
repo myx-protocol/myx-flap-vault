@@ -57,22 +57,18 @@ contract MyxVaultForkTest is FlapBSCFixture {
         basePool = new MockBasePool(lpToken, usdt);
         poolManager = new MockPoolManager();
 
-        // Deploy OUR factory: MYX side pointed at the mocks,
-        // WBNB/router/feeds pointed at REAL BSC addresses.
+        // Deploy OUR factory: MYX side pointed at the mocks.
+        // TODO(v4): triggered-mode + dividend assertions — harvest now distributes the pool
+        // quote token directly (no swap/feeds), so the runtime fork flow needs a pool whose
+        // quoteToken == the token's dividendToken before harvest can be exercised here.
         factory = new MyxVaultFactory(
             MyxVaultFactory.GlobalConfig({
                 poolManager: address(poolManager),
                 basePool: address(basePool),
-                swapRouter: PANCAKE_ROUTER,
-                wbnb: WBNB,
-                quoteToken: address(usdt),
-                bnbUsdFeed: BNB_USD_FEED,
-                usdtUsdFeed: USDT_USD_FEED,
                 // 5%: the buyback minOut is bounded by a pre-trade same-block Portal quote,
                 // so the bound must absorb the curve impact of the vault's own buy.
                 maxSlippageBps: 500,
-                minProcessAmount: 0.001 ether, // small so a modest trade clears it
-                maxPriceStaleness: 86_400 // wide tolerance: fork block may lag live feed updates
+                minProcessAmount: 0.001 ether // small so a modest trade clears it
             })
         );
 
