@@ -64,6 +64,11 @@ contract MockPancakeRouter {
     }
 }
 
+/// @dev v6: the configured dividendToken is the myx base-pool LP (mBase). deposit() pulls that LP
+///      via transferFrom; withdrawDividendsFor(user) claims a holder's pending LP on their behalf
+///      (Lista proxy target), transferring pendingOf[user] of the dividendToken to the user so
+///      claimReward()'s effect is assertable. deposit() returns false (not revert) when the
+///      depositSucceeds flag simulates the real contract's totalShares == 0 early window.
 contract MockDividendDistributor {
     address public dividendToken;
     uint256 public totalDeposited;
@@ -80,6 +85,13 @@ contract MockDividendDistributor {
     }
     function setPending(address user, uint256 amount) external { pendingOf[user] = amount; }
     function withdrawableDividends(address user) external view returns (uint256) { return pendingOf[user]; }
+    /// @dev Claim-on-behalf: pays the holder its pending LP and zeroes the entry, so a
+    ///      vault.claimReward() call's effect is observable in tests.
+    function withdrawDividendsFor(address user) external {
+        uint256 amount = pendingOf[user];
+        pendingOf[user] = 0;
+        if (amount > 0) IERC20(dividendToken).transfer(user, amount);
+    }
 }
 
 contract MockTaxToken is ERC20 {
@@ -210,8 +222,14 @@ contract MockPoolManager is IMyxPoolManager {
     mapping(bytes32 => PoolMetadata) internal pools;
     uint256 public deployPoolCallCount;
     bool public marketExists = true;
+    /// @dev v6: the LP (mBase) address deployPool stamps as basePoolToken. When set to the real
+    ///      mock lpToken, the vault's _feedDividend finds a live ERC20 to feed; when 0, a synthetic
+    ///      non-contract address is used (faithful to "real deployPool always sets it", but feeding
+    ///      against it would revert — tests exercising the feed path set this to the lpToken).
+    address public lpTokenForDeploy;
 
     function setMarketExists(bool v) external { marketExists = v; }
+    function setLpTokenForDeploy(address lp) external { lpTokenForDeploy = lp; }
 
     function setPool(PoolId poolId, PoolMetadata memory meta) external { pools[PoolId.unwrap(poolId)] = meta; }
 
@@ -223,7 +241,10 @@ contract MockPoolManager is IMyxPoolManager {
         meta.marketId = params.marketId;
         meta.poolId = PoolId.wrap(id);
         meta.baseToken = params.baseToken;
-        meta.basePoolToken = address(uint160(uint256(id))); // faithful: real deployPool always sets it
+        // faithful: real deployPool always sets basePoolToken. Use the configured LP when provided
+        // so the vault's v6 _feedDividend can pull a live ERC20; else a deterministic synthetic addr.
+        meta.basePoolToken =
+            lpTokenForDeploy != address(0) ? lpTokenForDeploy : address(uint160(uint256(id)));
         pools[id] = meta;
     }
 

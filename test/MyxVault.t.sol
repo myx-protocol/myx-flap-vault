@@ -3,6 +3,7 @@ pragma solidity ^0.8.26;
 
 import {Test} from "forge-std/Test.sol";
 import {MyxVault} from "../src/MyxVault.sol";
+import {VaultMethodSchema} from "../src/flap/IVaultSchemasV1.sol";
 import {MarketId, PoolId, MyxPoolId, MyxMarketId, IMyxBasePool, PoolMetadata} from "../src/myx/IMyxPool.sol";
 import {IPortalTradeV2} from "../src/flap/IPortal.sol";
 import {ERC1967Proxy} from "@openzeppelin/proxy/ERC1967/ERC1967Proxy.sol";
@@ -44,10 +45,10 @@ contract MyxVaultTestBase is Test {
         router = new MockPancakeRouter();
         bnbUsdFeed = new MockAggregatorV3(600e8, 8);  // BNB = $600
         usdtUsdFeed = new MockAggregatorV3(1e8, 8);   // USDT = $1
-        // v4: the pool's quote token IS the dividend token; the claimed rebate is distributed
-        // directly. Construct the dividend with dividendToken() == usdt so harvest's invariant
-        // (pool.quoteToken == dividend.dividendToken()) holds.
-        dividend = new MockDividendDistributor(address(usdt));
+        // v6: the DIVIDEND ASSET is the myx base-pool LP (mBase), set at launch via
+        // computeDividendToken. Construct the dividend with dividendToken() == the LP token so the
+        // vault's _feedDividend pulls exactly the LP the mock pool mints (dividendToken == LP invariant).
+        dividend = new MockDividendDistributor(address(lpToken));
         taxToken = new MockTaxToken(address(dividend));
         triggerService = new MockTriggerService();
 
@@ -220,9 +221,11 @@ contract MyxVaultProcessTest is MyxVaultTestBase {
         assertEq(vault.pendingBnb(), 0);
         assertEq(basePool.depositCallCount(), 1);
         assertEq(basePool.lastDepositAmount(), 1000 ether);
-        assertEq(basePool.lastDepositRecipient(), address(vault)); // LP held by vault
-        assertEq(lpToken.balanceOf(address(vault)), 1000 ether);
+        assertEq(basePool.lastDepositRecipient(), address(vault)); // LP minted to the vault first
         assertEq(vault.totalLpMinted(), 1000 ether);
+        // v6: the minted LP is then fed into the dividend, so the vault retains none.
+        assertEq(lpToken.balanceOf(address(vault)), 0, "LP fed to the dividend");
+        assertEq(dividend.totalDeposited(), 1000 ether);
     }
 
     function test_defaultMode_isTriggered() public view {
@@ -283,7 +286,9 @@ contract MyxVaultProcessTest is MyxVaultTestBase {
         vault.processRevenue();
         // deposit must use the balance delta (net), never the Portal's gross output
         assertEq(basePool.lastDepositAmount(), 960 ether);
-        assertEq(lpToken.balanceOf(address(vault)), 960 ether);
+        // v6: the 960 LP minted is fed into the dividend
+        assertEq(dividend.totalDeposited(), 960 ether);
+        assertEq(lpToken.balanceOf(address(vault)), 0);
     }
 
     function test_processRevenue_zeroQuote_reverts() public {
@@ -469,8 +474,8 @@ contract MyxVaultTriggerTest is MyxVaultTestBase {
 
     function setUp() public override {
         super.setUp();
-        // Register the tax-token pool with quoteToken == usdt == dividend.dividendToken()
-        // so both the buyback (deposit) and the harvest (direct distribution) work in-cycle.
+        // v6: register the pool with basePoolToken == the LP, and set the dividend asset to that
+        // SAME LP, so the in-cycle buyback mints LP and _feedDividend feeds it to the dividend.
         PoolMetadata memory meta;
         meta.marketId = marketId;
         meta.poolId = MyxPoolId.derive(marketId, address(taxToken));
@@ -478,6 +483,7 @@ contract MyxVaultTriggerTest is MyxVaultTestBase {
         meta.quoteToken = address(usdt);
         meta.basePoolToken = address(lpToken);
         poolManager.setPool(meta.poolId, meta);
+        dividend.setDividendToken(address(lpToken)); // v6: dividend asset IS the LP
         portal.setRate(1000, 1); // 1 BNB -> 1000 tax tokens
     }
 
@@ -536,19 +542,20 @@ contract MyxVaultTriggerTest is MyxVaultTestBase {
     }
 
     function test_trigger_runsCycleAndReschedules() public {
-        basePool.setRebate(600 ether); // harvestable rebate
         uint256 fee = triggerService.getFee();
         _fund(1 ether); // well above minProcessAmount + fee
         vault.scheduleTrigger(); // id 1, reserves one fee
         assertEq(vault.pendingTriggerId(), 1);
+        uint256 bnbForBuyback = vault.pendingBnb() - fee; // remainder after the in-cycle reschedule fee
 
         triggerService.fire(address(vault), 1);
 
-        // harvest happened (rebate forwarded into the dividend contract)
-        assertEq(dividend.totalDeposited(), 600 ether);
-        // buyback happened (LP minted)
+        // v6: the in-cycle buyback minted LP and the cycle fed the WHOLE LP into the dividend.
+        uint256 expectedLp = bnbForBuyback * 1000; // mock Portal rate 1000, LP minted 1:1
         assertEq(basePool.depositCallCount(), 1);
-        assertGt(vault.totalLpMinted(), 0);
+        assertEq(vault.totalLpMinted(), expectedLp);
+        assertEq(dividend.totalDeposited(), expectedLp, "cycle must feed the minted LP to the dividend");
+        assertEq(lpToken.balanceOf(address(vault)), 0, "LP flushed to the dividend");
         // next cycle rescheduled (id 2), and pendingBnb consumed by the buyback
         assertEq(vault.pendingTriggerId(), 2);
         assertEq(vault.pendingBnb(), 0);
@@ -558,22 +565,37 @@ contract MyxVaultTriggerTest is MyxVaultTestBase {
         triggerService.fire(address(vault), 1);
     }
 
-    function test_trigger_harvestBackstopRunsEvenBelowBuybackThreshold() public {
+    function test_trigger_feedBackstopFlushesDeferredEvenBelowBuybackThreshold() public {
+        // v6: the cycle's feed backstop flushes any deferred LP first, even when the remaining
+        // pendingBnb is below the buyback threshold. Arrange deferred LP via a failed feed, then
+        // fire a cycle whose remainder is too small to buy back: the deferred LP must still flush.
         uint256 fee = triggerService.getFee();
-        // pendingBnb strictly between fee and (minProcessAmount + fee) so that after the
-        // reschedule fee is deducted, the remainder is below minProcessAmount: buyback skipped.
+
+        // Stage deferred LP: fund + processRevenue with deposit failing -> 1000 LP retained.
+        // (This staging step itself runs one buyback to mint the LP, so depositCallCount becomes 1.)
+        _fund(1 ether);
+        dividend.setDepositSucceeds(false);
+        vm.prank(creator);
+        vault.processRevenue();
+        assertEq(lpToken.balanceOf(address(vault)), 1000 ether, "LP deferred");
+        assertEq(dividend.totalDeposited(), 0);
+        uint256 depositsAfterStaging = basePool.depositCallCount(); // 1 from the staging buyback
+
+        // Now shares exist: fund just enough that, after the reschedule fee, the remainder is below
+        // minProcessAmount so the buyback is skipped — proving the feed runs independently.
+        dividend.setDepositSucceeds(true);
         uint256 funded = fee + 0.05 ether; // 0.05 < minProcessAmount (0.1)
         _fund(funded);
-        basePool.setRebate(123 ether);
         vault.scheduleTrigger(); // id 1, deducts one fee -> pendingBnb = 0.05 ether
         assertEq(vault.pendingBnb(), 0.05 ether);
 
         triggerService.fire(address(vault), 1);
 
-        // harvest backstop ran
-        assertEq(dividend.totalDeposited(), 123 ether);
-        // buyback skipped (remainder below minProcessAmount)
-        assertEq(basePool.depositCallCount(), 0);
+        // feed backstop flushed the deferred LP
+        assertEq(dividend.totalDeposited(), 1000 ether, "deferred LP flushed by the cycle feed");
+        assertEq(lpToken.balanceOf(address(vault)), 0);
+        // buyback skipped in the cycle (remainder below minProcessAmount): no NEW deposit
+        assertEq(basePool.depositCallCount(), depositsAfterStaging);
         // rescheduled, and another fee consumed from the 0.05 remainder
         assertEq(vault.pendingTriggerId(), 2);
         assertEq(vault.pendingBnb(), 0.05 ether - fee);
@@ -583,7 +605,6 @@ contract MyxVaultTriggerTest is MyxVaultTestBase {
         // Pool pre-registered (setUp) so no heavy deployPool runs inside the callback.
         // NOTE: real myx deployPool gas is UNMEASURED (myx is not on BSC); the first
         // triggered processRevenue per token may need an out-of-band ensurePoolDeployed().
-        basePool.setRebate(50 ether);
         _fund(1 ether);
         vault.scheduleTrigger(); // id 1
 
@@ -644,9 +665,8 @@ contract MyxVaultTriggerTest is MyxVaultTestBase {
 
     function test_trigger_modeSwitchedToAuto_completesCycleButDoesNotReschedule() public {
         // Loop is running in TRIGGERED mode with a trigger in-flight. The creator switches to AUTO
-        // mid-cycle. The in-flight trigger must still complete its current cycle (harvest + buyback)
+        // mid-cycle. The in-flight trigger must still complete its current cycle (feed + buyback+feed)
         // but MUST NOT re-arm the loop, so switching away from TRIGGERED cleanly winds it down.
-        basePool.setRebate(600 ether);
         _fund(1 ether);
         vault.scheduleTrigger(); // id 1
         assertEq(vault.pendingTriggerId(), 1);
@@ -657,10 +677,11 @@ contract MyxVaultTriggerTest is MyxVaultTestBase {
 
         triggerService.fire(address(vault), 1);
 
-        // current cycle still settled rewards and ran the buyback...
-        assertEq(dividend.totalDeposited(), 600 ether);
+        // current cycle still ran the buyback and fed the resulting LP into the dividend...
+        assertGt(dividend.totalDeposited(), 0);
         assertEq(basePool.depositCallCount(), 1);
         assertGt(vault.totalLpMinted(), 0);
+        assertEq(lpToken.balanceOf(address(vault)), 0, "LP flushed to the dividend");
         // ...but the loop did NOT re-arm: no new trigger scheduled, no extra fee skimmed.
         assertEq(vault.pendingTriggerId(), 0);
     }
@@ -696,6 +717,14 @@ contract MyxVaultTriggerTest is MyxVaultTestBase {
 }
 
 contract MyxVaultAutoDeployPoolTest is MyxVaultTestBase {
+    function setUp() public override {
+        super.setUp();
+        // v6: when the cycle auto-deploys the pool, the deployed basePoolToken must be the real LP
+        // so _feedDividend can feed it (dividend asset == LP). Wire deployPool to stamp the lpToken.
+        poolManager.setLpTokenForDeploy(address(lpToken));
+        portal.setRate(1000, 1);
+    }
+
     function _fund(uint256 amount) internal {
         vm.deal(address(this), amount);
         (bool ok,) = address(vault).call{value: amount}("");
@@ -709,6 +738,8 @@ contract MyxVaultAutoDeployPoolTest is MyxVaultTestBase {
         vault.processRevenue();
         assertEq(poolManager.deployPoolCallCount(), 1);
         assertEq(basePool.depositCallCount(), 1);
+        // v6: the LP minted by the buyback is fed into the dividend
+        assertEq(dividend.totalDeposited(), 1000 ether);
     }
 
     function test_processRevenue_skipsDeployWhenPoolExists() public {
@@ -732,11 +763,20 @@ contract MyxVaultAutoDeployPoolTest is MyxVaultTestBase {
     }
 }
 
-contract MyxVaultHarvestTest is MyxVaultTestBase {
+/// @dev v6: the DIVIDEND ASSET is the myx base-pool LP (mBase) itself, not USDT. processRevenue
+///      buys back the token, deposits it into myx (LP minted to the vault), then feeds the WHOLE
+///      LP balance into the token's native Flap Dividend contract (whose dividendToken == the LP,
+///      set at launch via computeDividendToken). Holders claim the LP via the dividend; the vault
+///      no longer claims/handles any USDT rebate.
+contract MyxVaultFeedDividendTest is MyxVaultTestBase {
+    event DividendDeferred(uint256 lpAmount);
+    event Harvested(uint256 rebateAmount, uint256 forwarded);
+
     function setUp() public override {
         super.setUp();
-        // v4: harvest reads pool.quoteToken as the reward token. Register the pool so
-        // pool.quoteToken == usdt == dividend.dividendToken() — the direct-distribution invariant.
+        // Register the tax-token pool with basePoolToken == the LP the mock pool mints, so
+        // _feedDividend discovers the LP. The dividendToken == that SAME LP (v6 invariant), so
+        // deposit() pulls exactly what the pool minted.
         PoolMetadata memory meta;
         meta.marketId = marketId;
         meta.poolId = MyxPoolId.derive(marketId, address(taxToken));
@@ -744,54 +784,139 @@ contract MyxVaultHarvestTest is MyxVaultTestBase {
         meta.quoteToken = address(usdt);
         meta.basePoolToken = address(lpToken);
         poolManager.setPool(meta.poolId, meta);
+        dividend.setDividendToken(address(lpToken)); // v6: dividend asset IS the LP
+        portal.setRate(1000, 1); // 1 BNB -> 1000 tax tokens
     }
 
-    function test_harvest_claimsAndDistributesDirectly() public {
-        basePool.setRebate(600 ether); // 600 USDT pending
-        vault.harvest();
-        // No swap: the claimed USDT goes straight into the dividend contract.
-        assertEq(dividend.totalDeposited(), 600 ether);
-        assertEq(vault.totalRewardsForwarded(), 600 ether);
-        assertEq(usdt.balanceOf(address(vault)), 0);
+    function _fund(uint256 amount) internal {
+        vm.deal(address(this), amount);
+        (bool ok,) = address(vault).call{value: amount}("");
+        assertTrue(ok);
     }
 
-    function test_harvest_noRebate_noop() public {
-        vault.harvest();
+    function test_processRevenue_feedsLpToDividend() public {
+        _fund(1 ether);
+        vm.prank(creator);
+        vault.processRevenue();
+        // 1 BNB -> 1000 tax tokens -> 1000 LP minted 1:1 -> the WHOLE LP fed into the dividend.
+        assertEq(vault.totalLpMinted(), 1000 ether);
+        assertEq(dividend.totalDeposited(), 1000 ether, "dividend must receive the minted LP");
+        assertEq(lpToken.balanceOf(address(vault)), 0, "vault LP flushed to the dividend");
+        assertEq(vault.totalRewardsForwarded(), 1000 ether);
+    }
+
+    function test_processRevenue_emitsHarvestedWithLpFed() public {
+        _fund(1 ether);
+        vm.expectEmit(true, true, true, true, address(vault));
+        emit Harvested(1000 ether, 1000 ether);
+        vm.prank(creator);
+        vault.processRevenue();
+    }
+
+    function test_feedDividend_defersWhenTotalSharesZero() public {
+        _fund(1 ether);
+        dividend.setDepositSucceeds(false); // simulate totalShares == 0: deposit() returns false
+        vm.expectEmit(true, true, true, true, address(vault));
+        emit DividendDeferred(1000 ether);
+        vm.prank(creator);
+        vault.processRevenue();
+        // LP retained in the vault, nothing deposited, no rewards counted
         assertEq(dividend.totalDeposited(), 0);
+        assertEq(lpToken.balanceOf(address(vault)), 1000 ether, "LP deferred in vault");
+        assertEq(vault.totalRewardsForwarded(), 0);
+
+        // recovery: a permissionless feedDividend() flushes the deferred LP once shares exist
+        dividend.setDepositSucceeds(true);
+        vm.prank(makeAddr("stranger"));
+        vault.feedDividend();
+        assertEq(dividend.totalDeposited(), 1000 ether);
+        assertEq(lpToken.balanceOf(address(vault)), 0, "deferred LP flushed on retry");
+        assertEq(vault.totalRewardsForwarded(), 1000 ether);
     }
 
-    function test_harvest_dividendDepositFalse_reverts() public {
-        // real Dividend contract returns false instead of reverting (e.g. totalShares == 0)
-        basePool.setRebate(600 ether);
+    function test_feedDividend_defersWhenNoDividendContract() public {
+        _fund(1 ether);
+        taxToken.setDividendContract(address(0)); // dividend not wired yet
+        vm.expectEmit(true, true, true, true, address(vault));
+        emit DividendDeferred(1000 ether);
+        vm.prank(creator);
+        vault.processRevenue();
+        assertEq(dividend.totalDeposited(), 0);
+        assertEq(lpToken.balanceOf(address(vault)), 1000 ether, "LP retained when dividend unwired");
+
+        // once wired, feedDividend() flushes the retained LP
+        taxToken.setDividendContract(address(dividend));
+        vault.feedDividend();
+        assertEq(dividend.totalDeposited(), 1000 ether);
+        assertEq(lpToken.balanceOf(address(vault)), 0);
+    }
+
+    function test_feedDividend_noLp_noop() public {
+        // no LP held: feedDividend is a no-op, no deposit, no revert
+        vault.feedDividend();
+        assertEq(dividend.totalDeposited(), 0);
+        assertEq(vault.totalRewardsForwarded(), 0);
+    }
+
+    function test_feedDividend_permissionless() public {
+        // accumulate LP via a successful processRevenue, then a stranger can re-run feedDividend
+        // as a no-op (whole balance already flushed) — proves the entrypoint is open to anyone.
+        _fund(1 ether);
+        vm.prank(creator);
+        vault.processRevenue();
+        assertEq(lpToken.balanceOf(address(vault)), 0);
+        vm.prank(makeAddr("stranger"));
+        vault.feedDividend(); // must not revert
+    }
+
+    function test_feedDividend_flushesDeferredPlusNew() public {
+        // First cycle defers (shares zero); a later processRevenue with shares available must feed
+        // the WHOLE balance: the deferred LP plus the freshly minted LP.
+        _fund(1 ether);
         dividend.setDepositSucceeds(false);
-        vm.expectRevert(MyxVault.DividendDepositFailed.selector);
-        vault.harvest();
-        assertEq(dividend.totalDeposited(), 0);
+        vm.prank(creator);
+        vault.processRevenue(); // 1000 LP deferred
+        assertEq(lpToken.balanceOf(address(vault)), 1000 ether);
+
+        dividend.setDepositSucceeds(true);
+        _fund(1 ether);
+        vm.prank(creator);
+        vault.processRevenue(); // mints +1000 LP, feeds the whole 2000
+        assertEq(dividend.totalDeposited(), 2000 ether, "whole balance (deferred + new) fed");
+        assertEq(lpToken.balanceOf(address(vault)), 0);
+        assertEq(vault.totalRewardsForwarded(), 2000 ether);
+    }
+}
+
+/// @dev v6 claim proxy (Lista pattern): holders claim their mBase LP either directly on the
+///      dividend contract or via the vault's claimReward() convenience, which proxies to
+///      withdrawDividendsFor(msg.sender). pendingReward proxies withdrawableDividends.
+contract MyxVaultClaimTest is MyxVaultTestBase {
+    function setUp() public override {
+        super.setUp();
+        dividend.setDividendToken(address(lpToken)); // v6: dividend asset IS the LP
     }
 
-    function test_harvest_dividendTokenMismatch_reverts() public {
-        // invariant break: the dividend contract's token no longer matches the pool quote.
-        basePool.setRebate(600 ether);
-        address other = makeAddr("other");
-        dividend.setDividendToken(other);
-        vm.expectRevert(
-            abi.encodeWithSelector(MyxVault.DividendTokenMismatch.selector, address(usdt), other)
-        );
-        vault.harvest();
-        assertEq(dividend.totalDeposited(), 0);
+    function test_claimReward_proxiesToDividend() public {
+        address alice = makeAddr("alice");
+        // dividend holds LP and owes alice 7 LP; claimReward pays it out via withdrawDividendsFor.
+        lpToken.mint(address(dividend), 7 ether);
+        dividend.setPending(alice, 7 ether);
+        vm.prank(alice);
+        vault.claimReward();
+        assertEq(lpToken.balanceOf(alice), 7 ether, "alice received her LP via the proxy");
+        assertEq(dividend.withdrawableDividends(alice), 0, "pending cleared");
     }
 
-    function test_harvest_zeroDividendContract_reverts() public {
-        basePool.setRebate(600 ether);
+    function test_pendingReward_proxies() public {
+        address alice = makeAddr("alice");
+        dividend.setPending(alice, 5 ether);
+        assertEq(vault.pendingReward(alice), 5 ether);
+    }
+
+    function test_pendingReward_zeroWhenNoDividendContract() public {
         taxToken.setDividendContract(address(0));
-        vm.expectRevert(MyxVault.ZeroDividendContract.selector);
-        vault.harvest();
-    }
-
-    function test_harvest_forwardedEqualsClaimed() public {
-        basePool.setRebate(123 ether);
-        vault.harvest();
-        assertEq(vault.totalRewardsForwarded(), dividend.totalDeposited());
+        assertEq(vault.pendingReward(makeAddr("nobody")), 0);
     }
 }
 
@@ -827,39 +952,6 @@ contract MyxVaultEmergencyTest is MyxVaultTestBase {
 }
 
 contract MyxVaultViewsTest is MyxVaultTestBase {
-    function setUp() public override {
-        super.setUp();
-        // Register the pool so userLpShare can discover basePoolToken == address(lpToken)
-        PoolMetadata memory meta;
-        meta.marketId = marketId;
-        meta.poolId = MyxPoolId.derive(marketId, address(taxToken));
-        meta.baseToken = address(taxToken);
-        meta.basePoolToken = address(lpToken);
-        poolManager.setPool(meta.poolId, meta);
-    }
-
-    function test_userLpShare_proRataByHolding() public {
-        lpToken.mint(address(vault), 100 ether);
-        address alice = makeAddr("alice");
-        address bob = makeAddr("bob");
-        // alice holds 30%, bob 70% of tax token supply
-        deal(address(taxToken), alice, 30 ether, true);
-        deal(address(taxToken), bob, 70 ether, true);
-        assertEq(vault.userLpShare(alice), 30 ether);
-        assertEq(vault.userLpShare(bob), 70 ether);
-    }
-
-    function test_userLpShare_zeroSupply() public {
-        lpToken.mint(address(vault), 100 ether);
-        assertEq(vault.userLpShare(makeAddr("nobody")), 0);
-    }
-
-    function test_pendingVaultRebates_passesThrough() public {
-        basePool.setRebate(42 ether);
-        (uint256 rebates,) = vault.pendingVaultRebates(1e18);
-        assertEq(rebates, 42 ether);
-    }
-
     function test_pendingReward_wrapsDividendPending() public {
         address alice = makeAddr("alice");
         dividend.setPending(alice, 5 ether);
@@ -873,6 +965,22 @@ contract MyxVaultViewsTest is MyxVaultTestBase {
     function test_vaultUISchema_describesMethods() public view {
         assertEq(vault.vaultUISchema().vaultType, "MyxVault");
         assertGt(vault.vaultUISchema().methods.length, 0);
+    }
+
+    function test_vaultUISchema_exposesClaimAndFeed() public view {
+        VaultMethodSchema[] memory methods = vault.vaultUISchema().methods;
+        bool hasClaim;
+        bool hasFeed;
+        bool hasPending;
+        for (uint256 i = 0; i < methods.length; i++) {
+            bytes32 n = keccak256(bytes(methods[i].name));
+            if (n == keccak256("claimReward")) hasClaim = true;
+            if (n == keccak256("feedDividend")) hasFeed = true;
+            if (n == keccak256("pendingReward")) hasPending = true;
+        }
+        assertTrue(hasClaim, "schema must expose claimReward");
+        assertTrue(hasFeed, "schema must expose feedDividend");
+        assertTrue(hasPending, "schema must expose pendingReward");
     }
 }
 

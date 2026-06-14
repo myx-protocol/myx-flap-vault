@@ -16,16 +16,23 @@ import {IFlapTriggerService, ITriggerReceiver} from "./flap/IFlapTriggerService.
 import {Strings} from "@openzeppelin/utils/Strings.sol";
 
 /// @title MyxVault
-/// @notice Flap vault that buys back the tax token with tax revenue via the Flap Portal,
-///         deposits it as MYX base-pool liquidity (LP held by the vault) and forwards
-///         harvested rebates directly to the token's Dividend contract.
+/// @notice Flap vault that buys back the tax token with tax revenue via the Flap Portal, deposits
+///         it as MYX base-pool liquidity, and feeds the resulting LP (mBase) into the token's
+///         native Flap Dividend contract — the LP ITSELF is the dividend asset.
+/// @dev v6 reward model (Lista pattern): the vault is an LP producer + dividend feeder + claim
+///      proxy. tax BNB -> Portal buyback (BASE) -> BasePool.deposit (LP minted to the vault) ->
+///      _feedDividend deposits the LP into the Dividend contract whose dividendToken == that same
+///      mBase LP (wired at launch via computeDividendToken). Holders claim the mBase LP via the
+///      dividend (fairly, via Flap setShare hooks), then claim their myx rebates themselves on myx.
+///      The vault NO LONGER claims or handles any USDT rebate.
 /// @dev Invariants:
 ///      - receive() performs accounting only (Flap Rule 005), never external calls.
-///      - harvest distributes the claimed rebate DIRECTLY: the myx pool's quote token equals
-///        the token's configured dividendToken, so the rebate IS the dividend token — no swap,
-///        no price feeds. The processRevenue trigger is mode-gated: AUTO (default) is
-///        permissionless so a keeper can run it automatically; MANUAL restricts it to
-///        OPERATOR_ROLE. setMode is creator/Guardian-only.
+///      - The dividend asset IS the LP: dividendToken == basePoolToken == mBase. _feedDividend
+///        deposits the whole held LP balance; if the dividend is unwired or deposit() returns false
+///        (totalShares == 0 early window), the LP is RETAINED (DividendDeferred) and retried on the
+///        next feedDividend()/cycle — no swap, no price feeds, no fallback path.
+///      - processRevenue is mode-gated: AUTO is permissionless so a keeper can run it automatically;
+///        TRIGGERED and MANUAL restrict it to OPERATOR_ROLE. setMode is creator/Guardian-only.
 ///      - Guardian roles cannot be revoked by any other account; only the guardian
 ///        itself may voluntarily renounce (Flap mandate).
 contract MyxVault is
@@ -56,9 +63,6 @@ contract MyxVault is
     error CannotRevokeGuardianRole();
     error ZeroMarketQuoteToken();
     error BelowMinimumProcessAmount(uint256 pending, uint256 minimum);
-    error DividendDepositFailed();
-    error DividendTokenMismatch(address poolQuote, address dividendToken);
-    error ZeroDividendContract();
     error ZeroQuote();
     error NotAuthorized();
     error NotModeAdmin();
@@ -71,7 +75,12 @@ contract MyxVault is
     event ModeChanged(Mode newMode);
     event RevenueProcessed(uint256 bnbAmount, uint256 baseAmount, uint256 lpMinted);
     event PoolDeployed(PoolId poolId);
-    event Harvested(uint256 rebateAmount, uint256 forwarded);
+    /// @notice Emitted when the vault's LP (mBase) balance is successfully fed into the token's
+    ///         native Dividend contract. `lpFed` == the LP amount distributed to holders.
+    event Harvested(uint256 lpFed, uint256 forwarded);
+    /// @notice Emitted when a feed is deferred (dividend not wired yet, or deposit() returned false
+    ///         because totalShares == 0 in the early window). The LP is retained for a later retry.
+    event DividendDeferred(uint256 lpAmount);
     event EmergencyWithdrawal(uint256 lpAmount, uint256 amountOut, address to);
     event EmergencySwept(uint256 bnbAmount, address to);
     event TriggerScheduled(uint256 requestId, uint64 executeAfter);
@@ -182,7 +191,8 @@ contract MyxVault is
     }
 
     /// @dev The buyback body, callable from the public entrypoint (after the mode/min gate) and
-    ///      from the triggered _runCycle (after its own min gate). Consumes all pendingBnb.
+    ///      from the triggered _runCycle (after its own min gate). Consumes all pendingBnb, mints LP
+    ///      to the vault, then feeds the whole LP balance into the dividend (v6: the LP is the reward).
     function _processInternal() internal {
         uint256 amount = pendingBnb;
         pendingBnb = 0;
@@ -197,6 +207,10 @@ contract MyxVault is
         totalLpMinted += lpOut;
 
         emit RevenueProcessed(amount, received, lpOut);
+
+        // v6: distribute the freshly minted LP (plus any deferred LP from a prior failed feed) to
+        // holders via the token's native Dividend contract. Deferral-safe: never reverts the buyback.
+        _feedDividend();
     }
 
     /// @notice Switch between TRIGGERED (automated via the Flap TriggerService, operator-only
@@ -248,30 +262,41 @@ contract MyxVault is
         }
     }
 
-    /// @notice Claims accumulated LP rebates and distributes them directly to holders via the
-    ///         token's native Dividend contract. Permissionless in ALL modes (post-v4 it has no
-    ///         swap/MEV surface — just claim + direct deposit).
-    function harvest() external nonReentrant {
-        _harvestInternal();
+    /// @notice Feeds the vault's whole held LP (mBase) balance into the token's native Dividend
+    ///         contract, distributing it to holders. Permissionless in ALL modes: anyone can retry a
+    ///         deferred feed (e.g. once the dividend gets wired or its totalShares becomes > 0)
+    ///         without performing a buyback.
+    function feedDividend() external nonReentrant {
+        _feedDividend();
     }
 
-    /// @dev The harvest body, callable from the public entrypoint and from the triggered cycle.
-    ///      Early-returns when there is nothing to claim (resilient backstop). It CAN still revert
-    ///      on a misconfigured vault (DividendTokenMismatch / ZeroDividendContract /
-    ///      DividendDepositFailed); in TRIGGERED mode such a revert bricks the whole _runCycle and
-    ///      the loop must be recovered via retryTrigger()/manual scheduleTrigger(). This coupling
-    ///      is accepted by design (a misconfigured vault is a dead vault) — no silent fallback is
-    ///      added (anti-fallback principle).
-    function _harvestInternal() internal {
-        basePool.claimUserRebate(poolId, address(this), address(this));
-        // The pool's quote token IS the reward token AND the token's configured dividendToken
-        // (enforced in _forwardToDividend), so the claimed rebate is distributed directly.
-        address rewardToken = poolManager.getPool(poolId).quoteToken;
-        uint256 amount = IERC20(rewardToken).balanceOf(address(this));
-        if (amount == 0) return;
-        _forwardToDividend(rewardToken, amount);
-        totalRewardsForwarded += amount;
-        emit Harvested(amount, amount);
+    /// @dev Feeds the WHOLE vault LP balance (freshly minted + any deferred from a prior failed feed)
+    ///      into the dividend contract. Deferral-safe — NEVER reverts the caller:
+    ///        - no LP held              -> no-op
+    ///        - dividend not wired      -> retain LP, emit DividendDeferred, retry next time
+    ///        - deposit() returns false -> retain LP, emit DividendDeferred, retry next time
+    ///          (real Dividend returns false when totalShares == 0 in the early window — Lista pattern)
+    ///      This replaces the v4 USDT rebate-claim+forward entirely: the LP IS the dividend asset, so
+    ///      there is nothing to claim or swap. The deferral is the documented degraded mode (no
+    ///      fallback path, anti-fallback principle): a failed feed simply retains the LP for retry.
+    function _feedDividend() internal {
+        address lp = poolManager.getPool(poolId).basePoolToken; // the mBase LP token
+        if (lp == address(0)) return;
+        uint256 bal = IERC20(lp).balanceOf(address(this));
+        if (bal == 0) return;
+        address div = IFlapTaxTokenV3(taxToken).dividendContract();
+        if (div == address(0)) {
+            emit DividendDeferred(bal); // not wired yet -> keep LP, retry next time
+            return;
+        }
+        IERC20(lp).forceApprove(div, bal);
+        // deposit() returns false when totalShares == 0 (early window) -> keep LP, retry (Lista pattern)
+        if (!IDividendDistributor(div).deposit(bal)) {
+            emit DividendDeferred(bal);
+            return;
+        }
+        totalRewardsForwarded += bal;
+        emit Harvested(bal, bal);
     }
 
     // ─────────────────────────────────────────────────────────────────────────────
@@ -295,22 +320,19 @@ contract MyxVault is
         _runCycle();
     }
 
-    /// @dev One automated cycle: always settle rewards (the timed harvest backstop), reserve the
-    ///      next cycle's fee from pendingBnb and reschedule, then buy back with whatever BNB remains
-    ///      if it clears the threshold. Re-validates the buyback threshold at callback time
-    ///      (delay-aware).
+    /// @dev One automated cycle: always flush any deferred LP into the dividend (the timed feed
+    ///      backstop), reserve the next cycle's fee from pendingBnb and reschedule, then buy back
+    ///      with whatever BNB remains if it clears the threshold (the buyback also feeds the LP it
+    ///      mints). Re-validates the buyback threshold at callback time (delay-aware).
     function _runCycle() internal {
-        // Order: settle rewards (timed harvest backstop) -> reschedule next cycle (so the timer
-        // survives a SKIPPED buyback when pendingBnb < minProcessAmount) -> conditional buyback.
-        // NOTE: all three run in one tx; a harvest revert (DividendDepositFailed when
-        // totalShares==0, DividendTokenMismatch, ZeroDividendContract) aborts the ENTIRE cycle
-        // including the reschedule, stalling the loop until retryTrigger()/manual recovery. This
-        // coupling is accepted (see _harvestInternal). In practice tax revenue implies prior
-        // trades, which create dividend holders, so totalShares>0 by the time BNB accumulates.
-        _harvestInternal(); // always settle rewards; never reverts on an empty rebate
+        // Order: flush deferred LP (timed feed backstop) -> reschedule next cycle (so the timer
+        // survives a SKIPPED buyback when pendingBnb < minProcessAmount) -> conditional buyback+feed.
+        // The feed NEVER reverts (deferral-safe), so unlike the v4 harvest it cannot brick the loop:
+        // a not-yet-wired dividend or a totalShares==0 window simply retains the LP for the next cycle.
+        _feedDividend(); // always settle deferred rewards; never reverts
 
         // Reschedule ONLY while still in TRIGGERED mode. If a setMode(AUTO|MANUAL) landed while this
-        // trigger was in-flight, the current cycle's harvest+buyback still complete (harmless), but
+        // trigger was in-flight, the current cycle's feed+buyback still complete (harmless), but
         // the loop is NOT re-armed — so switching away from TRIGGERED cleanly winds the automation
         // down after the in-flight trigger instead of self-perpetuating forever (and draining
         // pendingBnb on trigger fees against the operator's intent). pendingTriggerId was already
@@ -365,16 +387,13 @@ contract MyxVault is
         _ensurePoolExists();
     }
 
-    /// @dev Distributes the reward directly: the myx pool's quote token MUST equal the Flap
-    ///      token's configured dividendToken, so no swap is needed. deposit() pulls the
-    ///      dividendToken and returns false on failure (verified) — checked and reverted.
-    function _forwardToDividend(address rewardToken, uint256 amount) internal {
-        address dividendAddr = IFlapTaxTokenV3(taxToken).dividendContract();
-        if (dividendAddr == address(0)) revert ZeroDividendContract();
-        address divToken = IDividendDistributor(dividendAddr).dividendToken();
-        if (divToken != rewardToken) revert DividendTokenMismatch(rewardToken, divToken);
-        IERC20(rewardToken).forceApprove(dividendAddr, amount);
-        if (!IDividendDistributor(dividendAddr).deposit(amount)) revert DividendDepositFailed();
+    /// @notice Claim proxy (Lista pattern): claims the caller's mBase LP dividend ON THEIR BEHALF
+    ///         via the token's Dividend contract, paying the LP directly to msg.sender. A convenience
+    ///         only — holders may equivalently call withdrawDividends() on the Dividend contract
+    ///         themselves. Reverts if the dividend is not wired (the call on the zero address fails);
+    ///         pendingReward() guards that case for read-side UI.
+    function claimReward() external nonReentrant {
+        IDividendDistributor(IFlapTaxTokenV3(taxToken).dividendContract()).withdrawDividendsFor(msg.sender);
     }
 
     /// @notice Redeems vault-held LP back to quote token, sent to `to`. Disaster recovery only.
@@ -396,38 +415,24 @@ contract MyxVault is
         emit EmergencySwept(amount, to);
     }
 
-    /// @notice Notional LP share for a tax-token holder: vaultLp * holderBalance / totalSupply.
-    function userLpShare(address user) external view returns (uint256) {
-        uint256 supply = IERC20(taxToken).totalSupply();
-        if (supply == 0) return 0;
-        address lpToken = poolManager.getPool(poolId).basePoolToken;
-        if (lpToken == address(0)) return 0;
-        uint256 vaultLp = IERC20(lpToken).balanceOf(address(this));
-        return (vaultLp * IERC20(taxToken).balanceOf(user)) / supply;
-    }
-
-    /// @notice Vault-level claimable rebates from the MYX base pool.
-    /// @param price MYX oracle price input required by pendingUserRebates upstream.
-    function pendingVaultRebates(uint256 price) external view returns (uint256 rebates, uint256 genesisRebates) {
-        return basePool.pendingUserRebates(poolId, address(this), price);
-    }
-
-    /// @notice Per-holder claimable dividend, read from the token's Dividend contract.
-    /// @dev Verified signature (docs/phase0-findings.md): withdrawableDividends(address).
-    ///      Holders claim via withdrawDividends() on the Dividend contract directly.
+    /// @notice Per-holder claimable mBase LP dividend, read from the token's Dividend contract.
+    /// @dev v6: the unit is mBase LP, not USDT. Guards an unwired dividend (returns 0). Holders claim
+    ///      via claimReward() here or withdrawDividends() on the Dividend contract directly.
     function pendingReward(address user) external view returns (uint256) {
-        return IDividendDistributor(IFlapTaxTokenV3(taxToken).dividendContract()).withdrawableDividends(user);
+        address div = IFlapTaxTokenV3(taxToken).dividendContract();
+        if (div == address(0)) return 0;
+        return IDividendDistributor(div).withdrawableDividends(user);
     }
 
     function description() public view override returns (string memory) {
         return string.concat(
-            "MYX liquidity vault: buys back the token with tax revenue via the Flap Portal and provides it as MYX base-pool liquidity held by this vault (",
+            "MYX liquidity vault: buys back the token with tax revenue via the Flap Portal, provides it as MYX base-pool liquidity (",
             Strings.toString(totalLpMinted),
-            " LP minted cumulatively; some may have been emergency-withdrawn) and distributes harvested rebates directly to holders via the token's dividend contract (",
+            " LP minted cumulatively) and feeds the resulting myx LP (mBase) into the token's dividend contract as the reward asset (",
             Strings.toString(totalRewardsForwarded),
-            " distributed). Pending BNB: ",
+            " LP distributed). Holders claim the LP via claimReward() (or the dividend contract directly), then earn myx rebates by holding it. Pending BNB: ",
             Strings.toString(pendingBnb),
-            ". harvest() is permissionless. processRevenue() trigger mode: ",
+            ". feedDividend() is permissionless. processRevenue() trigger mode: ",
             _modeLabel(),
             "."
         );
@@ -443,36 +448,34 @@ contract MyxVault is
     function vaultUISchema() public pure override returns (VaultUISchema memory schema) {
         schema.vaultType = "MyxVault";
         schema.description =
-            "Tax revenue becomes MYX base-pool liquidity; LP rewards flow back to holders via the dividend contract.";
+            "Tax revenue becomes MYX base-pool liquidity (mBase LP); the LP itself is fed into the token's dividend contract as the reward. Holders claim the LP, then earn myx rebates by holding it.";
         schema.methods = new VaultMethodSchema[](5);
 
-        schema.methods[0].name = "userLpShare";
-        schema.methods[0].description = "Notional LP share for a holder, pro-rata to token balance.";
-        schema.methods[0].inputs = new FieldDescriptor[](1);
-        schema.methods[0].inputs[0] = FieldDescriptor("user", "address", "Holder address", 0);
+        schema.methods[0].name = "pendingBnb";
+        schema.methods[0].description = "Tax revenue awaiting processing.";
         schema.methods[0].outputs = new FieldDescriptor[](1);
-        schema.methods[0].outputs[0] = FieldDescriptor("share", "uint256", "Notional LP amount", 18);
+        schema.methods[0].outputs[0] = FieldDescriptor("amount", "uint256", "BNB amount", 18);
 
-        schema.methods[1].name = "pendingBnb";
-        schema.methods[1].description = "Tax revenue awaiting processing.";
-        schema.methods[1].outputs = new FieldDescriptor[](1);
-        schema.methods[1].outputs[0] = FieldDescriptor("amount", "uint256", "BNB amount", 18);
+        schema.methods[1].name = "processRevenue";
+        schema.methods[1].description =
+            "Convert pending BNB into MYX base-pool liquidity by buying back the token, then feed the resulting mBase LP into the dividend contract. Permissionless in AUTO mode; operator-only in TRIGGERED and MANUAL modes (TRIGGERED also runs automatically via the Flap TriggerService).";
+        schema.methods[1].isWriteMethod = true;
 
-        schema.methods[2].name = "processRevenue";
+        schema.methods[2].name = "feedDividend";
         schema.methods[2].description =
-            "Convert pending BNB into MYX base-pool liquidity by buying back the token. Permissionless in AUTO mode; operator-only in TRIGGERED and MANUAL modes (TRIGGERED also runs automatically via the Flap TriggerService).";
+            "Feed the vault's held mBase LP into the dividend contract, distributing it to holders. Permissionless; retries any deferred feed without a buyback.";
         schema.methods[2].isWriteMethod = true;
 
-        schema.methods[3].name = "harvest";
+        schema.methods[3].name = "claimReward";
         schema.methods[3].description =
-            "Claim LP rebates and distribute them directly to holders via the dividend contract. Anyone can call.";
+            "Claim your mBase LP dividend on your behalf via the token's dividend contract (or claim on the dividend contract directly).";
         schema.methods[3].isWriteMethod = true;
 
         schema.methods[4].name = "pendingReward";
-        schema.methods[4].description = "Claimable dividend for a holder (claim on the token's dividend contract).";
+        schema.methods[4].description = "Claimable mBase LP dividend for a holder.";
         schema.methods[4].inputs = new FieldDescriptor[](1);
         schema.methods[4].inputs[0] = FieldDescriptor("user", "address", "Holder address", 0);
         schema.methods[4].outputs = new FieldDescriptor[](1);
-        schema.methods[4].outputs[0] = FieldDescriptor("amount", "uint256", "Claimable dividend amount", 18);
+        schema.methods[4].outputs[0] = FieldDescriptor("amount", "uint256", "Claimable LP amount", 18);
     }
 }
