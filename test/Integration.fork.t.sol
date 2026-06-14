@@ -7,20 +7,19 @@ import {IERC20} from "@openzeppelin/token/ERC20/IERC20.sol";
 import {FlapBSCFixture} from "./FlapBSCFixture.sol";
 import {IVaultPortalTypes} from "../src/flap/IVaultPortal.sol";
 import {IPortalTradeV2} from "../src/flap/IPortal.sol";
-import {IFlapTriggerService} from "../src/flap/IFlapTriggerService.sol";
 
 import {MyxVault} from "../src/MyxVault.sol";
 import {MyxVaultFactory} from "../src/MyxVaultFactory.sol";
-import {MarketId, PoolId, MyxPoolId, MyxMarketId, PoolMetadata} from "../src/myx/IMyxPool.sol";
+import {MarketId, PoolId, MyxPoolId, MyxMarketId} from "../src/myx/IMyxPool.sol";
 
 import {MockERC20, MockBasePool, MockPoolManager, MockMyxPoolFactory} from "./mocks/Mocks.sol";
 
 /// @title MyxVaultForkTest
-/// @notice BSC mainnet fork end-to-end proof of the v3 buyback flow: launches a REAL Flap V3
+/// @notice BSC mainnet fork end-to-end proof of the v6 buyback flow: launches a REAL Flap V3
 ///         tax token through the REAL VaultPortal pointed at OUR MyxVaultFactory, trades to
 ///         generate tax, dispatches the real TaxProcessor under a 1M gas cap (the live proof
-///         of Flap Rule 005 compliance), then has the token CREATOR (OPERATOR_ROLE) call
-///         processRevenue(): the vault buys back THE LAUNCHED TOKEN via the REAL Portal
+///         of Flap Rule 005 compliance), then has ANY caller invoke the permissionless
+///         process(): the vault buys back THE LAUNCHED TOKEN via the REAL Portal
 ///         (swapExactInput on its bonding curve) and deposits the balance delta into the
 ///         mock MYX base pool, auto-deploying the token-keyed pool on first use.
 ///
@@ -67,13 +66,12 @@ contract MyxVaultForkTest is FlapBSCFixture {
         poolFactory = new MockMyxPoolFactory();
 
         // Deploy OUR factory: MYX side pointed at the mocks.
-        // TODO(v4): triggered-mode + dividend assertions — harvest now distributes the pool
-        // quote token directly (no swap/feeds), so the runtime fork flow needs a pool whose
-        // quoteToken == the token's dividendToken before harvest can be exercised here.
-        // TODO(v6): rework this fork flow for the v2.3 computeDividendToken path — the launched
-        // token will carry MAGIC_DIVIDEND_COMPUTED and the dividend token is the myx mBase LP
-        // resolved via factory.computeDividendToken(predicted, hint), not BSC_USDT. The
-        // poolFactory mock here is wired only so the constructor config is well-formed.
+        // TODO(v6): rework the dividend assertions for the v2.3 computeDividendToken path — the
+        // launched token will carry MAGIC_DIVIDEND_COMPUTED and the dividend token is the myx mBase
+        // LP resolved via factory.computeDividendToken(predicted, hint), not BSC_USDT. This fork
+        // test proves only the permissionless buyback + deposit leg; the dividend-feed leg against a
+        // real wired LP dividend stays unit-tested. The poolFactory mock here is wired only so the
+        // constructor config is well-formed.
         factory = new MyxVaultFactory(
             MyxVaultFactory.GlobalConfig({
                 poolManager: address(poolManager),
@@ -82,17 +80,12 @@ contract MyxVaultForkTest is FlapBSCFixture {
                 // 5%: the buyback minOut is bounded by a pre-trade same-block Portal quote,
                 // so the bound must absorb the curve impact of the vault's own buy.
                 maxSlippageBps: 500,
-                minProcessAmount: 0.001 ether, // small so a modest trade clears it
-                // Real Flap TriggerService on BSC mainnet (chainId 56); the fork test exercises
-                // the v3 processRevenue path, not the triggered loop, so this only needs to be
-                // a valid config value for the constructor.
-                triggerService: 0xcf4EE25035CF883895110f367F5BA8172416a7F9,
-                triggerInterval: 1 hours
+                minProcessAmount: 0.001 ether // small so a modest trade clears it
             })
         );
 
         // NOTE: no pool pre-registration. The pool key is derived from the LAUNCHED token
-        // address (unknown until the test runs), and processRevenue() must prove the
+        // address (unknown until the test runs), and process() must prove the
         // auto-deploy path via poolManager.deployPool().
 
         vm.label(WBNB, "WBNB");
@@ -158,27 +151,25 @@ contract MyxVaultForkTest is FlapBSCFixture {
 
     function test_endToEnd_launchTradeDispatchProcess() public {
         (address token, MyxVault vault) = _launchAndFundVault();
-        address creator = vault.creator();
 
         uint256 dispatchedBnb = vault.pendingBnb();
         console2.log("dispatched BNB to vault (wei):", dispatchedBnb);
 
         // Pre-trade quote for the exact amount the vault is about to swap, on the same curve
-        // state processRevenue() will see. This is the vault's own minOut basis; logged so a
+        // state process() will see. This is the vault's own minOut basis; logged so a
         // slippage failure can be diagnosed against the observed quote/received pair.
         uint256 quoted = portal.quoteExactInput(
             IPortalTradeV2.QuoteExactInputParams({inputToken: address(0), outputToken: token, inputAmount: dispatchedBnb})
         );
         console2.log("portal quoteExactInput (token wei):", quoted);
 
-        // 5. processRevenue() as the creator-operator: buy back the launched token via the
+        // 5. process() from a RANDOM caller (permissionless): buy back the launched token via the
         //    REAL Portal, then deposit the balance delta into the mock MYX base pool.
-        vm.startPrank(creator);
-        vault.processRevenue();
-        vm.stopPrank();
+        vm.prank(makeAddr("keeper"));
+        vault.process();
 
         // All pending BNB was consumed by the buyback.
-        assertEq(vault.pendingBnb(), 0, "pendingBnb must zero after processRevenue");
+        assertEq(vault.pendingBnb(), 0, "pendingBnb must zero after process");
 
         // Balance-delta accounting, end to end: the deposit amount recorded by the pool equals
         // the LP minted 1:1 to the vault AND the bought tokens still sitting in the vault
@@ -193,121 +184,11 @@ contract MyxVaultForkTest is FlapBSCFixture {
         );
 
         // Quote-vs-swap basis on the real Portal: the swap cleared the vault's minOut bound
-        // (quoted * (1 - 5%)), otherwise processRevenue would have reverted inside the Portal.
+        // (quoted * (1 - 5%)), otherwise process() would have reverted inside the Portal.
         assertGe(deposited, (quoted * 9_500) / 10_000, "received below the vault's own minOut bound");
 
         // Auto-deploy happened exactly once for the token-keyed pool (no pre-registration).
         assertEq(poolManager.deployPoolCallCount(), 1, "pool auto-deploy must run exactly once");
-    }
-
-    /// @notice TRIGGERED-mode end-to-end against the REAL BSC TriggerService.
-    ///
-    /// @dev This exercises the v4 automated path that the unit tests (mock TriggerService) cannot:
-    ///        • scheduleTrigger() calls the REAL TriggerService.requestTrigger{value: getFee()} —
-    ///          real fee, real request creation, real request id.
-    ///        • the callback is fired by impersonating the REAL TriggerService address, so trigger()
-    ///          runs exactly as the live backend would invoke it.
-    ///        • the buyback leg goes through the REAL Portal (swapExactInput on the bonding curve),
-    ///          giving the real-Portal validation of the Rule 008 2M gas budget that the mock-Portal
-    ///          unit test could not provide.
-    ///
-    ///      Mode is TRIGGERED by default, so processRevenue() is operator-only; the automated cycle
-    ///      runs only through the trigger() callback. The heavy myx deployPool is forced out-of-band
-    ///      via the permissionless ensurePoolDeployed() BEFORE scheduling (scheduleTrigger() gates on
-    ///      PoolNotDeployed), so the gas-capped callback never pays for pool deployment.
-    ///
-    ///      HARVEST IS A DELIBERATE NO-OP HERE. The cycle always runs _harvestInternal() first; to
-    ///      keep THIS test about the trigger + buyback + scheduling path (the dividend-distribution
-    ///      leg is covered by unit tests), the mock pool is arranged so harvest claims ZERO rebate
-    ///      and reads a real ERC20 (USDT) quote token with zero balance — _harvestInternal early-
-    ///      returns (amount == 0) before ever touching the launched token's dividend contract.
-    function test_endToEnd_triggeredMode() public {
-        // Sanity: the vault's configured triggerService must be the REAL BSC TriggerService so the
-        // fork executes its real code (getFee / requestTrigger / request bookkeeping).
-        (address token, MyxVault vault) = _launchAndFundVault();
-        assertEq(vault.triggerService(), FLAP_TRIGGER_SERVICE, "vault must point at the real TriggerService");
-
-        uint256 dispatchedBnb = vault.pendingBnb();
-        console2.log("dispatched BNB to vault (wei):", dispatchedBnb);
-
-        // 1. Deploy the myx pool OUT-OF-BAND via the permissionless ensurePoolDeployed(). This pays
-        //    the heavy deployPool gas outside the gas-capped trigger callback (mock poolManager).
-        vault.ensurePoolDeployed();
-        assertEq(poolManager.deployPoolCallCount(), 1, "ensurePoolDeployed must deploy the pool");
-
-        // Arrange harvest as a safe no-op: the mock deployPool leaves quoteToken == address(0), which
-        // would make _harvestInternal's IERC20(rewardToken).balanceOf revert. Re-register the pool
-        // metadata with quoteToken == real USDT (a live ERC20 returning 0 balance for the vault) and
-        // the basePoolToken the mock just set, and ensure claimUserRebate pays ZERO. Net: harvest
-        // early-returns (amount == 0) — see the test docstring.
-        PoolId poolId = vault.poolId();
-        PoolMetadata memory meta = poolManager.getPool(poolId);
-        meta.quoteToken = BSC_USDT;
-        poolManager.setPool(poolId, meta);
-        basePool.setRebate(0); // explicit: harvest claims nothing
-
-        // Pre-trade quote for the exact amount the cycle will swap (same-block curve state). This is
-        // the vault's own minOut basis; logged so a slippage failure is diagnosable.
-        uint256 quoted = portal.quoteExactInput(
-            IPortalTradeV2.QuoteExactInputParams({inputToken: address(0), outputToken: token, inputAmount: dispatchedBnb})
-        );
-        console2.log("portal quoteExactInput (token wei):", quoted);
-
-        // 2. Schedule the loop: scheduleTrigger() calls the REAL TriggerService.requestTrigger and
-        //    binds the returned request id. The real fee is paid from pendingBnb.
-        uint256 realFee = IFlapTriggerService(FLAP_TRIGGER_SERVICE).getFee();
-        console2.log("real TriggerService getFee (wei):", realFee);
-        assertGe(dispatchedBnb, realFee, "dispatched BNB must cover at least one trigger fee");
-
-        uint256 bnbAfterDispatch = vault.pendingBnb();
-        vault.scheduleTrigger();
-        uint256 firstTriggerId = vault.pendingTriggerId();
-        assertGt(firstTriggerId, 0, "scheduleTrigger must bind a real request id");
-        assertEq(vault.pendingBnb(), bnbAfterDispatch - realFee, "scheduleTrigger must pay the fee from pendingBnb");
-        console2.log("first real trigger id:", firstTriggerId);
-
-        uint256 pendingBeforeCycle = vault.pendingBnb();
-
-        // 3. Fire the callback by impersonating the REAL TriggerService (msg.sender gate). Measure the
-        //    gas of the real-Portal cycle and assert it fits the Rule 008 2M budget.
-        vm.prank(FLAP_TRIGGER_SERVICE);
-        uint256 gasBefore = gasleft();
-        vault.trigger(firstTriggerId);
-        uint256 gasUsed = gasBefore - gasleft();
-        console2.log("real-Portal trigger() gas used:", gasUsed);
-        assertLt(gasUsed, 2_000_000, "trigger() callback must fit the Rule 008 2M gas budget");
-
-        // 4a. Harvest was a no-op: the dividend contract was never touched (no forwarded rewards).
-        assertEq(vault.totalRewardsForwarded(), 0, "harvest must be a no-op in this test");
-
-        // 4b. Real Portal buyback happened inside the cycle: LP minted, vault holds the bought token
-        //     (balance delta), and the deposit ran exactly once.
-        uint256 deposited = basePool.lastDepositAmount();
-        console2.log("bought + deposited token amount (wei):", deposited);
-        assertGt(deposited, 0, "cycle buyback must deposit into the base pool");
-        assertEq(basePool.depositCallCount(), 1, "expected exactly one deposit");
-        assertEq(lpToken.balanceOf(address(vault)), deposited, "LP minted must equal deposit amount");
-        assertEq(
-            IERC20(token).balanceOf(address(vault)), deposited, "vault token balance delta must equal deposit amount"
-        );
-        assertGt(vault.totalLpMinted(), 0, "cycle must mint LP");
-        // Quote-vs-swap basis on the real Portal: the swap cleared the vault's minOut bound.
-        assertGe(deposited, (quoted * 9_500) / 10_000, "received below the vault's own minOut bound");
-
-        // 4c. pendingBnb reduced by the cycle's buyback (all remaining BNB was consumed).
-        assertLt(vault.pendingBnb(), pendingBeforeCycle, "cycle must reduce pendingBnb via buyback");
-        assertEq(vault.pendingBnb(), 0, "cycle consumed all remaining pendingBnb in the buyback");
-
-        // 4d. A NEW trigger was scheduled (the loop rescheduled itself with a fresh real request id).
-        uint256 nextTriggerId = vault.pendingTriggerId();
-        assertGt(nextTriggerId, 0, "cycle must reschedule a new trigger");
-        assertTrue(nextTriggerId != firstTriggerId, "rescheduled trigger id must differ from the consumed one");
-        console2.log("rescheduled real trigger id:", nextTriggerId);
-
-        // 4e. Replay protection: firing the consumed id again must revert (it was consumed in trigger()).
-        vm.prank(FLAP_TRIGGER_SERVICE);
-        vm.expectRevert(abi.encodeWithSelector(MyxVault.UnknownTrigger.selector, firstTriggerId));
-        vault.trigger(firstTriggerId);
     }
 
     /// @dev Accept BNB so the EOA-style test contract can fund itself / receive trade proceeds.

@@ -22,12 +22,7 @@ contract DeployMyxVaultFactory is Script {
                 // v2.3 computeDividendToken callback. Env-driven (MYX not yet live on BSC mainnet).
                 poolFactory: vm.envAddress("MYX_POOL_FACTORY"),
                 maxSlippageBps: 300,
-                minProcessAmount: 0.1 ether,
-                // Flap TriggerService on BSC mainnet (chainId 56). Override via env if needed.
-                triggerService: vm.envOr(
-                    "FLAP_TRIGGER_SERVICE", address(0xcf4EE25035CF883895110f367F5BA8172416a7F9)
-                ),
-                triggerInterval: uint64(vm.envOr("TRIGGER_INTERVAL", uint256(1 hours)))
+                minProcessAmount: 0.1 ether
             })
         );
         console2.log("MyxVaultFactory:", address(factory));

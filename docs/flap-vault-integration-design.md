@@ -1,349 +1,105 @@
-# MYX × Flap Vault 接入设计
+# MYX × Flap Vault 设计
 
-> 状态：**v5（质押分红：甩掉 Dividend 合约，stake-to-earn）**
-> 日期：2026-06-12
-> 方向：myx 作为 Flap 的 Vault 开发者，在 BSC 内同链对接
-> 机制：税收 → 经 Flap Portal 买回 tax token → 加 myx base 流动性 → LP 由 vault 持有 → LP 奖励(USDT)按**质押量**分给质押者，vault 内 `claim()` 领取
+> 在 BSC 上为 Flap 发射的 tax token 实现一对 `MyxVault + MyxVaultFactory`：把代币交易税转化为 myx 永续做市 LP，并以该 LP 作为分红代币按持币比例分给持有者。
 
----
+## 1. 目标与经济飞轮
 
-## 0′. v5 变更摘要（当前权威设计，取代 v4 的 harvest/Dividend 部分）
-
-**保留 v4**：三模式（TRIGGERED 默认 / AUTO / MANUAL）+ Trigger 自动化、Portal 买回 tax token 加 myx LP、vaultData 传 quoteToken → vault 推导 marketId（`keccak256(abi.encode(uint64(chainid), quoteToken))`）、emergency。
-
-**v5 改动 = 奖励分配从「灌 Flap 原生 Dividend」改成「vault 内质押分红」**：
-
-### 0′.1 为什么换：四不可兼得
-"不依赖 Dividend 合约 + 持币即分(被动) + 全链上 + 公平按比例"四者不可同时满足——公平的持币即分本质需要 transfer hook，而 vault 是 market（收 mktBps）不是 token 的 dividend 合约、拿不到转账回调，ERC20 也无历史余额。直接按 `balanceOf/totalSupply` 分会被「领取→转新地址→再领」刷穿（资损）。用户选择放弃「持币即分」→ **质押模型**（质押=自建 hook，全链上公平）。
-
-### 0′.2 质押分红会计（MasterChef / Synthetix accRewardPerShare 模式）
-- 状态：`totalStaked`、`stakedBalance[user]`（显式计数器，质押/赎回时更新）、`accRewardPerShare`（每质押 1 token 累积 USDT，放大 `1e18`）、`rewardDebt[user]`、`accruedReward[user]`（已结算待领）、`undistributed`（零质押窗口缓冲）。
-- harvest 拿到 `R` USDT：`toDistribute = R + undistributed`；若 `totalStaked>0` 则 `accRewardPerShare += toDistribute*1e18/totalStaked; undistributed=0`，否则 `undistributed = toDistribute`（不丢、不除零）。
-- 结算（stake/unstake/claim 入口先跑）：`accruedReward[user] += stakedBalance[user]*accRewardPerShare/1e18 - rewardDebt[user]`；改 stakedBalance 后 `rewardDebt[user] = stakedBalance[user]*accRewardPerShare/1e18`。
-- **关键不变量（用户强调）**：新质押者 `rewardDebt` 按当前 `accRewardPerShare` 设定 → 只分到质押之后新增的奖励，**领不走存量**。pending(刚质押)=0。
-
-### 0′.3 函数
-| 函数 | 行为 |
-|---|---|
-| `stake(uint256 amount)` | `taxToken.transferFrom` 进 vault，**按余额差值入账**（fee-on-transfer 防御；vault↔用户转账已验证免税）；结算 + 更新份额/debt |
-| `unstake(uint256 amount)` | 结算 + 转回 tax token（**无锁**，随时可取）；更新份额/debt |
-| `claim()` | 结算 + 把 `accruedReward[user]` 的 USDT 转给用户 |
-| `pendingReward(address) view` | 可领 USDT = accrued + 未结算部分 |
-| `stakedBalanceOf(address)` / `totalStaked()` view | 质押查询 |
-
-### 0′.4 奖励币 = USDT，彻底删依赖
-奖励直接是 myx 池 quote（USDT），**不 swap、不碰 WBNB、不碰 Chainlink feed、不碰 Flap 原生 Dividend**。删除：`IDividendDistributor`、`_forwardToDividend`、`IFlapTaxTokenV3.dividendContract`、`DividendTokenMismatch/ZeroDividendContract/DividendDepositFailed`、`userLpShare`。harvest 简化为：`claimUserRebate(USDT)` → `_distribute(usdtAmount)`（折入 accRewardPerShare）。
-
-### 0′.5 fee-on-transfer 安全
-质押的是 tax token。phase0-v3 已验证：Flap V3 token 只对「注册池对手方」抽税，vault 不是注册池 → stake/unstake(用户↔vault)免税。stake 仍用余额差值入账兜底。质押的 tax token 与 processRevenue 买回的 tax token 互不干扰（买回的当 tx 立即存进 myx LP；`totalStaked` 是独立计数器）。
-
-### 0′.6 工厂校验放宽
-v5 不依赖 token 的 dividend 配置 → 删除 `_validateBeforeLaunch` 里 `dividendToken==0`/`self-magic` 两条拦截，仅保留 `quoteToken==address(0)`（Flap 必须 BNB quote）。发币时 dividendToken/dividendBps 随便填（不用），不再有 swap-path / 校验拦截。
-
-### 0′.7 经济飞轮
-税 → 买回 token（价格支撑）+ myx LP → LP 赚 USDT → 质押者分 USDT；质押锁住流通量、进一步支撑价格。
-
----
-
-## 0. v4 变更摘要（相对 v3）
-
-v3 已落地（三模式之前为 AUTO/MANUAL 两模式、harvest 走 USDT→WBNB swap）。v4 在其上做三处改动：
-
-### 0.1 三模式：`enum Mode { TRIGGERED, AUTO, MANUAL }`，默认 **TRIGGERED**
-
-| 模式 | processRevenue / harvest 由谁驱动 | 用途 |
-|---|---|---|
-| **TRIGGERED（默认）** | Flap `TriggerService` 后端定时回调 vault 的 `trigger(requestId)`，vault 每轮自我重排下一次 | hands-off 全自动；后端非公开 mempool，MEV 面小于 AUTO |
-| **AUTO（无许可）** | 任意人/keeper 直接调 | TriggerService 停摆时的活性兜底 |
-| **MANUAL（需权限）** | 仅 `OPERATOR_ROLE` | tax token 无外部喂价、需人工控时机防夹时 |
-
-- `setMode` 由 creator / Guardian 切换。
-- **TriggerService**（BSC 主网 `0xcf4EE25035CF883895110f367F5BA8172416a7F9`）：`getFee()`≈0.0002 BNB/次，`getMaxCallbackGas()`=**2,000,000**（已链上读取确认，用户确认足够含 deployPool）。
-- `trigger(uint256)` 实现 `ITriggerReceiver`：`require(msg.sender == triggerService)` + nonReentrant + 校验 requestId 绑定 + 重排下一次（Rule 008 强制）。
-- **bootstrap**：`requestTrigger` 是外部调用，**禁止放进 `receive()`**（Rule 005）；TRIGGERED 模式由一个公开 `scheduleTrigger()`（无 pending 时任意人可触发首次排程）启动，之后回调内链式自排。
-
-### 0.2 harvest 直分 dividendToken（砍掉整条 swap + feed）
-
-**核心不变量**：myx 池的 **quote token == 该 Flap token 的 dividendToken**（USDT 或 USDC）。
-- **v4-5：launcher 不再传不透明 marketId，而是直接传 market 的 quoteToken（= dividendToken，USDT/USDC 地址）**。vault 链上自推 `marketId = keccak256(abi.encode(uint64(block.chainid), quoteToken))`（已 fuzz 256 + concrete 验证等价于 myx `MarketIdLib.toId`），再 `poolId = keccak256(abi.encode(marketId, taxToken))`。两个硬编码 marketId 常量删除，dividendToken == pool-quote == reward 不变量天然成立。
-- 发币时 `dividendToken` 选 USDT → vault 推出 quote=USDT 的 myx market；选 USDC → 同理。
-- LP rebate 奖励币 = 池 quote = dividendToken。
-- harvest：`claimUserRebate`（拿到 dividendToken）→ `require(getPool(poolId).quoteToken == IDividend(div).dividendToken())` → `forceApprove(div, amt)` → `IDividend(div).deposit(amt)`（已验证单参 `deposit(uint256)→bool` 拉取 dividendToken）→ 持币者在原生 Dividend 领取。
-- **整条消除**：USDT→WBNB Pancake swap、`swapRouter`、`wbnb`、`bnbUsdFeed`、`usdtUsdFeed`、`maxPriceStaleness`、`_readPrice`、`SWAP_DEADLINE`。vault 依赖收缩为 Portal + myx + Dividend + TriggerService。
-- **misconfig 失败路径**：v4-5 后 launcher 传的就是 quoteToken 本身，vault 由它推 marketId，因此 "marketId 的 quote ≠ dividendToken" 这种错配已不可能由参数引入；剩余风险仅是 launcher 传的 quoteToken ≠ 实际 dividendToken（此时 harvest revert，dividendToken 滞留 vault，可 `emergencyWithdraw` 救援）。`quoteToken == address(0)` 由 vault initializer 直接 revert `ZeroMarketQuoteToken`。factory `_validateBeforeLaunch` 仍只做轻量预检（拒绝 `dividendToken == address(0)` 原生 BNB 与 self-magic `0xfEED…fEED`，无 USDT/USDC 白名单——避免重引注册表）；exact dividendToken↔marketId 一致性由 vault 运行时 `pool.quoteToken == dividend.dividendToken()` 强制（不符即 revert，资金安全）。
-
-### 0.3 deployPool 时机 + 触发费来源
-
-- **deployPool 懒执行**：首次 processRevenue 时建池（2M gas 足够，用户确认）。**不能在 `newVault` 时建**——彼时 taxToken 尚未部署（CREATE2 预测地址），myx `deployPool` 读 `decimals()` 会 revert。
-- 安全阀：额外暴露无许可 `ensurePoolDeployed()`，可把建池的重 gas 从首次 triggered processRevenue 里拆出来单独做。
-- **触发费从 pendingBnb 出**：要求 `pendingBnb >= minProcessAmount`（阈值 > 单次 getFee + 有意义的买回额）；排程下一次 trigger 的 `getFee()` 从 vault 的 BNB 余额扣，相应递减 pendingBnb 记账。pendingBnb 枯竭 → trigger 停排 → 退化到 AUTO 无许可兜底。
-
-### 0.4 待证（Phase-0-v4，网络/myx-BSC 可达后补）
-
-- ERC20(USDT) dividend 实例：`deposit(uint256)` 在 `dividendBps > 0` 时是否仍 permissionless（phase0 在 WBNB 实例已证无 caller gate，但未测 dividendBps>0 + 非 WBNB 组合）。
-- USDT dividend 实例 claim 是否直转 USDT（推断：unwrap 仅在 `dividendToken==weth` 时；USDT 直转）。
-- 真实 deployPool gas 是否 ≤ 2M（myx 上 BSC 后 fork 实测）。
-- myx 是否有 quote=USDC / quote=USDT 的 market（部署前置）。
-
----
-
-## 1. 背景与目标
-
-Flap 是 BSC 上的 tax-token（fee-on-transfer）发射平台。第三方按规范实现 `Vault + VaultFactory`，承接代币交易抽到的税（native BNB），自定义其去向。
-
-**本方案目标（v3）**：实现 `MyxVault + MyxVaultFactory`，让 Flap 上发行的 tax token 把抽到的税（`mktBps` 份额，native BNB）：
-
-1. 经 **Flap Portal 的 `IPortalTradeV2.swapExactInput`** 买回**该 tax token 本身**（BUY：`inputToken=address(0)` 带 value，`outputToken=taxToken`；bonding curve 上或已上 DEX 均支持，Portal 内部路由）；
-2. 以 **tax token 作为 base 资产**，若该 token 的 myx base pool 不存在则**先 `deployPool` 创建**（`poolId = keccak256(abi.encode(marketId, taxToken))`），再 `BasePool.deposit` 添加流动性；
-3. 得到的 **LP 由 vault 持有**（不分发到用户钱包）；
-4. vault 持有的 LP 持续累积奖励（USDT rebate）；harvest：claim → Pancake swap 成 WBNB（Chainlink feed 防护）→ 灌入该 token 的**原生 Dividend 合约**，由持币者**按持币比例**领取；
-5. 合约提供查询：用户名义 LP 份额、用户可领奖励；前端展示 + 领取按钮指向原生 Dividend 的 `withdrawDividends()`。
-
-**v3 相对 v2 的关键变化**：
-- base 资产从「发币时指定的白名单资产（WBNB/BTCB…）」改为 **tax token 本身**——买回压力 + 为该 token 在 myx 开做市池，经济语义更聚焦；
-- 买入腿从 Pancake + Chainlink 改为 **Flap Portal**（tax token 无 Chainlink feed，且 Portal 是 bonding curve 阶段唯一交易场所）；
-- **`processRevenue` 从任意人可调改为 permissioned（OPERATOR_ROLE：creator + Guardian + 可授权 operator）**——tax token 无可信外部价源，`quoteExactInput` 是同块 spot 报价防不了三明治；Flap 官方对 buyback 类操作的建议即 permissioned。minOut 仍由合约内部用同块 quote × (1-slippage) 计算作为兜底；
-- harvest 腿保持 v2 不变（USDT→WBNB 有 Chainlink feed 防护，仍任意人可调）；
-- 工厂的 base 白名单 / feed 注册表 / 18-decimals 校验整体移除（base 恒为 taxToken）。
-
-**链与资产**：全流程 BSC 内闭环，无跨链桥。
-
----
-
-## 2. 四条定调结论
-
-1. **myx 侧零核心代码改动**。建池 `deployPool` permissionless、`BasePool.deposit/claimUserRebate` 对合约开放、LP 是标准 ERC20、`pendingUserRebates` 是 public view。主体工作 100% 在 Flap vault 合约。
-
-2. **`receive()` 是铁律红线**。Flap Spec Rule 005（Critical）禁止 `receive()` 调用树内任何外部调用 / swap / deposit / 无界循环，gas ≤ 1M。违反 → 该 token 税收永久损坏 + BNB 锁死。`receive()` 只记账，重活全异步。
-
-3. **"自动建池"半可行，受 market 前置约束**。`PoolManager.deployPool(marketId, baseToken)` 无权限、任意合约可调，且建出的 **Cook 状态即允许 deposit**。但**前提是对应 `market` 已由 `RISK_ADMIN` 创建**（market 级是治理动作）。即：vault 能补 pool，但补不了 market。
-
-4. **"按持币比例分奖励"复用 Flap 原生 Dividend，但有一个可行性前提待证**。按持币比例链上可得，无需链下系统；vault 把 LP 奖励灌进 token 原生 Dividend 合约即可让持币者按比例领。**但原生 Dividend 合约"是否支持外部主动注入"及其入金 ABI 未公开，必须 BscScan 反查**（Phase 0 头号阻塞项，见 §11）。
-
----
-
-## 3. 关键事实（已源码级核实）
-
-### 3.1 Flap 侧
-
-| 事实 | 证据 |
-|---|---|
-| 仅支持 BSC（56 / 测试 97） | `VaultBase` error 定义 |
-| Vault 只收 native BNB（quote 强制 `address(0)`） | factory 校验 |
-| 税聚合：`dispatch()` 任意人可调，`call{gas:1_000_000}` 推**聚合后 BNB**给 `receive()`，**无 per-buyer 归属** | `FlapBSCFixture.sol:408-411` |
-| `receive()` 禁外部调用（Rule 005 Critical） | `spec-checker/rules/005` |
-| Dividend 地址：`IFlapTaxTokenV3(taxToken).dividendContract()`，收 WBNB（ERC20），原生按持币比例分 | `IFlapTaxTokenV3.sol:51-52`、`ITaxProcessor.sol` |
-| Factory = BeaconProxy + UpgradeableBeacon；`newVault` `require(msg.sender==_getVaultPortal())` + `new BeaconProxy`；升级权限独占 Guardian | `FreeCoinBeacon.sol:183-205` |
-| 构造期 taxToken 不存在（CREATE2），不能 init 期回调 | `IVaultFactory.sol:21-27` |
-| Guardian 对每个 permissioned 函数不可撤销权限 | 规范页 |
-
-**BSC 主网地址**：VaultPortal `0x90497450f2a706f1951b5bdda52B4E5d16f34C06` ｜ Guardian `0x9e27098dcD8844bcc6287a557E0b4D09C86B8a4b` ｜ WBNB `0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c`。
-
-### 3.2 myx 侧
-
-| 事实 | 证据 |
-|---|---|
-| `deployPool(DeployPoolParams{marketId, baseToken})` **无权限** | `PoolManager.sol:152` |
-| 建池前置：`market` 由 `RISK_ADMIN` 创建（`createMarket onlyRiskAdmin`） | `MarketManager.sol:116` |
-| Cook 状态即可 deposit（`_validateDeposit` 仅挡 PreBench/Bench） | `BasePool.sol:478-481` |
-| `BasePool.deposit(poolId,amountIn,minOut,user,recipient)` 对合约开放（`user==msg.sender`）；LP mint 给 `recipient` | `BasePool.sol:156-197`，校验 `:163` |
-| base LP 标准 ERC20 | `BasePoolToken → TokenBase → ERC20Upgradeable` |
-| `pendingUserRebates(poolId,user,price)` public view，返回 `(rebates, genesisRebates)` | `BasePool.sol:135-142` |
-| `claimUserRebate(poolId,user,recipient)` 用户自己可调 | `BasePool.sol:275-278` |
-| 交易利润经 rebate 机制单独可领（非纯净值复投），`withdraw` 时一并结算 | `BasePool.sol:216-272, 462-472` |
-| base token 由 deployer 指定（≠quote，decimals<19）；BSC quote 典型 USDT | `PoolManager.sol:152-163`、`markets/usd` |
-| myx 当前仅 Arbitrum Sepolia，BSC 未部署 | `hardhat.config.ts` |
-
----
-
-## 4. 目标架构（BSC 内闭环）
+Flap 是 BSC 上的 tax-token（fee-on-transfer）发射平台；第三方按 Flap Vault 规范实现金库，承接交易税（native BNB，`mktBps` 份额）并自定义其去向。
 
 ```
-Flap tax token ──tax(mktBps, 聚合)──▶ dispatch{gas:1M} ──BNB──▶ MyxVault.receive()
-                                                                  │ 仅记账 pendingBnb += msg.value
-                                                                  ▼
-        [OPERATOR_ROLE] processRevenue():
-            BNB ──Portal.swapExactInput{value}(BUY: 0→taxToken, minOut=同块quote×(1-slip))──▶ taxToken
-            ──▶ if !poolExists: PoolManager.deployPool(marketId, taxToken)    // market 须已存在
-            ──▶ BasePool.deposit(poolId, received, minOut, self, self)        // LP 留 vault
-                   ⋯ vault 持有 LP, 累积 rebate ⋯
-        [任意人] harvest():
-            BasePool.claimUserRebate(poolId, self, self)  // 领 USDT
-            ──Pancake swap USDT→WBNB(Chainlink feed minOut)──▶ DividendContract.deposit(WBNB)
-                                                          ▼
-                                          持币者按 balanceOf/totalSupply 比例领取
-        [Guardian/creator] emergencyWithdraw(): 赎回 vault 持有的 LP / 救援
-
-查询(view, 给前端):
-    userLpShare(user)   = lpHeld × flap.balanceOf(user) / flap.totalSupply()      // 名义份额
-    pendingReward(user) = DividendContract.withdrawableDividends(user) 的包装    // 可领奖励
-领取(前端): 用户钱包直接调 DividendContract.withdrawDividends()（Flap 原生）
+MEME(tax token) 交易 → 税(BNB) ──dispatch──▶ MyxVault.receive()  (只记账)
+        [任意人] process(): BNB ──Flap Portal 买回──▶ MEME
+                          ──▶ 存入 myx (MEME/USDT) base 池 ──▶ 得 LP 代币 mBase
+                          ──▶ 把 mBase 存进该 MEME 的 Flap 原生 Dividend 合约(dividendToken = mBase)
+        持有 MEME 的用户 ──按份额累积 mBase──▶ claimReward() 领走 mBase LP
+        领到 mBase 的用户 ──持有 LP──▶ 自己去 myx 领 USDT rebate / 退本
 ```
 
----
+**飞轮**：税 → 买回 MEME（价格支撑）+ 注入 myx 做市深度 → LP 持续产 USDT rebate → 分给持币者。分红资产是 **LP 本身**，持币者拿到 LP 后既享 LP 净值也可自取 myx 奖励。
 
-## 5. MyxVault 合约设计（主体产出）
+## 2. 分红公平性：复用 Flap 原生 Dividend 的 setShare hook（不可刷）
 
-> 合约全英文标识符。以下为接口级设计，含不变量与失败路径。
+公平的「持币即分」需要在每次代币转账时更新每人份额。我们的 vault 是 market（收 mktBps），不是 token 的 dividend 合约，**拿不到转账回调**——所以 vault 不自建任何 per-user 会计，而是把 LP 喂进 token 的 **Flap 原生 Dividend 合约**（MasterChef 累加器 `magnifiedDividendPerShare/rewardDebt`）。该合约靠 token 的 `_afterTokenTransfer → setShare(holder, balanceOf)`（`onlyTaxToken` 门）维护份额：
 
-### 5.1 存储与初始化
+- `pendingReward(user)` → `dividend.withdrawableDividends(user)`
+- `claimReward()` → `dividend.withdrawDividendsFor(msg.sender)`
+- **不可刷**：新接收 token 的钱包 `rewardDebt` 以当前 index 基准，对此前已注入的分红零份额；领→转→再领无法刷出第二份。
 
-- `initialize(InitParams)`，由 factory 经 BeaconProxy 调用。
-- `vaultData` 解码：`(address marketQuoteToken)`（v4-5，原为 `(MarketId marketId)`）——传 market 的 quoteToken（= dividendToken，USDT/USDC）；base 资产恒为 taxToken 本身，无需用户指定；其余基础设施地址由 factory 的 `GlobalConfig` 注入。
-- **不变量**：init 期不回调 taxToken（CREATE2 时未部署），仅存地址。`marketId = keccak256(abi.encode(uint64(block.chainid), marketQuoteToken))`、`poolId = keccak256(abi.encode(marketId, taxToken))` init 期即可推导（纯哈希，无 myx 查询）。`marketQuoteToken == address(0)` revert `ZeroMarketQuoteToken`。
-- 状态：`pendingBnb`、`poolId`、`totalLpMinted`、`totalRewardsForwarded`。
+（机制对照 Lista DAO 的 slisBNB 金库 `0xabd6156A587484EC487e7CcA236fCEE7E6e126a6`：金库只当「收益资产生产者 + dividend 喂料器 + claim 代理」，公平性 100% 来自 Flap Dividend 合约。我们把 slisBNB 换成 myx LP。）
 
-### 5.2 函数
+## 3. 死循环与 Flap Spec v2.3 `computeDividendToken`
 
-| 函数 | 触发者 | 行为 | 不变量 / 失败路径 |
-|---|---|---|---|
-| `receive()` | dispatch | **仅** `pendingBnb += msg.value` | 绝不外部调用（Rule 005）；不 revert |
-| `processRevenue()` | **mode 决定**：AUTO=任意人；MANUAL=OPERATOR_ROLE | `require(pendingBnb >= minProcessAmount)`；BNB→`Portal.swapExactInput{value}`（BUY 0→taxToken，**minOut = 同块 `quoteExactInput` × (1-maxSlippageBps)**）；若池不存在则 `deployPool(marketId, taxToken)`；`BasePool.deposit(...,self,self)` | reentrancy guard；AUTO 下重开同块 quote 三明治面（靠滑点上限+小额阈值缓解）；MANUAL 下 operator 控时机/私有 mempool 防夹；market 不存在 / swap / deposit 失败 → BNB 安全滞留 pendingBnb |
-| `setMode(Mode)` | creator 或 Guardian | 切 AUTO（默认，无许可）/ MANUAL（仅 operator）；emit ModeChanged | 仅 `msg.sender == creator \|\| _getGuardian()`，不随 OPERATOR_ROLE 授权扩散；Guardian 兜底可翻回 AUTO 防 creator grief |
-| `harvest()` | 任意人 | `claimUserRebate(poolId,self,self)`（USDT）→ Pancake swap USDT→WBNB（Chainlink feed minOut）→ `DividendContract.deposit(amt)` 校验返回值 | minOut 内部算；Dividend 注入失败 → revert，资金滞留 vault 重试 |
-| `emergencyWithdraw(uint256 lpAmount, uint256 minAmountOut, address to)` | EMERGENCY_ROLE（Guardian/creator） | 赎回 vault 持有的 LP，救援 | 应对 myx 异常/流动性枯竭 |
-| `emergencySweepBnb(address to)` | EMERGENCY_ROLE | 清扫卡死 BNB | 灾难恢复 |
-| `userLpShare(address user)` | view | `lpToken.balanceOf(self) * flap.balanceOf(user) / flap.totalSupply()` | 名义份额，前端展示用 |
-| `pendingReward(address user)` | view | 包装 `DividendContract.withdrawableDividends(user)` | 给前端显示可领额 |
-| `description()` / `vaultUISchema()` | view/pure | 动态披露 + UI schema | V2 强制 |
+**死循环**：dividendToken 必须在 Portal 创建 MEME 时写进合约；但我们要用 myx LP(mBase) 当 dividendToken，而 mBase 地址依赖 MEME 地址，MEME 此刻还没部署（CREATE2 预测地址）。
 
-### 5.3 买回腿（BNB → tax token，经 Flap Portal）
+**Flap Spec v2.3（官方 issue，本设计依赖、尚未上线）**：新增魔法地址 `MAGIC_DIVIDEND_COMPUTED`。发币时 dividendToken 填它；VaultPortal 预测出 MEME 地址后回调我们 factory：
+```solidity
+function computeDividendToken(address predictedToken, bytes calldata hint) external view returns (address);
+```
+我们在回调里从 `predictedToken` 算出 mBase 地址返回 → 它成为该 MEME 的 dividendToken。纯链上、无需预输入。
 
-- 接口：`IPortalTradeV2.swapExactInput(ExactInputParams{inputToken: address(0), outputToken: taxToken, inputAmount, minOutputAmount, permitData: ""}) payable`，Portal 地址来自基类 `_getPortal()`（chainid 内置）。
-- bonding curve 阶段和已上 DEX 阶段 Portal 均支持（接口 NatSpec 明示）。
-- **minOut**：`quoteExactInput`（同块报价，注意非 view）× `(10000 - maxSlippageBps) / 10000`。同块报价**防不了三明治**，只限定单次最大偏移——真正的防夹靠 OPERATOR_ROLE 控时机/私有 mempool。
-- **fee-on-transfer 注意**（Phase 0-v3 核实项）：BUY 的 outputAmount 与实际到账、以及 vault→BasePool 的 transferFrom 是否被抽税，决定 deposit 记账用名义值还是余额差值。若 transfer 腿被抽税，必须用余额差值入账，且 myx 池实收短缺问题需显式处理。
+## 4. 三处合约
 
-### 5.4 自动建池（"池子没创建先部署"）
+### 4.1 myx PoolFactory（CREATE2 + 权威预测 view）
+为让 mBase 地址在 MEME 部署前可被精确预测：
+- `_deployPoolToken` 的 `new BeaconProxy(beacon, initData)` 改为 **CREATE2**：`new BeaconProxy{salt: keccak256(abi.encode(poolId, underlyingToken))}(beacon, initData)`（underlyingToken 区分 base/quote）。
+- 新增权威预测 view（地址数学只此一份，避免跨仓库漂移）：
+  ```solidity
+  function predictBasePoolToken(MarketId marketId, address baseToken, string calldata baseSymbol)
+      external view returns (address);
+  ```
+  内部复刻部署用的 `initData`（含 `name="MYX Finance "+baseSym+"-"+quoteSym+" BasePool Token"`，`symbol="m"+baseSym`，quoteSym 链上现读 market.quoteToken.symbol()）+ salt，`Create2.computeAddress(salt, keccak256(initcode), POOL_FACTORY)`。
+- 部署路径与预测路径共用同一组 `name/symbol/initData/salt` 助手 → **不可能漂移**。
+- 测试 `PoolTokenPredict.t.sol` 焊死 `predictBasePoolToken(...) == 实际 deployPool 出来的 basePoolToken`（已字节级验证通过）。
+- 副作用：CREATE2 改变所有 pool token 地址；`PoolFactory.initialize` 缓存依赖加了 `MARKET_MANAGER`（已部署工厂需重新注册）。
 
-- `poolId = keccak256(abi.encode(marketId, taxToken))`；检查 `getPool(poolId).basePoolToken == 0`；未初始化则 `deployPool(marketId, taxToken)`（permissionless）。
-- **v3 下自动建池成为主路径**：每个新发的 tax token 在首次 processRevenue 时为自己开 myx 池。
-- **硬约束**：`marketId` 对应 market 必须已由 `RISK_ADMIN` 创建——vault 无权建 market。若 market 不存在，`processRevenue` revert，BNB 滞留待重试（前置依赖，见 §7）。myx 建池约束：baseToken ≠ quoteToken、decimals < 19（Flap token 18 dec ✓）。
-- Cook 态即可 deposit；Cook→Primed/Trench 激活仍需 LISTING_ADMIN（不影响 deposit，但影响池子可交易性 / LP 价值，见 §9 风险）。
+> myx 改动在 `feat/pool-token-create2` 分支，待 myx 团队 review。
 
-### 5.5 收益分配（"按持币比例" → 复用原生 Dividend）
+### 4.2 MyxVaultFactory（非升级，BeaconProxy 工厂）
+- `computeDividendToken(predictedToken, hint)`：从 `hint` 解出 `(quoteToken, symbol)`，`marketId = keccak256(abi.encode(uint64(chainid), quoteToken))`（已验证等价 myx `MarketIdLib`），`return IMyxPoolFactory(poolFactory).predictBasePoolToken(marketId, predictedToken, symbol)`。**地址数学全委托 myx，本地不复刻**。
+- `factorySpecVersion() == "v2.3"`；`isQuoteTokenSupported` 仅 BNB；`_validateBeforeLaunch` 仅校验 `quoteToken==address(0)`（dividendToken 是 v2.3 sentinel，不在此校验）。
+- `newVault`：`require(msg.sender==_getVaultPortal())`，vaultData = `abi.encode(address quoteToken)`，`new BeaconProxy(beacon, initData)`；升级权限独占 Guardian。
+- GlobalConfig：`poolManager / basePool / poolFactory / maxSlippageBps / minProcessAmount`。
 
-- vault `claimUserRebate` 领到 USDT → swap BNB → wrap WBNB → 注入 token 原生 Dividend 合约。
-- 持币者按 `balanceOf/totalSupply` 经**原生 Dividend** 领取，vault **不自建分配/快照**。
-- **默认策略**：仅 claim rebate 回流；交易利润的净值增长部分留在 vault 持有的 LP 内（本金性质，Guardian 应急可赎回）。是否额外提净值增长见 §10 待定项。
-
-### 5.6 权限模型
-
-- 角色：`OPERATOR_ROLE`（processRevenue 触发；creator + Guardian + Guardian/creator 可再授权）、`EMERGENCY_ROLE`（emergencyWithdraw/sweep；creator + Guardian）、`DEFAULT_ADMIN_ROLE`（Guardian）。
-- 每个 permissioned 函数**必须同时授予 Guardian**（`0x9e27...8a4b`，Flap 强制）；override `revokeRole` 对 Guardian 抛 `CannotRevokeGuardianRole()`。
-- `harvest` 无许可（任意人，feed 防护健全）。
-- 收敛 Guardian 影响面：不暴露任意提款，能力上界 = 暴露的 permissioned 集合。
-
----
-
-## 6. MyxVaultFactory 合约设计
-
-- **BeaconProxy + UpgradeableBeacon**，构造期建 impl+beacon。
-- `newVault(taxToken, quoteToken, creator, vaultData)`：`require(msg.sender==_getVaultPortal())` → `abi.decode(vaultData, (address marketQuoteToken))`（v4-5，原为 `(MarketId)`）→ `new BeaconProxy(beacon, abi.encodeCall(MyxVault.initialize, InitParams))`。`VaultCreated` 末参由 `marketId` 改为 `marketQuoteToken`；两个硬编码 marketId 常量删除。用 `new` 非 CREATE2。
-- **v3 移除**：base 白名单 / feed 注册表 / 18-decimals 校验 / `ZeroFeedForNonWbnbToken`（base 恒为 taxToken）。
-- `GlobalConfig` 保留：poolManager / basePool / swapRouter(Pancake, harvest 用) / wbnb / quoteToken(USDT) / bnbUsdFeed / usdtUsdFeed（harvest 的 feed 防护）/ maxSlippageBps / minProcessAmount / maxPriceStaleness。
-- `_validateBeforeLaunch`：强制 `quoteToken==address(0)`。
-- `isQuoteTokenSupported` 仅 BNB；`vaultDataSchema()`（单字段 `quoteToken`，address 类型，v4-5 原为 bytes32 `marketId`）；`factorySpecVersion()=="v2.2"`。
-- 升级权限独占 Guardian（`require(msg.sender==_getGuardian())`）。
-
----
-
-## 7. myx 侧"修改点"（诚实结论：以前置依赖为主）
-
-| 项 | 性质 | 说明 |
+### 4.3 MyxVault（精简，322 行）
+| 函数 | 触发 | 行为 |
 |---|---|---|
-| myx 在 BSC 主网部署 | **前置依赖** | Flap 在 BSC |
-| 目标 base token 的 **market 已创建**（RISK_ADMIN） | **前置依赖** | vault 只能补 pool，补不了 market |
-| 合约代码改动 | **≈ 0** | deployPool/deposit/claim 已对合约开放；可选加 view helper |
-| （可选）池子激活到 Trench | 运营 | 影响池子可交易性与 LP 经济意义 |
+| `receive()` | dispatch | **仅** `pendingBnb += msg.value`（Flap Rule 005：不外部调用、不 revert、≤1M gas） |
+| `process()` | **任意人** | `pendingBnb→Portal 买回 MEME(minOut=同块 quote×(1-slippage), 余额差值入账)→若池不存在 deployPool→BasePool.deposit 得 LP→_feedDividend()` |
+| `feedDividend()` | 任意人 | 把 vault 持有的 LP 喂进 Dividend；`dividendContract==0` 或 `deposit()` 返 false(`totalShares==0`) → 留 LP、`emit DividendDeferred`、下次重试（deferral，绝不 revert 卡死） |
+| `claimReward()` | 任意人 | 代理 `dividend.withdrawDividendsFor(msg.sender)` |
+| `pendingReward(user)` | view | 代理 `dividend.withdrawableDividends(user)`（mBase LP 单位） |
+| `ensurePoolDeployed()` | 任意人 | 可选预建池 |
+| `emergencyWithdraw / emergencySweepBnb / emergencyRescueToken` | EMERGENCY_ROLE(Guardian+creator) | 赎回 LP / 清 BNB / 救援滞留 LP 或杂入 ERC20 |
 
----
+- `initialize`：`marketId = derive(chainid, marketQuoteToken)`，`poolId = derive(marketId, taxToken)`；授 Guardian `DEFAULT_ADMIN+EMERGENCY`、creator `EMERGENCY`；`revokeRole` 对 Guardian 不可撤销。
+- **无 trigger / 无三模式 / 无 operator**：`process` 无许可（tax token 无外部喂价，同块 quote minOut 兜底单次损失；这是经过权衡的取舍）。
 
-## 8. Flap 开发计划（分阶段）
+## 5. 持币者 UX
+1. 持有 MEME → Flap Dividend 按份额累积 mBase（转账 hook，不可刷）。
+2. `vault.claimReward()`（或直接在 Dividend）领走 mBase LP。
+3. 持有 mBase LP → 自己去 myx `claimUserRebate` 领 USDT / `withdraw` 退本。
 
-- **Phase 0 ｜ 补证（阻塞）**：
-  - **BscScan 反查原生 Dividend 合约：是否支持外部注入 + 入金/pending ABI**（决定 §5.5 可行性）。
-  - 确认目标 base token、对应 market 是否存在、poolId、PoolManager/BasePool 地址。
-  - swap 路由（Pancake）+ BSC USDT/WBNB 地址 + 可信价源（Chainlink BNB/USD or TWAP）。
-  - 核实 Cook 态 deposit 的 LP 完整生命周期（能否正常 claim/withdraw）。
-- **Phase 1 ｜ 骨架**：VaultBaseV2/VaultFactoryBaseV2 继承、Beacon 工厂、`receive()` 空记账、Guardian 权限框架。
-- **Phase 2 ｜ 资金流（TDD + BSC fork）**：`processRevenue`（wrap/swap→建池→deposit）、`harvest`（claim→WBNB→Dividend）。
-- **Phase 3 ｜ 应急/边界**：emergencyWithdraw、内部 minOut、阈值/分批、失败路径、market 缺失分支。
-- **Phase 4 ｜ 合规**：跑 `FlapVaultSpecChecker`（Rule 005 等）修到全过；补 `description/vaultUISchema/vaultDataSchema`；实现 `userLpShare/pendingReward` view。
-- **Phase 5 ｜ 审计 + 上线**：第三方审计 → factory verify → BSC 主网部署。
+## 6. 已验证的链上事实
+- **CREATE2 等价**（fuzz 256 + concrete）：`keccak256(abi.encode(uint64 chainId, quoteToken)) == myx MarketIdLib.toId`；`predictBasePoolToken == 实际 basePoolToken`。
+- **Flap V3 转账税范围**：只对「注册池对手方」抽税，`pools` 集合 initialize 后不可变 → vault↔用户、vault→myx 池的普通转账免税（stake/deposit 无缺口）；Portal BUY 在 bonding curve 足额、DEX 阶段净额 → 买回腿用余额差值入账。
+- **Flap Dividend `deposit(uint256)→bool`**：permissionless approve+pull dividendToken；`totalShares==0` 返 false（不 revert）→ 我们 defer。`withdrawableDividends(address)` 查、`withdrawDividendsFor(address)` 代领。
+- **BSC 地址**：VaultPortal `0x9049…4C06`、Guardian `0x9e27…8a4b`。
 
----
-
-## 9. 风险矩阵（资金安全优先）
-
-| 风险 | 等级 | 缓解 |
+## 7. 依赖与未决（上线前必须闭环）
+| 项 | 等级 | 说明 |
 |---|---|---|
-| `receive()` 越界 → 税收永久损坏 + BNB 锁死 | **极高** | receive 纯记账；Phase 4 spec checker 门禁 |
-| **原生 Dividend 不支持外部注入** → §5.5 分配方案失效 | **高** | Phase 0 头号验证；失败则退化为 vault 自建持币快照分配（复杂度大增） |
-| **买回腿无外部可信价源**（tax token 无 Chainlink，Portal quote 是同块 spot） | **高** | MANUAL 模式 OPERATOR_ROLE 控时机/私有 mempool；minOut = 同块 quote × (1-slippage) 仅作单次损失上限兜底。**AUTO 模式（默认）下此面重新打开**——任意人/block proposer 可零成本夹每笔 processRevenue,单次损失上限 = pendingBnb × slippage;接受 hands-off 便利与 MEV 的权衡,sandwich 敏感场景切 MANUAL |
-| operator 不作为 → BNB 长期滞留不入场 | 中（v3 引入） | Guardian 兜底可调;阈值累积无资金损失;后续可加冷却期开放任意人 |
-| **fee-on-transfer 双腿待证**：BUY 到账是否足额、vault→BasePool transferFrom 是否被抽税 | **高（Phase 0-v3 待证）** | 若 transfer 腿抽税：deposit 必须按余额差值入账,且 myx 池实收短缺需显式设计;若免税(典型:仅 pair 抽)则按名义值 |
-| `harvest` 任意人触发 → swap 三明治 | 中 | minOut 内部 Chainlink 算（USDT/BNB 均有 feed）+ 阈值 |
-| **本金做市风险敞口**：税本金入 base LP，净值随 myx 盈亏/无常损失缩水 | 高（业务性，已选择承担） | 设本金上限/分批；Guardian 应急赎回 |
-| Cook 态池子未激活 → LP 经济意义不全 / 赎回受限 | 中 | Phase 0 核实；推动 LISTING_ADMIN 激活到 Trench |
-| 自动建池但 **market 不存在** | 中 | 前置依赖（治理建 market）；vault revert 安全滞留 |
-| 双向 swap（BNB→base、USDT→BNB）损耗 | 中 | 累积到阈值批量处理降频 |
-| Factory 不可升级 | 中 | 可变参数走 vaultData / Guardian 可改存储 |
-| 喂价 stale → minOut 失真 → 三明治面 | 高 | `_readPrice` 校验 `answer>0` + `answeredInRound>=roundId` + `updatedAt` 时效窗口（`maxPriceStaleness`），任一不满足 revert（已实现 Task 7） |
-| harvest 腿单跳 `[USDT, WBNB]` 路径 | 低（v3 收缩） | USDT↔WBNB 是 BSC 最深池之一；买回腿已移交 Portal 内部路由，无 path 风险 |
-| 原生 Dividend `totalShares==0`(发币早期无持币者)→ `deposit` 返 false → `harvest` revert | 中(已接受) | revert 是安全选择:rebate 留在 myx 池未领、自解;有持币者后 harvest 正常。任意人调只浪费自身 gas,无套利 |
-| `dividendContract()` 每次 live lookup(未缓存)| 低(已接受) | init 期 taxToken 尚不存在(CREATE2 预测地址)无法缓存;转出仅 reward(本就给持币者),敞口限单次 harvest 的 WBNB 非本金;加 zero-address 卫语句 |
-| **首次 `deployPool` 在 trigger 回调里超 2M gas**（Rule 008 回调 gas 上限） | **高（v4 引入）** | `scheduleTrigger` 前置 `PoolNotDeployed` 门禁:池子未建则拒绝启动 loop;重型 `deployPool` 强制走无许可的 `ensurePoolDeployed()` 带外预部署,回调内只跑买回+harvest+reschedule。fork e2e 实测真实 Portal 路径 `trigger()` gas ≈ 0.54M（< 2M），实证达标 |
-| **harvest revert → 整轮 `_runCycle` 回滚**（含 reschedule，loop 停摆） | 中(已接受) | 仅 `totalShares==0` 早期窗口耦合,概率低(有税收即有交易即有持币者,BNB 累积到阈值时通常已 `totalShares>0`);operator 可手动 `processRevenue()` 兜底买回,loop 可经 `scheduleTrigger()` 重启;`retryTrigger()` 无 gas 上限可重放。不加静默 fallback(反 fallback 原则) |
-| **TriggerService 后端活性 + 每次 0.0002 BNB 费(从 `pendingBnb` 扣)** | 中 | fee 实测 `getFee()==2e14 wei`(0.0002 BNB);`pendingBnb < fee` 时 `_runCycle` 发 `LoopStalled` 事件并停止 reschedule,等新税收到账后任意人 `scheduleTrigger()` 重启;后端不活时退化到 AUTO(无许可)/MANUAL(operator)。无资金损失,仅延迟入场 |
-| **TRIGGERED 下 `retryTrigger` 公开可重放 → 买回 MEV 诱饵** | 低 | 正常路径成功后请求状态非 FAILED,不可被 `retryTrigger` 重放(replay 由 `pendingTriggerId` 一次性消费保护);即便重放,买回 minOut = 同块 Portal quote ×(1-slippage)兜底单次损失上限 |
-| **dividendToken 配置不兼容**(native BNB / self-magic / 与 myx market quote 不匹配) | 中 | factory `_validateBeforeLaunch` 早拒 native(`address(0)`)与 self-magic(`0xfEED…dEEd`)→ 发币期 fail-fast;运行期 vault `_forwardToDividend` 强校验 `pool.quoteToken == dividend.dividendToken()`,不匹配 revert(`DividendTokenMismatch`)。factory 看不到 marketId+dividendToken 全貌,精确一致性由 vault 运行期守护 |
+| **Flap v2.3 未发布** | 阻塞真 e2e | `computeDividendToken`/`MAGIC_DIVIDEND_COMPUTED` 未上线；现仅 mock 测回调。Flap 发布后补真 VaultPortal e2e。 |
+| **hint ABI** | 资金级 | 假设 `abi.encode(address quoteToken, string symbol)`；symbol 必须与 MEME 部署后 `symbol()` 逐字节相同（带不带 `$`、大小写）——差一字节预测地址错、dividendToken 打飞资金。与 Flap v2.3 钉死。 |
+| **interim rebate 归属** | 高 | LP 喂进 Dividend 后、被领走前由 Dividend 合约持有，其间 myx rebate 归 Dividend 合约。LP 转给领取者时累积 rebate 跟不跟着走，取决于 **myx LP 转账的 rebate 会计**——需 myx 侧确认，否则有 rebate 滞留/漏分风险。 |
+| **myx CREATE2 改动** | 协调 | 改变所有 pool token 地址 + initialize 依赖集；需 myx 团队接受并全测通过。 |
+| **Rule 004（自定义 error）** | 低（已接受） | spec-checker Medium：自定义 error UI 不易解码；非安全问题，保留。 |
 
----
+## 8. 部署
+- 工厂部署脚本：`script/{mainnet,testnet}/bnb/DeployMyxVaultFactory.s.sol`，GlobalConfig 走 env（`MYX_POOL_MANAGER/MYX_BASE_POOL/MYX_POOL_FACTORY` + maxSlippageBps/minProcessAmount）。
+- 前置依赖：myx 在 BSC 部署 + 对应 quote(USDT/USDC) market 由 RISK_ADMIN 创建。
+- 发币：dividendToken 填 `MAGIC_DIVIDEND_COMPUTED`，vaultFactory 填本工厂，vaultData = `abi.encode(quoteToken)`，hint 带 `(quoteToken, MEME symbol)`。
 
-## 10. 已确认的设计决策
-
-1. 方向：myx 做 Flap 的 Vault。
-2. 跨链：myx 上 BSC，同链对接，无桥。
-3. 注资形态：税 → 加 **base 流动性**（非 quote）。
-4. base 资产（**v3 变更**）：**tax token 本身**——税 BNB 经 **Flap Portal `IPortalTradeV2.swapExactInput`** 买回该 token 再入池（买回压力 + 为 token 开 myx 做市池）。
-5. 建池：池子不存在则 vault 自动 `deployPool(marketId, taxToken)`（permissionless，Cook 即可 deposit；market 须已存在）。v3 下这是主路径。
-6. LP 归属：**vault 持有**（不分发用户钱包）。
-7. 收益分配：**按持币比例**，复用 Flap 原生 Dividend，无链下系统（v3 确认沿用）。
-8. 触发权限（**v4 变更，三态**）：`processRevenue` 由 **mode 开关**决定——**TRIGGERED（默认）= 经 Flap TriggerService 自动跑 `_runCycle`，手动 `processRevenue` 仅 OPERATOR_ROLE**；**AUTO = 无许可触发**（配 keeper 即"自动"，税到即入场）；**MANUAL = 仅 OPERATOR_ROLE**（控时机+私有 mempool 防夹）。`setMode` 权限 = creator 或 Guardian。`receive()` 永远纯记账（Rule 005 不可动；"自动"绝不在 receive 内执行 swap/deposit，否则税收永久损坏+BNB 锁死+无法过 flap 验证）。`harvest` 保持任意人（v4 后无 swap/MEV 面，仅 claim+直分）。
-9. **harvest 直分 dividendToken（v4 变更）**：myx 池的 quote token == 该 token 配置的 `dividendToken`，claim 到的 rebate 即 dividend token,直接 `deposit` 进原生 Dividend——**砍掉整条 swap + Chainlink feed**。运行期 `_forwardToDividend` 强校验 `pool.quoteToken == dividend.dividendToken()`,不匹配 revert。
-10. **触发费来源（v4 新增）**：每轮 TriggerService fee（实测 `getFee()==2e14 wei`/0.0002 BNB）从 `pendingBnb` 扣（vault 唯一持有的 BNB);`pendingBnb < fee` 则 `LoopStalled` 停摆,等新税收到账后 `scheduleTrigger()` 重启。
-11. **deployPool 经 `ensurePoolDeployed()` 前置（v4 新增）**：重型建池强制带外无许可预部署;`scheduleTrigger` 门禁 `PoolNotDeployed`,池未建拒绝启动 loop——保证 gas-capped trigger 回调内绝不付 deployPool gas（fork 实测真实 Portal 路径 `trigger()` ≈ 0.54M < 2M）。
-12. **dividendToken fail-fast 预检（v4 新增）**：factory `_validateBeforeLaunch` 早拒 native BNB(`address(0)`)与 self-magic(`0xfEED…dEEd`)dividend——发币期即报错;精确 dividendToken↔market 一致性仍由 vault 运行期守护。
-13. 查询：`userLpShare(user)` 名义 LP 份额 + `pendingReward(user)` 可领奖励。
-14. **marketId 链上自推（v4-5 变更）**：`vaultData` 不再是不透明 marketId，而是 market 的 `quoteToken`（= dividendToken，USDT/USDC 地址）。vault initializer 推 `marketId = keccak256(abi.encode(uint64(block.chainid), quoteToken))`（fuzz 256 + concrete 验证等价 myx `MarketIdLib.toId`）→ `poolId = keccak256(abi.encode(marketId, taxToken))`。删除 factory 的两个硬编码 marketId 常量;`VaultCreated` 末参与 schema 字段改为 `quoteToken`(address);dividendToken == pool-quote == reward 不变量由参数形态天然保证;`quoteToken==address(0)` revert `ZeroMarketQuoteToken`。
-14. 领取：前端调原生 Dividend `withdrawDividends()`。
-
-**待定项（review 时定）**：是否额外提取 LP 净值增长部分回流（需成本会计，默认否）。
-
----
-
-## 11. Phase 0 补证清单
-
-### Phase 0（已完成，2026-06-11，见 docs/phase0-findings.md）
-
-- [x] 原生 Dividend：`deposit(uint256)→bool` permissionless（失败返 false 须检查）；`withdrawableDividends(address)`；claim=`withdrawDividends()`
-- [x] Pancake 路由 / BSC USDT(18dec) / WBNB / Chainlink BNB-USD & USDT-USD feed 全部验证
-
-### Phase 0-v3（流程变更新增，开工前必须坐实）
-
-- [ ] **fee-on-transfer 双腿核实**（头号）：Portal BUY 的 outputAmount 是否足额到账;vault→BasePool `transferFrom`（非 pair 转账）是否被抽税 → 决定 deposit 名义值 vs 余额差值记账
-- [ ] Flap V3 token `decimals == 18` 确认（myx 建池要求 <19）
-- [ ] `quoteExactInput` 非 view 的调用形态确认（tx 内 call 取报价）
-- [ ] 目标 market 是否已存在 + PoolManager/BasePool 地址（依赖 myx BSC 部署）
-- [ ] Cook 态 deposit 的 LP 完整生命周期（claim/withdraw 是否正常）
-- [ ] `pendingUserRebates` 的 price 入参来源（myx oracle 接口）
-
----
-
-## 12. 参考
-
-- 官方参考实现：`github.com/flap-sh/FlapVaultExample`（FreeCoinBeacon.sol、VaultBaseV2、VaultFactoryBaseV2）
-- spec checker：`github.com/flap-sh/FlapVaultSpecChecker`（Rule 005）
-- Flap 文档：`docs.flap.sh/flap/developers/vault-developers/`
-- myx 关键文件：`src/pool/PoolManager.sol`、`src/pool/BasePool.sol`、`src/pool/token/BasePoolToken.sol`、`src/pool/MarketManager.sol`
+## 9. 参考
+- `.agents/skills/flap-vault-spec-checker/`（Rule 001–009 合规）；最新审计：`docs/spec-checker-findings.md`。
+- 官方参考实现：`github.com/flap-sh/FlapVaultExample`；Lista slisBNB 金库 `0xabd6156A587484EC487e7CcA236fCEE7E6e126a6`（分红模式对照）。
+- myx：`src/pool/PoolFactory.sol`（CREATE2+predict）、`src/pool/BasePool.sol`、`src/types/{MarketKey,PoolKey}.sol`。

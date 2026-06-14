@@ -19,8 +19,6 @@ contract MyxVaultFactory is VaultFactoryBaseV2 {
         address poolFactory; // myx PoolFactory: authoritative basePoolToken (LP / mBase) predictor
         uint16 maxSlippageBps;
         uint256 minProcessAmount;
-        address triggerService;
-        uint64 triggerInterval;
     }
 
     error UnsupportedQuoteToken();
@@ -74,9 +72,7 @@ contract MyxVaultFactory is VaultFactoryBaseV2 {
                             poolManager: c.poolManager,
                             basePool: c.basePool,
                             maxSlippageBps: c.maxSlippageBps,
-                            minProcessAmount: c.minProcessAmount,
-                            triggerService: c.triggerService,
-                            triggerInterval: c.triggerInterval
+                            minProcessAmount: c.minProcessAmount
                         })
                     )
                 )
@@ -130,16 +126,19 @@ contract MyxVaultFactory is VaultFactoryBaseV2 {
 
     function vaultDataSchema() public pure override returns (VaultDataSchema memory schema) {
         schema.description =
-            "MyxVault parameter: the myx market quote token, which MUST equal this token's dividendToken "
-            "(USDT or USDC). The vault derives the myx market and base pool from it on-chain, so LP rebates "
-            "(paid in this quote token) distribute to holders directly. Pass the same ERC20 address you set "
-            "as the token's dividendToken.";
+            "MyxVault parameter: the myx MARKET quote token (e.g. USDT or USDC) used only to derive the "
+            "myx market and base pool on-chain (marketId = keccak256(chainId, quoteToken)). The dividend "
+            "ASSET is NOT this quote token: tax revenue is bought back into the token and deposited into "
+            "that myx base pool, and the resulting myx LP (mBase) is itself the reward fed to holders. The "
+            "token's dividendToken is set to the MAGIC_DIVIDEND_COMPUTED sentinel at launch and resolved to "
+            "that mBase LP via computeDividendToken(...). Pass the ERC20 market quote token the myx pool uses.";
         schema.fields = new FieldDescriptor[](1);
         schema.fields[0] = FieldDescriptor(
             "quoteToken",
             "address",
-            "ERC20 quote/dividend token (e.g. USDT or USDC). Must equal the token's dividendToken; the vault "
-            "derives marketId = keccak256(chainId, quoteToken) and the base pool from it.",
+            "myx market quote token (e.g. USDT or USDC). Used only to derive marketId = keccak256(chainId, "
+            "quoteToken) and the base pool. The dividend asset is the resulting myx LP (mBase), resolved via "
+            "computeDividendToken; it is NOT this quote token.",
             0
         );
         schema.isArray = false;

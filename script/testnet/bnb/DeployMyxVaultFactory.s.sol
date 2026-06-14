@@ -20,10 +20,7 @@ contract DeployMyxVaultFactory is Script {
                 // v2.3 computeDividendToken callback. Env-driven to avoid hardcoding unverified ones.
                 poolFactory: vm.envAddress("MYX_POOL_FACTORY"),
                 maxSlippageBps: 500,
-                minProcessAmount: 0.005 ether,
-                // The Flap TriggerService testnet address is unknown; supply it via env.
-                triggerService: vm.envAddress("FLAP_TRIGGER_SERVICE"),
-                triggerInterval: uint64(vm.envOr("TRIGGER_INTERVAL", uint256(1 hours)))
+                minProcessAmount: 0.005 ether
             })
         );
         console2.log("MyxVaultFactory:", address(factory));

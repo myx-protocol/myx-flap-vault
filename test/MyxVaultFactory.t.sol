@@ -19,7 +19,6 @@ contract MyxVaultFactoryTest is Test {
     MockPoolManager poolManager;
     MockMyxPoolFactory poolFactory;
     MockPancakeRouter router;
-    MockTriggerService triggerService;
 
     address constant VAULT_PORTAL = 0x90497450f2a706f1951b5bdda52B4E5d16f34C06; // BSC mainnet
     address constant GUARDIAN = 0x9e27098dcD8844bcc6287a557E0b4D09C86B8a4b;
@@ -39,7 +38,6 @@ contract MyxVaultFactoryTest is Test {
         poolManager = new MockPoolManager();
         poolFactory = new MockMyxPoolFactory();
         router = new MockPancakeRouter();
-        triggerService = new MockTriggerService();
 
         factory = new MyxVaultFactory(_baseConfig());
     }
@@ -50,9 +48,7 @@ contract MyxVaultFactoryTest is Test {
             basePool: address(basePool),
             poolFactory: address(poolFactory),
             maxSlippageBps: 300,
-            minProcessAmount: 0.1 ether,
-            triggerService: address(triggerService),
-            triggerInterval: 1 hours
+            minProcessAmount: 0.1 ether
         });
     }
 
@@ -82,8 +78,7 @@ contract MyxVaultFactoryTest is Test {
             MyxVault.InitParams({
                 taxToken: address(1), creator: address(1),
                 marketQuoteToken: address(usdt), poolManager: address(1), basePool: address(1),
-                maxSlippageBps: 0, minProcessAmount: 0,
-                triggerService: address(1), triggerInterval: 0
+                maxSlippageBps: 0, minProcessAmount: 0
             })
         );
     }
