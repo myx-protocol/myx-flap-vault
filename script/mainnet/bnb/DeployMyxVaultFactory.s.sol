@@ -18,6 +18,9 @@ contract DeployMyxVaultFactory is Script {
             MyxVaultFactory.GlobalConfig({
                 poolManager: vm.envAddress("MYX_POOL_MANAGER"),
                 basePool: vm.envAddress("MYX_BASE_POOL"),
+                // myx PoolFactory: authoritative basePoolToken (mBase LP) predictor used by the
+                // v2.3 computeDividendToken callback. Env-driven (MYX not yet live on BSC mainnet).
+                poolFactory: vm.envAddress("MYX_POOL_FACTORY"),
                 maxSlippageBps: 300,
                 minProcessAmount: 0.1 ether,
                 // Flap TriggerService on BSC mainnet (chainId 56). Override via env if needed.

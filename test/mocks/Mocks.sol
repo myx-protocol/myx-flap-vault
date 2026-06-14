@@ -187,6 +187,25 @@ contract MockTriggerService {
     }
 }
 
+/// @dev Stand-in for the myx PoolFactory's authoritative CREATE2 predictor. Tests register the
+///      byte-exact basePoolToken (LP / mBase) address for a (marketId, baseToken, baseSymbol) key,
+///      mirroring myx's predictBasePoolToken(MarketId, address, string).
+contract MockMyxPoolFactory {
+    mapping(bytes32 => address) public predictions; // key = keccak(marketId, baseToken, symbol)
+
+    function setPrediction(MarketId marketId, address baseToken, string calldata baseSymbol, address lp) external {
+        predictions[keccak256(abi.encode(marketId, baseToken, baseSymbol))] = lp;
+    }
+
+    function predictBasePoolToken(MarketId marketId, address baseToken, string calldata baseSymbol)
+        external
+        view
+        returns (address)
+    {
+        return predictions[keccak256(abi.encode(marketId, baseToken, baseSymbol))];
+    }
+}
+
 contract MockPoolManager is IMyxPoolManager {
     mapping(bytes32 => PoolMetadata) internal pools;
     uint256 public deployPoolCallCount;

@@ -12,10 +12,12 @@ contract MyxVaultFactoryTest is Test {
     MyxVaultFactory factory;
     MockWBNB wbnb;
     MockERC20 usdt;
+    MockERC20 usdc;
     MockAggregatorV3 bnbFeed;
     MockAggregatorV3 usdtFeed;
     MockBasePool basePool;
     MockPoolManager poolManager;
+    MockMyxPoolFactory poolFactory;
     MockPancakeRouter router;
     MockTriggerService triggerService;
 
@@ -29,11 +31,13 @@ contract MyxVaultFactoryTest is Test {
         vm.chainId(56);
         wbnb = new MockWBNB();
         usdt = new MockERC20("Tether", "USDT");
+        usdc = new MockERC20("USD Coin", "USDC");
         marketId = MyxMarketId.derive(uint64(56), address(usdt));
         bnbFeed = new MockAggregatorV3(600e8, 8);
         usdtFeed = new MockAggregatorV3(1e8, 8);
         basePool = new MockBasePool(new MockERC20("LP", "LP"), usdt);
         poolManager = new MockPoolManager();
+        poolFactory = new MockMyxPoolFactory();
         router = new MockPancakeRouter();
         triggerService = new MockTriggerService();
 
@@ -44,6 +48,7 @@ contract MyxVaultFactoryTest is Test {
         return MyxVaultFactory.GlobalConfig({
             poolManager: address(poolManager),
             basePool: address(basePool),
+            poolFactory: address(poolFactory),
             maxSlippageBps: 300,
             minProcessAmount: 0.1 ether,
             triggerService: address(triggerService),
@@ -125,37 +130,10 @@ contract MyxVaultFactoryTest is Test {
     function test_validateBeforeLaunch_acceptsBnbQuote() public view {
         IVaultFactoryValidationV2.LaunchValidationDataV1 memory data;
         data.quoteToken = address(0);
-        // dividendToken must be a real ERC20 (native BNB / self-dividend are rejected); use USDT.
-        data.dividendToken = address(usdt);
+        // v2.3: dividendToken is the MAGIC_DIVIDEND_COMPUTED sentinel at validation time and is no
+        // longer inspected here — only the BNB-quote constraint is enforced. A bare BNB quote passes.
         (bool ok,) = factory.onBeforeLaunch(abi.encode(data));
         assertTrue(ok);
-    }
-
-    function test_validateBeforeLaunch_rejectsNativeDividend() public view {
-        IVaultFactoryValidationV2.LaunchValidationDataV1 memory data;
-        data.quoteToken = address(0); // valid BNB quote
-        data.dividendToken = address(0); // native BNB dividend — unsupported
-        (bool ok, string memory reason) = factory.onBeforeLaunch(abi.encode(data));
-        assertFalse(ok);
-        assertGt(bytes(reason).length, 0);
-    }
-
-    function test_validateBeforeLaunch_rejectsSelfDividend() public view {
-        IVaultFactoryValidationV2.LaunchValidationDataV1 memory data;
-        data.quoteToken = address(0); // valid BNB quote
-        data.dividendToken = 0xfEEDFEEDfeEDFEedFEEdFEEDFeEdfEEdFeEdFEEd; // self-dividend magic
-        (bool ok, string memory reason) = factory.onBeforeLaunch(abi.encode(data));
-        assertFalse(ok);
-        assertGt(bytes(reason).length, 0);
-    }
-
-    function test_validateBeforeLaunch_acceptsErc20Dividend() public view {
-        IVaultFactoryValidationV2.LaunchValidationDataV1 memory data;
-        data.quoteToken = address(0); // valid BNB quote
-        data.dividendToken = address(usdt); // real ERC20 dividend
-        (bool ok, string memory reason) = factory.onBeforeLaunch(abi.encode(data));
-        assertTrue(ok);
-        assertEq(bytes(reason).length, 0);
     }
 
     function test_upgradeOnlyGuardian() public {
@@ -167,8 +145,38 @@ contract MyxVaultFactoryTest is Test {
         assertEq(factory.beacon().implementation(), newImpl);
     }
 
-    function test_factorySpecVersion() public view {
-        assertEq(factory.factorySpecVersion(), "v2.2");
+    function test_factorySpecVersion_v23() public view {
+        assertEq(factory.factorySpecVersion(), "v2.3");
+    }
+
+    // ── Flap Spec v2.3 computeDividendToken callback ───────────────────────────
+    // hint ABI (ASSUMED, Flap-v2.3 coordination point): abi.encode(address quoteToken, string symbol).
+
+    function test_computeDividendToken_returnsPredictedLp() public {
+        address predictedToken = makeAddr("predictedTaxToken");
+        address someLpAddr = makeAddr("mBaseLp");
+        // marketId is keyed off the launch quoteToken (usdt) + chainid; the LP predictor is keyed
+        // off (marketId, predictedToken, symbol). Register the byte-exact LP the predictor returns.
+        MarketId mid = MyxMarketId.derive(uint64(block.chainid), address(usdt));
+        poolFactory.setPrediction(mid, predictedToken, "TAA", someLpAddr);
+
+        bytes memory hint = abi.encode(address(usdt), "TAA");
+        assertEq(factory.computeDividendToken(predictedToken, hint), someLpAddr);
+    }
+
+    function test_computeDividendToken_marketIdFromQuoteToken() public {
+        address predictedToken = makeAddr("predictedTaxToken");
+        address lpForUsdtMarket = makeAddr("lpUsdtMarket");
+        address lpForUsdcMarket = makeAddr("lpUsdcMarket");
+
+        MarketId usdtMarket = MyxMarketId.derive(uint64(block.chainid), address(usdt));
+        MarketId usdcMarket = MyxMarketId.derive(uint64(block.chainid), address(usdc));
+        // Same predictedToken + symbol, different quoteToken → distinct markets → distinct LPs.
+        poolFactory.setPrediction(usdtMarket, predictedToken, "TAA", lpForUsdtMarket);
+        poolFactory.setPrediction(usdcMarket, predictedToken, "TAA", lpForUsdcMarket);
+
+        assertEq(factory.computeDividendToken(predictedToken, abi.encode(address(usdt), "TAA")), lpForUsdtMarket);
+        assertEq(factory.computeDividendToken(predictedToken, abi.encode(address(usdc), "TAA")), lpForUsdcMarket);
     }
 
     function test_lockVaultUpgrades_blocksFurtherUpgrades() public {

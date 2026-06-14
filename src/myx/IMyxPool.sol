@@ -36,6 +36,17 @@ struct PoolMetadata {
     address tradingVault;
 }
 
+/// @dev Subset of the myx PoolFactory's deterministic address predictor. Returns the byte-exact
+///      future basePoolToken (LP / mBase) CREATE2 address for (marketId, baseToken, baseSymbol).
+///      VERIFIED upstream (branch feat/pool-token-create2): predict == actual deployed address.
+///      This is the AUTHORITATIVE source of the address math — we never recompute it locally.
+interface IMyxPoolFactory {
+    function predictBasePoolToken(MarketId marketId, address baseToken, string calldata baseSymbol)
+        external
+        view
+        returns (address);
+}
+
 interface IMyxPoolManager {
     struct DeployPoolParams {
         MarketId marketId;

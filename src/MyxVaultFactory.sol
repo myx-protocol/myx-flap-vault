@@ -7,6 +7,7 @@ import {VaultDataSchema, FieldDescriptor} from "./flap/IVaultSchemasV1.sol";
 import {BeaconProxy} from "@openzeppelin/proxy/beacon/BeaconProxy.sol";
 import {UpgradeableBeacon} from "@openzeppelin/proxy/beacon/UpgradeableBeacon.sol";
 import {MyxVault} from "./MyxVault.sol";
+import {MarketId, MyxMarketId, IMyxPoolFactory} from "./myx/IMyxPool.sol";
 
 /// @title MyxVaultFactory
 /// @notice Deploys MyxVault beacon proxies for the Flap VaultPortal. The factory itself is
@@ -15,6 +16,7 @@ contract MyxVaultFactory is VaultFactoryBaseV2 {
     struct GlobalConfig {
         address poolManager;
         address basePool;
+        address poolFactory; // myx PoolFactory: authoritative basePoolToken (LP / mBase) predictor
         uint16 maxSlippageBps;
         uint256 minProcessAmount;
         address triggerService;
@@ -24,11 +26,6 @@ contract MyxVaultFactory is VaultFactoryBaseV2 {
     error UnsupportedQuoteToken();
     error OnlyGuardian();
     error UpgradesLocked();
-
-    /// @dev Flap "self-dividend" sentinel: a token configured to distribute ITSELF as the dividend.
-    ///      Our myx pool distributes its quote token as the reward, so the dividendToken must be a
-    ///      real ERC20 we can match to a myx market quote — the self magic is incompatible.
-    address internal constant MAGIC_DIVIDEND_SELF = 0xfEEDFEEDfeEDFEedFEEdFEEDFeEdfEEdFeEdFEEd;
 
     event VaultCreated(
         address indexed vault, address indexed taxToken, address indexed creator, address marketQuoteToken
@@ -92,7 +89,33 @@ contract MyxVaultFactory is VaultFactoryBaseV2 {
         return quoteToken == address(0); // native BNB only
     }
 
+    /// @inheritdoc VaultFactoryBaseV2
+    /// @dev v2.3: opts into the Flap `computeDividendToken` resolution flow. The launcher sets the
+    ///      token's dividendToken to the MAGIC_DIVIDEND_COMPUTED sentinel; VaultPortal predicts the
+    ///      tax token address and calls computeDividendToken(...) to resolve the real dividend token.
+    function factorySpecVersion() public pure override returns (string memory) {
+        return "v2.3";
+    }
+
+    /// @notice Flap Spec v2.3 callback. The token launches with dividendToken = MAGIC_DIVIDEND_COMPUTED;
+    ///         VaultPortal predicts the tax token address and calls this to resolve the real dividend token.
+    ///         We return the myx base-pool LP (mBase) address for (USDT-market, predictedToken), so LP
+    ///         rebates flow to holders as the dividend asset.
+    /// @dev    hint MUST carry the launch quoteToken and the tax token's symbol. ASSUMED ENCODING (confirm
+    ///         against Flap v2.3 when released): abi.encode(address quoteToken, string symbol). The symbol
+    ///         MUST equal the deployed tax token's on-chain symbol() byte-for-byte, else the predicted LP
+    ///         address diverges from the real one (fund-critical — enforced upstream by Flap). Address math
+    ///         is delegated to the myx PoolFactory's authoritative predictBasePoolToken — never recomputed here.
+    function computeDividendToken(address predictedToken, bytes calldata hint) external view returns (address) {
+        (address quoteToken, string memory symbol) = abi.decode(hint, (address, string));
+        MarketId marketId = MyxMarketId.derive(uint64(block.chainid), quoteToken);
+        return IMyxPoolFactory(config.poolFactory).predictBasePoolToken(marketId, predictedToken, symbol);
+    }
+
     /// @notice Pre-launch validation hook (Flap VaultPortal calls this before token creation).
+    /// @dev    v2.3: the token's dividendToken is the MAGIC_DIVIDEND_COMPUTED sentinel at validation time
+    ///         (not a real ERC20) — it is resolved post-launch via computeDividendToken(...). We therefore
+    ///         no longer inspect dividendToken here; only the BNB-quote constraint is enforced.
     function _validateBeforeLaunch(IVaultFactoryValidationV2.LaunchValidationDataV1 memory data)
         internal
         view
@@ -101,16 +124,6 @@ contract MyxVaultFactory is VaultFactoryBaseV2 {
     {
         if (data.quoteToken != address(0)) {
             return (false, "MyxVaultFactory: only native BNB quote is supported");
-        }
-        // Our myx pool distributes its quote token as the reward, so the token's dividendToken
-        // must be a real ERC20 we can match to a myx market quote — not native BNB (address(0))
-        // and not the "self" magic (distribute the tax token itself). Exact dividendToken<->market
-        // consistency is enforced at runtime in the vault (pool.quoteToken == dividend.dividendToken()).
-        if (data.dividendToken == address(0)) {
-            return (false, "MyxVaultFactory: native BNB dividend not supported; use an ERC20 (USDT/USDC)");
-        }
-        if (data.dividendToken == MAGIC_DIVIDEND_SELF) {
-            return (false, "MyxVaultFactory: self-dividend not supported");
         }
         return (true, "");
     }

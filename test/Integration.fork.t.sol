@@ -13,7 +13,7 @@ import {MyxVault} from "../src/MyxVault.sol";
 import {MyxVaultFactory} from "../src/MyxVaultFactory.sol";
 import {MarketId, PoolId, MyxPoolId, MyxMarketId, PoolMetadata} from "../src/myx/IMyxPool.sol";
 
-import {MockERC20, MockBasePool, MockPoolManager} from "./mocks/Mocks.sol";
+import {MockERC20, MockBasePool, MockPoolManager, MockMyxPoolFactory} from "./mocks/Mocks.sol";
 
 /// @title MyxVaultForkTest
 /// @notice BSC mainnet fork end-to-end proof of the v3 buyback flow: launches a REAL Flap V3
@@ -50,6 +50,7 @@ contract MyxVaultForkTest is FlapBSCFixture {
     // ── Our deployments on the fork ───────────────────────────────────────────
     MyxVaultFactory internal factory;
     MockPoolManager internal poolManager;
+    MockMyxPoolFactory internal poolFactory;
     MockBasePool internal basePool;
     MockERC20 internal usdt;
     MockERC20 internal lpToken;
@@ -63,15 +64,21 @@ contract MyxVaultForkTest is FlapBSCFixture {
         lpToken = new MockERC20("MYX LP", "MLP");
         basePool = new MockBasePool(lpToken, usdt);
         poolManager = new MockPoolManager();
+        poolFactory = new MockMyxPoolFactory();
 
         // Deploy OUR factory: MYX side pointed at the mocks.
         // TODO(v4): triggered-mode + dividend assertions — harvest now distributes the pool
         // quote token directly (no swap/feeds), so the runtime fork flow needs a pool whose
         // quoteToken == the token's dividendToken before harvest can be exercised here.
+        // TODO(v6): rework this fork flow for the v2.3 computeDividendToken path — the launched
+        // token will carry MAGIC_DIVIDEND_COMPUTED and the dividend token is the myx mBase LP
+        // resolved via factory.computeDividendToken(predicted, hint), not BSC_USDT. The
+        // poolFactory mock here is wired only so the constructor config is well-formed.
         factory = new MyxVaultFactory(
             MyxVaultFactory.GlobalConfig({
                 poolManager: address(poolManager),
                 basePool: address(basePool),
+                poolFactory: address(poolFactory),
                 // 5%: the buyback minOut is bounded by a pre-trade same-block Portal quote,
                 // so the bound must absorb the curve impact of the vault's own buy.
                 maxSlippageBps: 500,
