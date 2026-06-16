@@ -583,6 +583,16 @@ contract MyxVaultViewsTest is MyxVaultTestBase {
         assertGt(bytes(vault.description()).length, 20);
     }
 
+    /// @dev Regression for the UI bug: 18-decimals wei must render as human-readable decimals,
+    ///      not raw wei. Values mirror the screenshot (pending BNB 9409000000000 wei -> "0.000009409").
+    function test_description_formatsWeiAsDecimals() public {
+        _fund(9409000000000);
+        assertEq(
+            vault.description(),
+            unicode"MYX liquidity vault / MYX 流動性金庫: 0 LP minted / LP 已鑄造, 0 LP distributed / LP 已分發, pending BNB / 待處理 BNB: 0.000009409."
+        );
+    }
+
     function test_vaultUISchema_describesMethods() public view {
         assertEq(vault.vaultUISchema().vaultType, "MyxVault");
         assertGt(vault.vaultUISchema().methods.length, 0);
