@@ -5,6 +5,7 @@ import {ERC20} from "@openzeppelin/token/ERC20/ERC20.sol";
 import {IERC20} from "@openzeppelin/token/ERC20/IERC20.sol";
 import {IMyxBasePool, IMyxPoolManager, PoolMetadata, PoolId, MarketId} from "../../src/myx/IMyxPool.sol";
 import {IPortalTradeV2} from "../../src/flap/IPortal.sol";
+import {ITriggerReceiver} from "../../src/flap/IFlapTriggerService.sol";
 
 contract MockERC20 is ERC20 {
     constructor(string memory n, string memory s) ERC20(n, s) {}
@@ -228,5 +229,34 @@ contract MockPoolManager is IMyxPoolManager {
 
     function getPool(PoolId poolId) external view returns (PoolMetadata memory) {
         return pools[PoolId.unwrap(poolId)];
+    }
+}
+
+/// @dev Mock of Flap's FlapTriggerService, etched at the address MyxVault._getTriggerService() returns
+///      on chainId 56. vm.etch zeroes storage, so tests MUST call setFee() after etching. requestTrigger
+///      ids start at 1; fire() simulates the Flap backend executing the callback after executeAfter.
+contract MockFlapTriggerService {
+    uint256 internal feeWei;
+    uint256 public lastRequestId;
+    uint64 public lastExecuteAfter;
+    bool public requestReverts;
+    mapping(uint256 => address) public requesterOf;
+
+    function setFee(uint256 f) external { feeWei = f; }
+    function setRequestReverts(bool v) external { requestReverts = v; }
+    function getFee() external view returns (uint256) { return feeWei; }
+    function getMaxCallbackGas() external pure returns (uint256) { return 5_000_000; }
+
+    function requestTrigger(uint64 executeAfter) external payable returns (uint256 requestId) {
+        if (requestReverts) revert("trigger service unavailable");
+        require(msg.value >= feeWei, "insufficient fee");
+        requestId = ++lastRequestId; // ids start at 1
+        lastExecuteAfter = executeAfter;
+        requesterOf[requestId] = msg.sender;
+    }
+
+    /// @dev Test helper: simulate the Flap backend firing the callback.
+    function fire(uint256 requestId) external {
+        ITriggerReceiver(requesterOf[requestId]).trigger(requestId);
     }
 }

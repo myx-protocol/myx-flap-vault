@@ -13,6 +13,7 @@ import {IDividendDistributor} from "./dividend/IDividendDistributor.sol";
 import {IFlapTaxTokenV3} from "./flap/IFlapTaxTokenV3.sol";
 import {IPortalTradeV2} from "./flap/IPortal.sol";
 import {Decimal18} from "./lib/Decimal18.sol";
+import {IFlapTriggerService, ITriggerReceiver} from "./flap/IFlapTriggerService.sol";
 
 /// @title MyxVault
 /// @notice Flap vault that buys back the tax token with tax revenue via the Flap Portal, deposits
@@ -24,7 +25,9 @@ import {Decimal18} from "./lib/Decimal18.sol";
 ///      that same mBase LP (wired at launch). Holders claim the mBase LP via
 ///      the dividend (fairly, via Flap setShare hooks), then earn myx rebates by holding it.
 /// @dev Invariants:
-///      - receive() is accounting-only (Flap Rule 005): no external calls, never reverts.
+///      - receive() does accounting (pendingBnb += msg.value) then best-effort schedules a delayed
+///        process() via FlapTriggerService in try/catch; accounting is the Rule-005 core and the
+///        schedule never reverts receive() (deliberate Rule-005 deviation, see auto-trigger doc).
 ///      - process() is permissionless: anyone may convert pending BNB into liquidity + dividend.
 ///      - The LP IS the dividend asset: dividendToken == basePoolToken == mBase. _feedDividend
 ///        deposits the whole held LP balance; if the dividend is unwired or deposit() returns false
@@ -32,7 +35,7 @@ import {Decimal18} from "./lib/Decimal18.sol";
 ///        price feed, no fallback path. Anti-fallback: retry via feedDividend() or next process().
 ///      - Guardian roles cannot be revoked by any other account; only the guardian itself may
 ///        voluntarily renounce (Flap mandate).
-contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, ReentrancyGuardUpgradeable {
+contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, ReentrancyGuardUpgradeable, ITriggerReceiver {
     using SafeERC20 for IERC20;
 
     struct InitParams {
@@ -47,12 +50,17 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
 
     bytes32 public constant EMERGENCY_ROLE = keccak256("EMERGENCY_ROLE");
     uint16 public constant BPS_DENOMINATOR = 10_000;
+    /// @notice Delay between a tax receipt and the auto-scheduled process() (seconds).
+    uint64 public constant PROCESS_DELAY = 60;
 
     error CannotRevokeGuardianRole();
     error ZeroMarketQuoteToken();
     error BelowMinimumProcessAmount(uint256 pending, uint256 minimum);
     error ZeroQuote();
     error ZeroDividendContract();
+    error TriggerServiceNotConfigured();
+    error OnlySelf();
+    error OnlyTriggerService();
 
     event RevenueReceived(uint256 amount, uint256 pendingTotal);
     event RevenueProcessed(uint256 bnbAmount, uint256 baseAmount, uint256 lpMinted);
@@ -69,6 +77,10 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
     ///         mBase LP, residual tax tokens, or any accidentally sent token — including cases where
     ///         the myx pool's withdraw path is unusable.
     event EmergencyTokenRescued(address indexed token, address to, uint256 amount);
+    /// @notice Emitted when receive() schedules a delayed process() via FlapTriggerService.
+    event ProcessScheduled(uint256 requestId, uint64 executeAfter);
+    /// @notice Emitted when the trigger callback runs; `success` is process()'s try/catch outcome.
+    event ProcessTriggered(uint256 requestId, bool success);
 
     address public taxToken;
     address public creator;
@@ -87,8 +99,14 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
     uint256 public totalLpMinted;
     uint256 public totalRewardsForwarded;
 
-    /// @dev Reserved storage to allow inserting parent mixins or new variables in upgrades.
-    uint256[44] private __gap;
+    /// @notice Last FlapTriggerService request id scheduled by receive(); meaningful only while
+    ///         `hasPendingTrigger`. `hasPendingTrigger` is the in-flight gate (true => receive() skips
+    ///         a duplicate schedule); kept separate from the id so service ids starting at 0 are safe.
+    uint256 public pendingTriggerId;
+    bool public hasPendingTrigger;
+
+    /// @dev Reserved storage for upgrades. Reduced from 44 to 42 for the two slots added above.
+    uint256[42] private __gap;
 
     constructor() {
         _disableInitializers();
@@ -118,10 +136,63 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
         _grantRole(EMERGENCY_ROLE, p.creator);
     }
 
-    /// @dev Flap Rule 005: accounting only. No external calls, no loops, never reverts.
+    /// @dev Accounting + best-effort auto-schedule. Accounting (pendingBnb += msg.value) runs first
+    ///      and is the Rule-005 core. Scheduling a delayed process() via FlapTriggerService is wrapped
+    ///      in try/catch (self-call) so ANY scheduling failure — service down, fee insufficient, OOG —
+    ///      degrades to "not scheduled" and NEVER reverts receive() or loses tax. The external call is
+    ///      a deliberate Rule-005 deviation (see auto-trigger design doc); never-revert is preserved.
     receive() external payable {
         pendingBnb += msg.value;
         emit RevenueReceived(msg.value, pendingBnb);
+        if (!hasPendingTrigger && pendingBnb >= minProcessAmount) {
+            try this.scheduleProcess() {} catch {}
+        }
+    }
+
+    /// @notice Schedules a delayed process() via FlapTriggerService. ONLY the vault itself may call
+    ///         it (from receive()); the self-call lets receive() wrap getFee()+requestTrigger in one
+    ///         try/catch. The fee is paid from tax revenue: pendingBnb is debited ONLY on a successful
+    ///         schedule, preserving the (vault BNB balance == pendingBnb) invariant.
+    function scheduleProcess() external {
+        if (msg.sender != address(this)) revert OnlySelf();
+        IFlapTriggerService service = IFlapTriggerService(_getTriggerService());
+        uint256 fee = service.getFee();
+        // Decide on ACCUMULATED pendingBnb (not a single receipt): it must cover the fee AND still
+        // leave >= minProcessAmount so the scheduled process() can actually run — no wasted fee, and
+        // pendingBnb -= fee can never underflow.
+        require(pendingBnb >= minProcessAmount + fee, "pending below min + fee");
+        uint64 executeAfter = uint64(block.timestamp) + PROCESS_DELAY;
+        uint256 id = service.requestTrigger{value: fee}(executeAfter);
+        pendingTriggerId = id;
+        hasPendingTrigger = true;
+        pendingBnb -= fee;
+        emit ProcessScheduled(id, executeAfter);
+    }
+
+    /// @notice FlapTriggerService callback (ITriggerReceiver). Clears the in-flight gate FIRST, then
+    ///         runs process() under try/catch so a revert (e.g. pendingBnb already drained below the
+    ///         minimum by a permissionless process()) cannot deadlock scheduling — the next tax
+    ///         receipt re-schedules. Stale/unknown request ids are ignored.
+    function trigger(uint256 requestId) external {
+        if (msg.sender != _getTriggerService()) revert OnlyTriggerService();
+        if (!hasPendingTrigger || requestId != pendingTriggerId) return;
+        hasPendingTrigger = false;
+        pendingTriggerId = 0;
+        bool success;
+        try this.process() {
+            success = true;
+        } catch {
+            success = false;
+        }
+        emit ProcessTriggered(requestId, success);
+    }
+
+    /// @dev FlapTriggerService address per chain — hardcoded like _getPortal/_getGuardian. The BSC
+    ///      testnet address is pending (see auto-trigger design doc open items).
+    function _getTriggerService() internal view returns (address) {
+        if (block.chainid == 56) return 0xcf4EE25035CF883895110f367F5BA8172416a7F9;
+        else if (block.chainid == 97) return 0x560E9830926C9e0EB98a59c6b9902383Fc0D9Eb2;
+        revert TriggerServiceNotConfigured();
     }
 
     /// @dev Flap mandate: the Guardian role must not be revocable by anyone else.

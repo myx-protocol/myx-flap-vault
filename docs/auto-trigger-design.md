@@ -35,8 +35,9 @@ gas-funded trigger callback 60s later, and remains permissionless as a fallback.
 ```
 Flap dispatch ──BNB──▶ receive()
                          ├─ pendingBnb += msg.value ; emit RevenueReceived   (Rule-005 accounting)
-                         └─ if no in-flight trigger & pendingBnb >= min:
-                              try this.scheduleProcess(msg.value)             (self-call, try/catch)
+                         └─ if no in-flight trigger & pendingBnb >= min:     (cheap pre-filter)
+                              try this.scheduleProcess()                      (self-call, try/catch)
+                                 ├─ require pendingBnb >= min + fee           (precise gate)
                                  └─ requestTrigger{value: fee}(now + DELAY)
 
 Flap trigger backend ──(>= now+DELAY)──▶ trigger(requestId)                  (ITriggerReceiver)
@@ -53,7 +54,7 @@ Flap trigger backend ──(>= now+DELAY)──▶ trigger(requestId)           
 | `triggerService` (immutable) | deploy param (BSC mainnet `0xcf4EE25035CF883895110f367F5BA8172416a7F9`; **testnet addr TBD**), not hardcoded |
 | `pendingTriggerId` (uint256) | `0` = no in-flight; non-zero = scheduled. Idempotence gate: non-zero ⇒ skip new schedule |
 | `PROCESS_DELAY` (immutable) | default 60s, deploy-configurable |
-| `scheduleProcess(uint256 budget) external` | `onlySelf` (msg.sender == address(this)); wraps `getFee()` + `requestTrigger` so the whole leg is inside the `receive()` try/catch |
+| `scheduleProcess() external` | `onlySelf`; gates on `pendingBnb >= minProcessAmount + fee` (decides on accumulated pending, NOT per-receipt msg.value) then wraps `getFee()`+`requestTrigger` inside the `receive()` try/catch |
 | `trigger(uint256) external` | implements `ITriggerReceiver`; sender check; stale-id ignore; clear id, then `try this.process()` |
 
 Events: `ProcessScheduled(requestId, executeAfter)`, `ProcessTriggered(requestId, bool success)`.
@@ -65,8 +66,10 @@ Events: `ProcessScheduled(requestId, executeAfter)`, `ProcessTriggered(requestId
 2. **Fee accounting self-consistent** — `pendingBnb += msg.value` first; `pendingBnb -= fee` ONLY
    on successful schedule, so `vault BNB balance == pendingBnb` always holds and `process()` can
    never be balance-starved.
-3. **Small-tax guard** — `msg.value <= fee` or `pendingBnb < minProcessAmount` ⇒ no schedule
-   (avoids underflow / dust scheduling); permissionless `process()` remains the fallback.
+3. **Threshold guard** — schedule only when accumulated `pendingBnb >= minProcessAmount + fee`
+   (decided on pending, NOT the per-receipt msg.value): covers the fee, leaves >= min so the
+   scheduled process() can actually run, and `pendingBnb -= fee` can never underflow. Below that,
+   no schedule — permissionless `process()` remains the fallback.
 4. **No deadlock on FAILED** — `trigger()` clears `pendingTriggerId` before `try process()`, so
    whether `process()` succeeds or reverts, the next tax receipt can re-schedule.
 
