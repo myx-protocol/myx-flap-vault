@@ -13,6 +13,19 @@ import {IAccessControlUpgradeable} from "@openzeppelin-contracts-upgradeable/acc
 ///        - any ERC-20 address: use that token as dividend (including quoteToken)
 address constant MAGIC_DIVIDEND_SELF = address(0xfEEDFEEDfeEDFEedFEEdFEEDFeEdfEEdFeEdFEEd);
 
+/// @dev Magic address value for `dividendToken` in NewTokenV6Params / NewTokenV7Params (Flap v2.3+).
+///      When set to this address, the VaultPortal will NOT use the provided dividendToken value
+///      directly; instead, after predicting the tax-token address via CREATE2, it calls the vault
+///      factory's `resolveDividendToken(predictedToken, launchVersion, launchParams)` via STATICCALL
+///      and uses the returned address as the actual dividend token.  This allows the factory to
+///      derive the dividend token from launch-time parameters (e.g. an myx base-pool LP address)
+///      without requiring the launcher to pre-compute it.
+///      The sentinel is 0xC0Dec0dec0DeC0Dec0dEc0DEC0DEC0DEC0DEC0dE — intentionally distinct from:
+///        - address(0)        : native gas token dividend
+///        - MAGIC_DIVIDEND_SELF: resolves to the tax token itself
+///        - any real ERC-20 address
+address constant MAGIC_DIVIDEND_COMPUTED = address(0xC0Dec0dec0DeC0Dec0dEc0DEC0DEC0DEC0DEC0dE);
+
 /// @title Common Types
 /// @notice This interface defines common types shared across the portal
 interface IPortalCommonTypes {

@@ -4,6 +4,42 @@ pragma solidity ^0.8.13;
 
 import {IPortalTypes} from "./IPortal.sol";
 
+// ─── Flap v2.3 Dividend-Token Resolution ────────────────────────────────────
+
+/// @dev launchVersion sentinel for NewTokenV6WithVaultParams (TOKEN_TAXED_V3).
+uint8 constant DIVIDEND_TOKEN_LAUNCH_VERSION_V6 = 6;
+
+/// @dev launchVersion sentinel for NewTokenV7WithVaultParams (TOKEN_V3_PERMIT / flexible fee).
+uint8 constant DIVIDEND_TOKEN_LAUNCH_VERSION_V7 = 7;
+
+/// @title IVaultFactoryDividendV23
+/// @notice Optional callback interface introduced in Flap factory spec v2.3.
+/// @dev    VaultPortal invokes this via STATICCALL when a token's dividendToken is the
+///         MAGIC_DIVIDEND_COMPUTED sentinel (see IPortal.sol). The factory must be `view`
+///         so that VaultPortal can call it safely without state side-effects.
+///
+///         Flow:
+///           1. Launcher sets params.dividendToken = MAGIC_DIVIDEND_COMPUTED.
+///           2. VaultPortal predicts the tax-token address (CREATE2).
+///           3. VaultPortal STATICCALL → factory.resolveDividendToken(predictedToken, launchVersion, launchParams).
+///           4. Factory decodes launchParams and returns the real dividend token address.
+///           5. VaultPortal uses that address as the token's dividendToken.
+///
+///         launchVersion values:
+///           DIVIDEND_TOKEN_LAUNCH_VERSION_V6 (6) → launchParams = abi.encode(NewTokenV6WithVaultParams)
+///           DIVIDEND_TOKEN_LAUNCH_VERSION_V7 (7) → launchParams = abi.encode(NewTokenV7WithVaultParams) [pending]
+interface IVaultFactoryDividendV23 {
+    /// @notice Resolve the real dividend token given the predicted tax-token address and launch params.
+    /// @param predictedToken  CREATE2-predicted address of the tax token (not yet deployed).
+    /// @param launchVersion   Version discriminator: 6 = V6, 7 = V7 (see constants above).
+    /// @param launchParams    ABI-encoded launch params struct (version-specific).
+    /// @return dividendToken  The real dividend token address to use for this launch.
+    function resolveDividendToken(address predictedToken, uint8 launchVersion, bytes calldata launchParams)
+        external
+        view
+        returns (address dividendToken);
+}
+
 /// @title IVaultFactory
 /// @notice Interface that all vault factory contracts must implement
 /// @dev Each vault type must have a corresponding factory contract that implements this interface
