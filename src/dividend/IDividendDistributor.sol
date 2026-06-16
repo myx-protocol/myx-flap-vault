@@ -8,12 +8,11 @@ pragma solidity ^0.8.26;
 ///        — callers MUST check the return value.
 ///      - withdrawableDividends(address) is the per-holder claimable view.
 ///      - withdrawDividendsFor(address) claims a holder's dividend ON THEIR BEHALF, paying the
-///        dividendToken to that holder (the Lista proxy target — lets the vault expose a
-///        claimReward() convenience without holding the reward itself).
+///        dividendToken to that holder — lets the vault expose a claimReward() convenience
+///        without holding the reward itself.
 ///      - dividendToken() is the token deposit() pulls and distributes (parameterized, not
-///        hardcoded WBNB). v6 sets dividendToken == the myx base-pool LP (mBase) at launch via
-///        computeDividendToken, so deposit() distributes the LP the vault produced DIRECTLY —
-///        the reward asset IS the LP, no USDT, no swap.
+///        hardcoded WBNB). v6 sets it to the myx base-pool LP (mBase) at launch, so deposit()
+///        distributes the LP directly — the reward asset IS the LP, no swap.
 ///      - Holders may also claim via withdrawDividends() directly on the Dividend contract.
 interface IDividendDistributor {
     function deposit(uint256 amount) external returns (bool success);

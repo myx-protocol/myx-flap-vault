@@ -36,7 +36,7 @@ contract MyxVaultTestBase is Test {
         basePool = new MockBasePool(lpToken, usdt);
         poolManager = new MockPoolManager();
         // v6: the DIVIDEND ASSET is the myx base-pool LP (mBase), set at launch via
-        // computeDividendToken. Construct the dividend with dividendToken() == the LP token so the
+        // resolveDividendToken. Construct the dividend with dividendToken() == the LP token so the
         // vault's _feedDividend pulls exactly the LP the mock pool mints (dividendToken == LP invariant).
         dividend = new MockDividendDistributor(address(lpToken));
         taxToken = new MockTaxToken(address(dividend));
@@ -384,6 +384,26 @@ contract MyxVaultFeedDividendTest is MyxVaultTestBase {
         assertEq(vault.totalRewardsForwarded(), 1000 ether);
     }
 
+    function test_feedDividend_defersWhenDepositReverts() public {
+        _fund(1 ether);
+        dividend.setDepositReverts(true); // external Dividend.deposit THROWS, not just returns false
+        vm.expectEmit(true, true, true, true, address(vault));
+        emit DividendDeferred(1000 ether);
+        vault.process(); // must NOT revert: the buyback + LP mint must persist, feed degrades to deferral
+        assertEq(dividend.totalDeposited(), 0);
+        assertEq(lpToken.balanceOf(address(vault)), 1000 ether, "LP deferred in vault on deposit revert");
+        assertEq(vault.totalRewardsForwarded(), 0);
+        assertEq(vault.totalLpMinted(), 1000 ether, "buyback + LP mint must persist despite feed revert");
+
+        // recovery: once deposit stops reverting, a permissionless retry flushes the deferred LP
+        dividend.setDepositReverts(false);
+        vm.prank(makeAddr("stranger"));
+        vault.feedDividend();
+        assertEq(dividend.totalDeposited(), 1000 ether);
+        assertEq(lpToken.balanceOf(address(vault)), 0, "deferred LP flushed on retry");
+        assertEq(vault.totalRewardsForwarded(), 1000 ether);
+    }
+
     function test_feedDividend_defersOnNoDividendContract() public {
         _fund(1 ether);
         taxToken.setDividendContract(address(0)); // dividend not wired yet
@@ -432,7 +452,7 @@ contract MyxVaultFeedDividendTest is MyxVaultTestBase {
     }
 }
 
-/// @dev v6 claim proxy (Lista pattern): holders claim their mBase LP either directly on the
+/// @dev v6 claim proxy: holders claim their mBase LP either directly on the
 ///      dividend contract or via the vault's claimReward() convenience, which proxies to
 ///      withdrawDividendsFor(msg.sender). pendingReward proxies withdrawableDividends.
 contract MyxVaultClaimTest is MyxVaultTestBase {

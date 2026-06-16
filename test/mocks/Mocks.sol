@@ -64,19 +64,22 @@ contract MockPancakeRouter {
 }
 
 /// @dev v6: the configured dividendToken is the myx base-pool LP (mBase). deposit() pulls that LP
-///      via transferFrom; withdrawDividendsFor(user) claims a holder's pending LP on their behalf
-///      (Lista proxy target), transferring pendingOf[user] of the dividendToken to the user so
-///      claimReward()'s effect is assertable. deposit() returns false (not revert) when the
-///      depositSucceeds flag simulates the real contract's totalShares == 0 early window.
+///      via transferFrom; withdrawDividendsFor(user) claims a holder's pending LP on their behalf,
+///      transferring pendingOf[user] of the dividendToken to the user so claimReward()'s effect is
+///      assertable. deposit() simulates both real failure modes: returns false (depositSucceeds flag,
+///      the totalShares == 0 early window) or reverts (depositReverts flag, external state not ready).
 contract MockDividendDistributor {
     address public dividendToken;
     uint256 public totalDeposited;
     bool public depositSucceeds = true;
+    bool public depositReverts; // simulate the real contract THROWING (vs. gracefully returning false)
     mapping(address => uint256) public pendingOf;
     constructor(address _dividendToken) { dividendToken = _dividendToken; }
     function setDividendToken(address t) external { dividendToken = t; }
     function setDepositSucceeds(bool v) external { depositSucceeds = v; }
+    function setDepositReverts(bool v) external { depositReverts = v; }
     function deposit(uint256 amount) external returns (bool) {
+        if (depositReverts) revert("dividend deposit reverted");
         if (!depositSucceeds) return false; // mirrors real contract: false, not revert
         IERC20(dividendToken).transferFrom(msg.sender, address(this), amount);
         totalDeposited += amount;

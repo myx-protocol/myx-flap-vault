@@ -184,6 +184,90 @@ interface IVaultPortalTypes {
         bytes vaultData;
     }
 
+    // ─── Flap v2.3 Decode-safe Structs (enums as uint8) ─────────────────────
+    // NOTE — MUST-VERIFY before mainnet: the V6 struct field order was rebuilt from the contract ABI
+    // (enums as uint8); the V7 path + FeeConfig + the exact onBeforeLaunch v2.3 surface must be
+    // byte-checked against the official verified source
+    // (bscscan testnet 0x00b2BE45FF38613a0e2b05acb5FeB76473CE6183) before production.
+
+    /// @notice ABI-decode-safe mirror of NewTokenV6WithVaultParams for use inside resolveDividendToken.
+    /// @dev    All enum-typed fields are replaced with uint8.  The ABI layout is byte-identical to the
+    ///         original struct (Solidity enums encode as uint8), but using uint8 avoids the
+    ///         Solidity 0.8 revert-on-invalid-enum behaviour when the on-chain byte value is a new
+    ///         variant not present in this file's enum definition.
+    struct NewTokenV6WithVaultParamsU8 {
+        string name;
+        string symbol;
+        string meta;
+        uint8 dexThresh;        // IPortalTypes.DexThreshType
+        bytes32 salt;
+        uint8 migratorType;     // IPortalTypes.MigratorType
+        address quoteToken;
+        uint256 quoteAmt;
+        bytes permitData;
+        bytes32 extensionID;
+        bytes extensionData;
+        uint8 dexId;            // IPortalTypes.DEXId
+        uint8 lpFeeProfile;     // IPortalTypes.V3LPFeeProfile
+        uint16 buyTaxRate;
+        uint16 sellTaxRate;
+        uint64 taxDuration;
+        uint64 antiFarmerDuration;
+        uint16 mktBps;
+        uint16 deflationBps;
+        uint16 dividendBps;
+        uint16 lpBps;
+        uint256 minimumShareBalance;
+        address dividendToken;
+        address commissionReceiver;
+        uint8 tokenVersion;     // IPortalTypes.TokenVersion
+        address vaultFactory;
+        bytes vaultData;
+    }
+
+    // ─── Flap v2.3 V7 Fee Configuration (U8 = enums replaced with uint8) ───────
+    // feeType values: NONE=0, MARKETING_OR_VAULT=1, DIVIDEND=2, DEFLATION=3, LP_BPS=4
+
+    /// @notice ABI-decode-safe mirror of FeeConfig for use inside resolveDividendToken.
+    /// @dev    feeType is uint8 to avoid Solidity 0.8 revert-on-invalid-enum for new FeeType variants.
+    struct FeeConfigU8 {
+        uint8 feeType;              // IPortalTypes.FeeType: NONE=0 / MARKETING_OR_VAULT=1 / DIVIDEND=2 / DEFLATION=3 / LP_BPS=4
+        uint16 bps;
+        address marketingAddress;
+        address dividendToken;
+        uint256 minimumShareBalance;
+    }
+
+    /// @notice ABI-decode-safe mirror of NewTokenV7WithVaultParams (21 fields, enums as uint8).
+    /// @dev    VERIFIED (2026-06-15) against the official Flap v2.3 verified source — VaultPortal
+    ///         impl 0x00b2BE45FF38613a0e2b05acb5FeB76473CE6183. All 21 fields match exactly.
+    ///         All enum-typed fields are replaced with uint8.  The ABI layout is byte-identical.
+    ///         V7 has NO top-level dividendToken; the dividend config is the feeConfigs entry with
+    ///         feeType == DIVIDEND (2). The myx market quote travels in vaultData (same as V6).
+    struct NewTokenV7WithVaultParamsU8 {
+        string name;
+        string symbol;
+        string meta;
+        uint8 dexThresh;            // IPortalTypes.DexThreshType
+        bytes32 salt;
+        uint8 migratorType;         // IPortalTypes.MigratorType
+        address quoteToken;
+        uint256 quoteAmt;
+        bytes permitData;
+        bytes32 extensionID;
+        bytes extensionData;
+        uint8 tokenVersion;         // IPortalTypes.TokenVersion
+        uint8 dexId;                // IPortalTypes.DEXId
+        uint64 antiFarmerDuration;
+        uint16 buyTaxRate;
+        uint16 sellTaxRate;
+        uint64 taxDuration;
+        address commissionReceiver;
+        FeeConfigU8[4] feeConfigs;
+        address vaultFactory;
+        bytes vaultData;
+    }
+
     /* ========== EVENTS ========== */
 
     /// @notice Emitted when a new tax token with an associated vault is successfully created

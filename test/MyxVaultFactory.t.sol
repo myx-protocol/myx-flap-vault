@@ -4,8 +4,11 @@ pragma solidity ^0.8.26;
 import {Test} from "forge-std/Test.sol";
 import {MyxVaultFactory} from "../src/MyxVaultFactory.sol";
 import {MyxVault} from "../src/MyxVault.sol";
-import {MarketId, PoolId, MyxPoolId, MyxMarketId} from "../src/myx/IMyxPool.sol";
-import {IVaultFactoryValidationV2} from "../src/flap/IVaultFactory.sol";
+import {MarketId, PoolId, MyxPoolId, MyxMarketId, IMyxPoolFactory} from "../src/myx/IMyxPool.sol";
+import {IVaultFactoryValidationV2, DIVIDEND_TOKEN_LAUNCH_VERSION_V6, DIVIDEND_TOKEN_LAUNCH_VERSION_V7} from "../src/flap/IVaultFactory.sol";
+import {IVaultPortalTypes} from "../src/flap/IVaultPortal.sol";
+import {MAGIC_DIVIDEND_COMPUTED} from "../src/flap/IPortal.sol";
+import {FactoryPolicy} from "../src/flap/IVaultSchemasV1.sol";
 import "./mocks/Mocks.sol";
 
 contract MyxVaultFactoryTest is Test {
@@ -122,13 +125,53 @@ contract MyxVaultFactoryTest is Test {
         assertGt(bytes(reason).length, 0);
     }
 
-    function test_validateBeforeLaunch_acceptsBnbQuote() public view {
+    function test_validateBeforeLaunch_acceptsBnbQuoteWithMagicDividend() public view {
         IVaultFactoryValidationV2.LaunchValidationDataV1 memory data;
         data.quoteToken = address(0);
-        // v2.3: dividendToken is the MAGIC_DIVIDEND_COMPUTED sentinel at validation time and is no
-        // longer inspected here — only the BNB-quote constraint is enforced. A bare BNB quote passes.
+        data.dividendToken = MAGIC_DIVIDEND_COMPUTED; // v6 requires the computed sentinel
         (bool ok,) = factory.onBeforeLaunch(abi.encode(data));
         assertTrue(ok);
+    }
+
+    function test_validateBeforeLaunch_rejectsNonMagicDividendToken() public view {
+        // The guard that would have BLOCKED the mis-configured launch: any non-sentinel dividendToken
+        // (e.g. WBNB) is rejected on-chain, so the dividend can never be wired to the wrong token.
+        IVaultFactoryValidationV2.LaunchValidationDataV1 memory data;
+        data.quoteToken = address(0);
+        data.dividendToken = address(usdt); // not MAGIC
+        (bool ok, string memory reason) = factory.onBeforeLaunch(abi.encode(data));
+        assertFalse(ok);
+        assertGt(bytes(reason).length, 0);
+    }
+
+    function test_validateBeforeLaunch_rejectsZeroDividendToken() public view {
+        // Even address(0) (no dividend) is rejected — this factory only makes sense with myx-LP dividends.
+        IVaultFactoryValidationV2.LaunchValidationDataV1 memory data;
+        data.quoteToken = address(0); // data.dividendToken defaults to address(0)
+        (bool ok,) = factory.onBeforeLaunch(abi.encode(data));
+        assertFalse(ok);
+    }
+
+    function test_validateBeforeLaunch_rejectsNonZeroDividendBps() public view {
+        // v6 requires Flap's native dividend dispatch OFF (dividendBps == 0); the vault feeds the LP itself.
+        IVaultFactoryValidationV2.LaunchValidationDataV1 memory data;
+        data.quoteToken = address(0);
+        data.dividendToken = MAGIC_DIVIDEND_COMPUTED;
+        data.dividendBps = 100; // non-zero
+        (bool ok,) = factory.onBeforeLaunch(abi.encode(data));
+        assertFalse(ok);
+    }
+
+    function test_tokenCreationPolicies_declaresConstraints() public view {
+        FactoryPolicy[] memory policies = factory.tokenCreationPolicies();
+        assertEq(policies.length, 3);
+        assertEq(policies[0].target, "dividendToken");
+        assertEq(policies[0].operator, "eq");
+        assertEq(abi.decode(policies[0].value, (address)), MAGIC_DIVIDEND_COMPUTED);
+        assertEq(policies[1].target, "quoteToken");
+        assertEq(abi.decode(policies[1].value, (address)), address(0));
+        assertEq(policies[2].target, "dividendBps");
+        assertEq(abi.decode(policies[2].value, (uint256)), 0);
     }
 
     function test_upgradeOnlyGuardian() public {
@@ -144,22 +187,45 @@ contract MyxVaultFactoryTest is Test {
         assertEq(factory.factorySpecVersion(), "v2.3");
     }
 
-    // ── Flap Spec v2.3 computeDividendToken callback ───────────────────────────
-    // hint ABI (ASSUMED, Flap-v2.3 coordination point): abi.encode(address quoteToken, string symbol).
+    // ── Flap Spec v2.3 resolveDividendToken callback ──────────────────────────
 
-    function test_computeDividendToken_returnsPredictedLp() public {
-        address predictedToken = makeAddr("predictedTaxToken");
-        address someLpAddr = makeAddr("mBaseLp");
-        // marketId is keyed off the launch quoteToken (usdt) + chainid; the LP predictor is keyed
-        // off (marketId, predictedToken, symbol). Register the byte-exact LP the predictor returns.
-        MarketId mid = MyxMarketId.derive(uint64(block.chainid), address(usdt));
-        poolFactory.setPrediction(mid, predictedToken, "TAA", someLpAddr);
-
-        bytes memory hint = abi.encode(address(usdt), "TAA");
-        assertEq(factory.computeDividendToken(predictedToken, hint), someLpAddr);
+    /// @dev Build a minimal V6WithVault params struct for resolveDividendToken tests.
+    ///      All fields not relevant to the factory's resolution logic are left zero/empty.
+    function _v6Params(address marketQuote, string memory symbol, address dividendToken)
+        internal
+        pure
+        returns (bytes memory)
+    {
+        IVaultPortalTypes.NewTokenV6WithVaultParamsU8 memory p;
+        p.symbol = symbol;
+        // Flap bonding quote is native BNB (address(0)); the myx MARKET quote token travels in
+        // vaultData — the same source newVault decodes — so the predicted LP and the vault's pool
+        // share the same myx market.
+        p.quoteToken = address(0);
+        p.vaultData = abi.encode(marketQuote);
+        p.dividendToken = dividendToken;
+        return abi.encode(p);
     }
 
-    function test_computeDividendToken_marketIdFromQuoteToken() public {
+    function test_resolveDividendToken_v6_returnsPredictedLp() public {
+        address predictedToken = makeAddr("predictedTaxToken");
+        address someLpAddr = makeAddr("mBaseLp");
+        // marketId is keyed off the launch quoteToken (usdt) + chainid; LP predictor keyed off
+        // (marketId, predictedToken, symbol).
+        MarketId mid = MyxMarketId.derive(uint64(block.chainid), address(usdt));
+        poolFactory.setPrediction(mid, predictedToken, "DEMO", someLpAddr);
+
+        bytes memory launchParams = _v6Params(address(usdt), "DEMO", MAGIC_DIVIDEND_COMPUTED);
+        address resolved = factory.resolveDividendToken(predictedToken, DIVIDEND_TOKEN_LAUNCH_VERSION_V6, launchParams);
+        assertEq(resolved, someLpAddr);
+        // Assert result matches direct poolFactory call — confirms the delegation is correct.
+        assertEq(
+            resolved,
+            IMyxPoolFactory(address(poolFactory)).predictBasePoolToken(mid, predictedToken, "DEMO")
+        );
+    }
+
+    function test_resolveDividendToken_v6_marketIdFromQuoteToken() public {
         address predictedToken = makeAddr("predictedTaxToken");
         address lpForUsdtMarket = makeAddr("lpUsdtMarket");
         address lpForUsdcMarket = makeAddr("lpUsdcMarket");
@@ -167,11 +233,118 @@ contract MyxVaultFactoryTest is Test {
         MarketId usdtMarket = MyxMarketId.derive(uint64(block.chainid), address(usdt));
         MarketId usdcMarket = MyxMarketId.derive(uint64(block.chainid), address(usdc));
         // Same predictedToken + symbol, different quoteToken → distinct markets → distinct LPs.
-        poolFactory.setPrediction(usdtMarket, predictedToken, "TAA", lpForUsdtMarket);
-        poolFactory.setPrediction(usdcMarket, predictedToken, "TAA", lpForUsdcMarket);
+        poolFactory.setPrediction(usdtMarket, predictedToken, "DEMO", lpForUsdtMarket);
+        poolFactory.setPrediction(usdcMarket, predictedToken, "DEMO", lpForUsdcMarket);
 
-        assertEq(factory.computeDividendToken(predictedToken, abi.encode(address(usdt), "TAA")), lpForUsdtMarket);
-        assertEq(factory.computeDividendToken(predictedToken, abi.encode(address(usdc), "TAA")), lpForUsdcMarket);
+        assertEq(
+            factory.resolveDividendToken(predictedToken, DIVIDEND_TOKEN_LAUNCH_VERSION_V6,
+                _v6Params(address(usdt), "DEMO", MAGIC_DIVIDEND_COMPUTED)),
+            lpForUsdtMarket
+        );
+        assertEq(
+            factory.resolveDividendToken(predictedToken, DIVIDEND_TOKEN_LAUNCH_VERSION_V6,
+                _v6Params(address(usdc), "DEMO", MAGIC_DIVIDEND_COMPUTED)),
+            lpForUsdcMarket
+        );
+    }
+
+    function test_resolveDividendToken_v6_rejectsNonMagicDividendToken() public {
+        // If V6 params carry a non-MAGIC dividendToken, factory must revert.
+        address predictedToken = makeAddr("predictedTaxToken");
+        bytes memory launchParams = _v6Params(address(usdt), "DEMO", address(usdt));
+        vm.expectRevert(bytes("expected V6 magic dividend"));
+        factory.resolveDividendToken(predictedToken, DIVIDEND_TOKEN_LAUNCH_VERSION_V6, launchParams);
+    }
+
+    /// @dev Build a minimal V7WithVault params struct for resolveDividendToken tests.
+    ///      ONE feeConfig entry has feeType=DIVIDEND(2) with the given dividendInFee;
+    ///      the other three entries have feeType=NONE(0).
+    function _v7Params(address marketQuote, string memory symbol, address dividendInFee)
+        internal
+        pure
+        returns (bytes memory)
+    {
+        IVaultPortalTypes.NewTokenV7WithVaultParamsU8 memory p;
+        p.symbol = symbol;
+        p.quoteToken = address(0); // Flap bonding quote is native BNB
+        p.vaultData = abi.encode(marketQuote);
+        // feeConfigs[0] carries the DIVIDEND slot
+        p.feeConfigs[0].feeType = 2; // DIVIDEND
+        p.feeConfigs[0].dividendToken = dividendInFee;
+        // feeConfigs[1..3] default to feeType=0 (NONE)
+        return abi.encode(p);
+    }
+
+    function test_resolveDividendToken_v7_returnsPredictedLp() public {
+        address predictedToken = makeAddr("predictedTaxTokenV7");
+        address someLpAddr = makeAddr("mBaseLpV7");
+        MarketId mid = MyxMarketId.derive(uint64(block.chainid), address(usdt));
+        poolFactory.setPrediction(mid, predictedToken, "DEMO", someLpAddr);
+
+        bytes memory launchParams = _v7Params(address(usdt), "DEMO", MAGIC_DIVIDEND_COMPUTED);
+        address resolved = factory.resolveDividendToken(predictedToken, DIVIDEND_TOKEN_LAUNCH_VERSION_V7, launchParams);
+        assertEq(resolved, someLpAddr);
+        assertEq(
+            resolved,
+            IMyxPoolFactory(address(poolFactory)).predictBasePoolToken(mid, predictedToken, "DEMO")
+        );
+    }
+
+    function test_resolveDividendToken_v7_rejectsNonMagicDividendToken() public {
+        address predictedToken = makeAddr("predictedTaxTokenV7");
+        // DIVIDEND feeConfig with wrong dividendToken (not the magic sentinel)
+        bytes memory launchParams = _v7Params(address(usdt), "DEMO", address(usdt));
+        vm.expectRevert(bytes("expected V7 magic dividend"));
+        factory.resolveDividendToken(predictedToken, DIVIDEND_TOKEN_LAUNCH_VERSION_V7, launchParams);
+    }
+
+    function test_resolveDividendToken_v7_rejectsNoDividendFeeConfig() public {
+        // All feeConfigs have feeType=NONE (0) — no DIVIDEND entry present
+        address predictedToken = makeAddr("predictedTaxTokenV7");
+        IVaultPortalTypes.NewTokenV7WithVaultParamsU8 memory p;
+        p.symbol = "DEMO";
+        p.quoteToken = address(0);
+        p.vaultData = abi.encode(address(usdt));
+        // All feeConfigs stay feeType=0 (NONE) — no DIVIDEND entry
+        bytes memory launchParams = abi.encode(p);
+        vm.expectRevert(bytes("no V7 dividend feeConfig"));
+        factory.resolveDividendToken(predictedToken, DIVIDEND_TOKEN_LAUNCH_VERSION_V7, launchParams);
+    }
+
+    function test_resolveDividendToken_unknownVersion_reverts() public {
+        // Any version other than 6 or 7 must revert.
+        address predictedToken = makeAddr("predictedTaxToken");
+        vm.expectRevert(bytes("unsupported launchVersion"));
+        factory.resolveDividendToken(predictedToken, 99, "");
+    }
+
+    function test_resolveDividendToken_isStaticallySafe() public {
+        // Verify the function can be called via staticcall (i.e. it is `view`).
+        // We use a low-level staticcall from this test contract to confirm no state mutation.
+        address predictedToken = makeAddr("predictedTaxToken");
+        address someLp = makeAddr("lp");
+        MarketId mid = MyxMarketId.derive(uint64(block.chainid), address(usdt));
+        poolFactory.setPrediction(mid, predictedToken, "DEMO", someLp);
+
+        bytes memory callData = abi.encodeWithSignature(
+            "resolveDividendToken(address,uint8,bytes)",
+            predictedToken,
+            DIVIDEND_TOKEN_LAUNCH_VERSION_V6,
+            _v6Params(address(usdt), "DEMO", MAGIC_DIVIDEND_COMPUTED)
+        );
+        (bool ok, bytes memory ret) = address(factory).staticcall(callData);
+        assertTrue(ok, "staticcall failed");
+        address result = abi.decode(ret, (address));
+        assertEq(result, someLp);
+    }
+
+    function test_validateBeforeLaunch_permitsMagicDividendToken() public view {
+        // v2.3: dividendToken = MAGIC_DIVIDEND_COMPUTED must be permitted by _validateBeforeLaunch.
+        IVaultFactoryValidationV2.LaunchValidationDataV1 memory data;
+        data.quoteToken = address(0); // BNB
+        data.dividendToken = MAGIC_DIVIDEND_COMPUTED;
+        (bool ok,) = factory.onBeforeLaunch(abi.encode(data));
+        assertTrue(ok);
     }
 
     function test_lockVaultUpgrades_blocksFurtherUpgrades() public {

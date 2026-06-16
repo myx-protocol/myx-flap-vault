@@ -66,9 +66,9 @@ contract MyxVaultForkTest is FlapBSCFixture {
         poolFactory = new MockMyxPoolFactory();
 
         // Deploy OUR factory: MYX side pointed at the mocks.
-        // TODO(v6): rework the dividend assertions for the v2.3 computeDividendToken path — the
+        // TODO(v6): rework the dividend assertions for the v2.3 resolveDividendToken path — the
         // launched token will carry MAGIC_DIVIDEND_COMPUTED and the dividend token is the myx mBase
-        // LP resolved via factory.computeDividendToken(predicted, hint), not BSC_USDT. This fork
+        // LP resolved via factory.resolveDividendToken(predicted, launchVersion, launchParams), not BSC_USDT. This fork
         // test proves only the permissionless buyback + deposit leg; the dividend-feed leg against a
         // real wired LP dividend stays unit-tested. The poolFactory mock here is wired only so the
         // constructor config is well-formed.

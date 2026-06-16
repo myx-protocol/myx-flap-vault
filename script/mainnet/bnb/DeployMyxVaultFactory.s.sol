@@ -19,10 +19,10 @@ contract DeployMyxVaultFactory is Script {
                 poolManager: vm.envAddress("MYX_POOL_MANAGER"),
                 basePool: vm.envAddress("MYX_BASE_POOL"),
                 // myx PoolFactory: authoritative basePoolToken (mBase LP) predictor used by the
-                // v2.3 computeDividendToken callback. Env-driven (MYX not yet live on BSC mainnet).
+                // v2.3 resolveDividendToken callback. Env-driven (MYX not yet live on BSC mainnet).
                 poolFactory: vm.envAddress("MYX_POOL_FACTORY"),
                 maxSlippageBps: 300,
-                minProcessAmount: 0.1 ether
+                minProcessAmount: 1
             })
         );
         console2.log("MyxVaultFactory:", address(factory));
