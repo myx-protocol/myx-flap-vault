@@ -12,7 +12,7 @@ import {MarketId, PoolId, MyxPoolId, MyxMarketId, PoolMetadata, IMyxPoolManager,
 import {IDividendDistributor} from "./dividend/IDividendDistributor.sol";
 import {IFlapTaxTokenV3} from "./flap/IFlapTaxTokenV3.sol";
 import {IPortalTradeV2} from "./flap/IPortal.sol";
-import {Strings} from "@openzeppelin/utils/Strings.sol";
+import {Decimal18} from "./lib/Decimal18.sol";
 
 /// @title MyxVault
 /// @notice Flap vault that buys back the tax token with tax revenue via the Flap Portal, deposits
@@ -297,11 +297,11 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
     function description() public view override returns (string memory) {
         return string.concat(
             unicode"MYX liquidity vault / MYX 流動性金庫: ",
-            Strings.toString(totalLpMinted),
+            Decimal18.toString(totalLpMinted),
             unicode" LP minted / LP 已鑄造, ",
-            Strings.toString(totalRewardsForwarded),
+            Decimal18.toString(totalRewardsForwarded),
             unicode" LP distributed / LP 已分發, pending BNB / 待處理 BNB: ",
-            Strings.toString(pendingBnb),
+            Decimal18.toString(pendingBnb),
             "."
         );
     }
