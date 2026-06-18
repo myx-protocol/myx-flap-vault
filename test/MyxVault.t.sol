@@ -92,7 +92,7 @@ contract MyxVaultInitTest is MyxVaultTestBase {
         p.marketQuoteToken = address(0);
         MyxVault impl = new MyxVault();
         bytes memory initData = abi.encodeCall(MyxVault.initialize, (p));
-        vm.expectRevert(MyxVault.ZeroMarketQuoteToken.selector);
+        vm.expectRevert(bytes(unicode"Zero market quote token / 市場報價幣為零地址"));
         new ERC1967Proxy(address(impl), initData);
     }
 
@@ -149,14 +149,14 @@ contract MyxVaultGuardianTest is MyxVaultTestBase {
     function test_revokeGuardianRole_reverts() public {
         bytes32 role = vault.EMERGENCY_ROLE();
         vm.prank(GUARDIAN); // even the admin itself cannot revoke the guardian
-        vm.expectRevert(MyxVault.CannotRevokeGuardianRole.selector);
+        vm.expectRevert(bytes(unicode"Guardian role cannot be revoked / 守護者角色不可撤銷"));
         vault.revokeRole(role, GUARDIAN);
     }
 
     function test_revokeGuardianAdminRole_reverts() public {
         bytes32 role = vault.DEFAULT_ADMIN_ROLE();
         vm.prank(GUARDIAN);
-        vm.expectRevert(MyxVault.CannotRevokeGuardianRole.selector);
+        vm.expectRevert(bytes(unicode"Guardian role cannot be revoked / 守護者角色不可撤銷"));
         vault.revokeRole(role, GUARDIAN);
     }
 
@@ -230,9 +230,7 @@ contract MyxVaultProcessTest is MyxVaultTestBase {
 
     function test_process_belowMinimum_reverts() public {
         _fund(0.05 ether); // below 0.1 ether minProcessAmount
-        vm.expectRevert(
-            abi.encodeWithSelector(MyxVault.BelowMinimumProcessAmount.selector, 0.05 ether, 0.1 ether)
-        );
+        vm.expectRevert(bytes(unicode"Pending below minimum / 待處理金額低於下限"));
         vault.process();
     }
 
@@ -240,7 +238,7 @@ contract MyxVaultProcessTest is MyxVaultTestBase {
         _fund(1 ether);
         vault.process(); // succeeds, pendingBnb -> 0
         uint256 minAmt = vault.minProcessAmount();
-        vm.expectRevert(abi.encodeWithSelector(MyxVault.BelowMinimumProcessAmount.selector, 0, minAmt));
+        vm.expectRevert(bytes(unicode"Pending below minimum / 待處理金額低於下限"));
         vault.process();
     }
 
@@ -257,7 +255,7 @@ contract MyxVaultProcessTest is MyxVaultTestBase {
     function test_process_zeroQuote_reverts() public {
         portal.setRate(0, 1); // Portal quotes zero output
         _fund(1 ether);
-        vm.expectRevert(MyxVault.ZeroQuote.selector);
+        vm.expectRevert(bytes(unicode"Buyback quote is zero / 回購報價為零"));
         vault.process();
         assertEq(vault.pendingBnb(), 1 ether); // retained for retry
     }
@@ -475,7 +473,7 @@ contract MyxVaultClaimTest is MyxVaultTestBase {
     function test_claimReward_revertsWhenNoDividendContract() public {
         taxToken.setDividendContract(address(0));
         vm.prank(makeAddr("alice"));
-        vm.expectRevert(MyxVault.ZeroDividendContract.selector);
+        vm.expectRevert(bytes(unicode"Dividend contract not set / 分紅合約未設置"));
         vault.claimReward();
     }
 
@@ -559,10 +557,10 @@ contract MyxVaultEmergencyTest is MyxVaultTestBase {
 
     function test_emergencyRescueToken_zeroAddressReverts() public {
         vm.prank(GUARDIAN);
-        vm.expectRevert("Zero address");
+        vm.expectRevert(bytes(unicode"Zero address / 零地址"));
         vault.emergencyRescueToken(address(lpToken), address(0));
         vm.prank(GUARDIAN);
-        vm.expectRevert("Zero address");
+        vm.expectRevert(bytes(unicode"Zero address / 零地址"));
         vault.emergencyRescueToken(address(0), makeAddr("rescue"));
     }
 }

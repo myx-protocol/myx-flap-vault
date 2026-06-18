@@ -2,16 +2,18 @@
 
 MYX integration vault for the [Flap](https://docs.flap.sh) launchpad on BNB Chain.
 
-Implements a custom `Vault + VaultFactory` pair following the Flap `VaultBaseV2` / `VaultFactoryBaseV2` specification. Tax revenue (native BNB, `mktBps` share) collected from Flap tax tokens is converted into the configured base asset and deposited as base liquidity into the MYX perpetual protocol. The vault holds the LP tokens; LP rewards are periodically harvested and routed back to token holders pro-rata via the token's native Dividend contract.
+Implements a custom `Vault + VaultFactory` pair following the Flap `VaultBaseV2` / `VaultFactoryBaseV2` specification. Tax revenue (native BNB, `mktBps` share) collected from Flap tax tokens is used to buy back the tax token via the Flap Portal and deposit it as base liquidity into the MYX protocol. The resulting MYX base-pool LP (mBase) is itself distributed to holders pro-rata via the token's native Dividend contract — **the LP IS the dividend asset** (no swap, no intermediate WBNB).
 
 ## Architecture
 
 ```
-Flap tax token ──tax(mktBps)──▶ dispatch() ──BNB──▶ MyxVault.receive()   (accounting only)
-        [anyone] processRevenue(): BNB → wrap/swap → base token
-                 → deployPool if missing → BasePool.deposit (LP held by vault)
-        [anyone] harvest(): claim LP rebates → swap → WBNB → Dividend contract
-        [guardian] emergencyWithdraw(): rescue path
+Flap tax token ──tax(mktBps)──▶ dispatch() ──BNB──▶ MyxVault.receive()
+        receive(): accounting + best-effort schedule a delayed process() via FlapTriggerService
+        [anyone / trigger] process(): BNB → buy back the tax token via the Flap Portal
+                 → deployPool if missing → BasePool.deposit (mBase LP minted to vault)
+                 → _feedDividend(): deposit the mBase LP ITSELF into the Dividend contract
+                   (the LP is the dividend asset — no swap, no WBNB)
+        [guardian] emergencyWithdraw / emergencySweepBnb / emergencyRescueToken: rescue paths
 ```
 
 See [docs/flap-vault-integration-design.md](docs/flap-vault-integration-design.md) for the full design, verified constraints, and the phased development plan.
