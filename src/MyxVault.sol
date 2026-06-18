@@ -53,15 +53,6 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
     /// @notice Delay between a tax receipt and the auto-scheduled process() (seconds).
     uint64 public constant PROCESS_DELAY = 60;
 
-    error CannotRevokeGuardianRole();
-    error ZeroMarketQuoteToken();
-    error BelowMinimumProcessAmount(uint256 pending, uint256 minimum);
-    error ZeroQuote();
-    error ZeroDividendContract();
-    error TriggerServiceNotConfigured();
-    error OnlySelf();
-    error OnlyTriggerService();
-
     event RevenueReceived(uint256 amount, uint256 pendingTotal);
     event RevenueProcessed(uint256 bnbAmount, uint256 baseAmount, uint256 lpMinted);
     event PoolDeployed(PoolId poolId);
@@ -121,7 +112,7 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
         // Derive the myx marketId on-chain (keccak256(chainId, quoteToken), equivalent to myx
         // MarketIdLib.toId), then the base pool key. This makes the dividendToken == pool-quote ==
         // reward invariant automatic — no opaque id, no myx query, no hardcoding.
-        if (p.marketQuoteToken == address(0)) revert ZeroMarketQuoteToken();
+        require(p.marketQuoteToken != address(0), unicode"Zero market quote token / 市場報價幣為零地址");
         marketQuoteToken = p.marketQuoteToken;
         marketId = MyxMarketId.derive(uint64(block.chainid), p.marketQuoteToken);
         poolId = MyxPoolId.derive(marketId, p.taxToken);
@@ -154,13 +145,13 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
     ///         try/catch. The fee is paid from tax revenue: pendingBnb is debited ONLY on a successful
     ///         schedule, preserving the (vault BNB balance == pendingBnb) invariant.
     function scheduleProcess() external {
-        if (msg.sender != address(this)) revert OnlySelf();
+        require(msg.sender == address(this), unicode"Caller must be the vault itself / 僅限金庫自身調用");
         IFlapTriggerService service = IFlapTriggerService(_getTriggerService());
         uint256 fee = service.getFee();
         // Decide on ACCUMULATED pendingBnb (not a single receipt): it must cover the fee AND still
         // leave >= minProcessAmount so the scheduled process() can actually run — no wasted fee, and
         // pendingBnb -= fee can never underflow.
-        require(pendingBnb >= minProcessAmount + fee, "pending below min + fee");
+        require(pendingBnb >= minProcessAmount + fee, unicode"Pending below minimum plus fee / 待處理低於下限加手續費");
         uint64 executeAfter = uint64(block.timestamp) + PROCESS_DELAY;
         uint256 id = service.requestTrigger{value: fee}(executeAfter);
         pendingTriggerId = id;
@@ -174,7 +165,7 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
     ///         minimum by a permissionless process()) cannot deadlock scheduling — the next tax
     ///         receipt re-schedules. Stale/unknown request ids are ignored.
     function trigger(uint256 requestId) external {
-        if (msg.sender != _getTriggerService()) revert OnlyTriggerService();
+        require(msg.sender == _getTriggerService(), unicode"Caller must be the trigger service / 僅限觸發服務調用");
         if (!hasPendingTrigger || requestId != pendingTriggerId) return;
         hasPendingTrigger = false;
         pendingTriggerId = 0;
@@ -192,12 +183,12 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
     function _getTriggerService() internal view returns (address) {
         if (block.chainid == 56) return 0xcf4EE25035CF883895110f367F5BA8172416a7F9;
         else if (block.chainid == 97) return 0x560E9830926C9e0EB98a59c6b9902383Fc0D9Eb2;
-        revert TriggerServiceNotConfigured();
+        revert(unicode"Trigger service not configured / 觸發服務未配置");
     }
 
     /// @dev Flap mandate: the Guardian role must not be revocable by anyone else.
     function revokeRole(bytes32 role, address account) public override onlyRole(getRoleAdmin(role)) {
-        if (account == _getGuardian()) revert CannotRevokeGuardianRole();
+        require(account != _getGuardian(), unicode"Guardian role cannot be revoked / 守護者角色不可撤銷");
         super.revokeRole(role, account);
     }
 
@@ -209,7 +200,7 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
     ///      Consumes ALL pendingBnb; the LP IS the reward (v6 model).
     function process() external nonReentrant {
         uint256 amount = pendingBnb;
-        if (amount < minProcessAmount) revert BelowMinimumProcessAmount(amount, minProcessAmount);
+        require(amount >= minProcessAmount, unicode"Pending below minimum / 待處理金額低於下限");
         pendingBnb = 0;
 
         uint256 received = _buyTaxToken(amount);
@@ -282,7 +273,7 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
     ///         withdrawDividends() directly on the Dividend contract.
     function claimReward() external nonReentrant {
         address div = IFlapTaxTokenV3(taxToken).dividendContract();
-        if (div == address(0)) revert ZeroDividendContract();
+        require(div != address(0), unicode"Dividend contract not set / 分紅合約未設置");
         IDividendDistributor(div).withdrawDividendsFor(msg.sender);
     }
 
@@ -309,7 +300,7 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
         uint256 amount = address(this).balance;
         pendingBnb = 0;
         (bool ok,) = to.call{value: amount}("");
-        require(ok, "BNB_SWEEP_FAILED");
+        require(ok, unicode"BNB sweep failed / BNB 清退失敗");
         emit EmergencySwept(amount, to);
     }
 
@@ -318,7 +309,7 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
     ///         or totalShares == 0 indefinitely) and residual tax tokens from a failed buyback —
     ///         covering cases where emergencyWithdraw is unusable (myx pool withdraw path broken).
     function emergencyRescueToken(address token, address to) external nonReentrant onlyRole(EMERGENCY_ROLE) {
-        require(token != address(0) && to != address(0), "Zero address");
+        require(token != address(0) && to != address(0), unicode"Zero address / 零地址");
         uint256 bal = IERC20(token).balanceOf(address(this));
         if (bal > 0) {
             IERC20(token).safeTransfer(to, bal);
@@ -339,7 +330,7 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
                 inputAmount: bnbAmount
             })
         );
-        if (quoted == 0) revert ZeroQuote();
+        require(quoted != 0, unicode"Buyback quote is zero / 回購報價為零");
         uint256 minOut = (quoted * (BPS_DENOMINATOR - maxSlippageBps)) / BPS_DENOMINATOR;
 
         uint256 balanceBefore = IERC20(taxToken).balanceOf(address(this));

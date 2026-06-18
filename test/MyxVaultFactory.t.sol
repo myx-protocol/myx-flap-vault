@@ -108,7 +108,7 @@ contract MyxVaultFactoryTest is Test {
         // A launcher passing abi.encode(address(0)) as vaultData must be rejected by the vault's
         // initializer (ZeroMarketQuoteToken), bubbling up through the factory's BeaconProxy deploy.
         vm.prank(VAULT_PORTAL);
-        vm.expectRevert(MyxVault.ZeroMarketQuoteToken.selector);
+        vm.expectRevert(bytes(unicode"Zero market quote token / 市場報價幣為零地址"));
         factory.newVault(makeAddr("tax"), address(0), makeAddr("creator"), abi.encode(address(0)));
     }
 
@@ -252,7 +252,7 @@ contract MyxVaultFactoryTest is Test {
         // If V6 params carry a non-MAGIC dividendToken, factory must revert.
         address predictedToken = makeAddr("predictedTaxToken");
         bytes memory launchParams = _v6Params(address(usdt), "DEMO", address(usdt));
-        vm.expectRevert(bytes("expected V6 magic dividend"));
+        vm.expectRevert(bytes(unicode"Expected V6 MAGIC dividend token / 預期 V6 MAGIC 分紅幣"));
         factory.resolveDividendToken(predictedToken, DIVIDEND_TOKEN_LAUNCH_VERSION_V6, launchParams);
     }
 
@@ -294,7 +294,7 @@ contract MyxVaultFactoryTest is Test {
         address predictedToken = makeAddr("predictedTaxTokenV7");
         // DIVIDEND feeConfig with wrong dividendToken (not the magic sentinel)
         bytes memory launchParams = _v7Params(address(usdt), "DEMO", address(usdt));
-        vm.expectRevert(bytes("expected V7 magic dividend"));
+        vm.expectRevert(bytes(unicode"Expected V7 MAGIC dividend token / 預期 V7 MAGIC 分紅幣"));
         factory.resolveDividendToken(predictedToken, DIVIDEND_TOKEN_LAUNCH_VERSION_V7, launchParams);
     }
 
@@ -307,14 +307,14 @@ contract MyxVaultFactoryTest is Test {
         p.vaultData = abi.encode(address(usdt));
         // All feeConfigs stay feeType=0 (NONE) — no DIVIDEND entry
         bytes memory launchParams = abi.encode(p);
-        vm.expectRevert(bytes("no V7 dividend feeConfig"));
+        vm.expectRevert(bytes(unicode"No V7 dividend feeConfig / 無 V7 分紅費用配置"));
         factory.resolveDividendToken(predictedToken, DIVIDEND_TOKEN_LAUNCH_VERSION_V7, launchParams);
     }
 
     function test_resolveDividendToken_unknownVersion_reverts() public {
         // Any version other than 6 or 7 must revert.
         address predictedToken = makeAddr("predictedTaxToken");
-        vm.expectRevert(bytes("unsupported launchVersion"));
+        vm.expectRevert(bytes(unicode"Unsupported launch version / 不支援的發行版本"));
         factory.resolveDividendToken(predictedToken, 99, "");
     }
 
@@ -352,7 +352,7 @@ contract MyxVaultFactoryTest is Test {
         vm.prank(GUARDIAN);
         factory.lockVaultUpgrades();
         vm.prank(GUARDIAN);
-        vm.expectRevert(MyxVaultFactory.UpgradesLocked.selector);
+        vm.expectRevert(bytes(unicode"Upgrades are locked / 升級已鎖定"));
         factory.upgradeVaultImplementation(newImpl);
     }
 

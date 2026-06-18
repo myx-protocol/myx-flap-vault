@@ -40,10 +40,6 @@ contract MyxVaultFactory is VaultFactoryBaseV2, IVaultFactoryDividendV23 {
     /// @notice FeeType.DIVIDEND == 2; identifies the dividend fee slot in V7 feeConfigs.
     uint8 internal constant FEE_TYPE_DIVIDEND = 2;
 
-    error UnsupportedQuoteToken();
-    error OnlyGuardian();
-    error UpgradesLocked();
-
     event VaultCreated(
         address indexed vault, address indexed taxToken, address indexed creator, address marketQuoteToken
     );
@@ -60,7 +56,7 @@ contract MyxVaultFactory is VaultFactoryBaseV2, IVaultFactoryDividendV23 {
     }
 
     modifier onlyGuardian() {
-        if (msg.sender != _getGuardian()) revert OnlyGuardian();
+        require(msg.sender == _getGuardian(), unicode"Caller must be the guardian / 僅限守護者調用");
         _;
     }
 
@@ -70,8 +66,8 @@ contract MyxVaultFactory is VaultFactoryBaseV2, IVaultFactoryDividendV23 {
         override
         returns (address vault)
     {
-        if (msg.sender != _getVaultPortal()) revert OnlyVaultPortal();
-        if (quoteToken != address(0)) revert UnsupportedQuoteToken();
+        require(msg.sender == _getVaultPortal(), unicode"Caller must be the vault portal / 僅限 VaultPortal 調用");
+        require(quoteToken == address(0), unicode"Unsupported quote token / 不支援的報價幣");
 
         // vaultData carries the myx MARKET quote token (the token's dividendToken). The vault derives
         // the myx marketId from it on-chain (keccak256(chainId, quoteToken)); zero is rejected there.
@@ -128,7 +124,7 @@ contract MyxVaultFactory is VaultFactoryBaseV2, IVaultFactoryDividendV23 {
         if (launchVersion == DIVIDEND_TOKEN_LAUNCH_VERSION_V6) {
             IVaultPortalTypes.NewTokenV6WithVaultParamsU8 memory params =
                 abi.decode(launchParams, (IVaultPortalTypes.NewTokenV6WithVaultParamsU8));
-            require(params.dividendToken == MAGIC_DIVIDEND_COMPUTED, "expected V6 magic dividend");
+            require(params.dividendToken == MAGIC_DIVIDEND_COMPUTED, unicode"Expected V6 MAGIC dividend token / 預期 V6 MAGIC 分紅幣");
             // The myx MARKET quote token travels in vaultData — NOT params.quoteToken (Flap bonding
             // quote = native BNB). MUST match newVault's marketQuoteToken source so the predicted LP
             // and the vault's actual myx pool share the same market — fund-critical.
@@ -146,13 +142,13 @@ contract MyxVaultFactory is VaultFactoryBaseV2, IVaultFactoryDividendV23 {
                 if (params.feeConfigs[i].feeType == FEE_TYPE_DIVIDEND) {
                     require(
                         params.feeConfigs[i].dividendToken == MAGIC_DIVIDEND_COMPUTED,
-                        "expected V7 magic dividend"
+                        unicode"Expected V7 MAGIC dividend token / 預期 V7 MAGIC 分紅幣"
                     );
                     found = true;
                     break;
                 }
             }
-            require(found, "no V7 dividend feeConfig");
+            require(found, unicode"No V7 dividend feeConfig / 無 V7 分紅費用配置");
             // Same source as V6 and newVault: myx MARKET quote in vaultData, NOT params.quoteToken.
             address marketQuote = abi.decode(params.vaultData, (address));
             MarketId marketId = MyxMarketId.derive(uint64(block.chainid), marketQuote);
@@ -160,7 +156,7 @@ contract MyxVaultFactory is VaultFactoryBaseV2, IVaultFactoryDividendV23 {
                 marketId, predictedToken, params.symbol
             );
         } else {
-            revert("unsupported launchVersion");
+            revert(unicode"Unsupported launch version / 不支援的發行版本");
         }
     }
 
@@ -233,7 +229,7 @@ contract MyxVaultFactory is VaultFactoryBaseV2, IVaultFactoryDividendV23 {
     }
 
     function upgradeVaultImplementation(address newImplementation) external onlyGuardian {
-        if (upgradesLocked) revert UpgradesLocked();
+        require(!upgradesLocked, unicode"Upgrades are locked / 升級已鎖定");
         beacon.upgradeTo(newImplementation);
         emit VaultImplementationUpgraded(newImplementation);
     }
