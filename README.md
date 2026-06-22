@@ -13,7 +13,7 @@ Flap tax token ──tax(mktBps)──▶ dispatch() ──BNB──▶ MyxVault
                  → deployPool if missing → BasePool.deposit (mBase LP minted to vault)
                  → _feedDividend(): deposit the mBase LP ITSELF into the Dividend contract
                    (the LP is the dividend asset — no swap, no WBNB)
-        [guardian] emergencyWithdraw / emergencySweepBnb / emergencyRescueToken: rescue paths
+        [guardian/creator] emergencyWithdraw / emergencySweepBnb / emergencyRescueToken: rescue paths
 ```
 
 See [docs/flap-vault-integration-design.md](docs/flap-vault-integration-design.md) for the full design, verified constraints, and the phased development plan.

@@ -133,6 +133,22 @@ contract MyxVaultAutoTriggerTest is Test {
         assertEq(vault.pendingBnb(), 0.16 ether - 0.05 ether, "fee deducted from accumulated pending");
     }
 
+    /// @dev Audit v2 F1 is a false positive: `requestTrigger{value: fee}` sends the fee OUT of the
+    ///      vault, so the actual BNB balance drops by exactly the same `fee` debited from pendingBnb.
+    ///      The (balance == pendingBnb) invariant holds, and process() forwards amount == pendingBnb
+    ///      == balance — it can never run out of BNB / be bricked.
+    function test_invariant_vaultBalanceEqualsPendingBnb() public {
+        _fund(1 ether);
+        assertTrue(vault.hasPendingTrigger());
+        assertEq(address(vault).balance, vault.pendingBnb(), "balance must equal pendingBnb after schedule");
+
+        vm.warp(block.timestamp + 61);
+        vm.prank(makeAddr("keeper"));
+        vault.process(); // forwards amount == pendingBnb == balance; cannot revert on insufficient BNB
+        assertEq(vault.pendingBnb(), 0);
+        assertEq(address(vault).balance, 0, "balance and pendingBnb both drained after process");
+    }
+
     // ── trigger() callback ───────────────────────────────────────────────────
 
     function test_trigger_executesProcessAndClears() public {
