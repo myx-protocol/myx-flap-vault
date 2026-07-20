@@ -20,6 +20,11 @@ library FlapDeployed {
             return 0x027e3704fC5C16522e9393d04C60A3ac5c0d775f;
         }
 
+        // Robinhood Chain Mainnet
+        if (chainId == 4663) {
+            return 0xe9F7AB7DE8FB8756acbB6a1cd13316a43308197B;
+        }
+
         revert("FlapDeployed: unsupported chain");
     }
 }

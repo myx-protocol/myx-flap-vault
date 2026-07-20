@@ -51,7 +51,7 @@ Flap trigger backend ──(>= now+DELAY)──▶ trigger(requestId)           
 
 | Item | Notes |
 |------|-------|
-| `triggerService` (immutable) | deploy param (BSC mainnet `0xcf4EE25035CF883895110f367F5BA8172416a7F9`; **testnet addr TBD**), not hardcoded |
+| `triggerService` | resolved per chain by `_getTriggerService()`, hardcoded like `_getPortal`/`_getGuardian`: BSC mainnet `0xcf4EE25035CF883895110f367F5BA8172416a7F9`, BSC testnet `0x560E9830926C9e0EB98a59c6b9902383Fc0D9Eb2`, Robinhood mainnet (4663) `0xD3421B1b616a72bB88993A0cf75709BB8D532cc1`. Unknown chain reverts — no default branch (Flap reuses CREATE2 addresses across chains, so a fallthrough would hit an unrelated live contract) |
 | `pendingTriggerId` (uint256) | `0` = no in-flight; non-zero = scheduled. Idempotence gate: non-zero ⇒ skip new schedule |
 | `PROCESS_DELAY` (immutable) | default 60s, deploy-configurable |
 | `scheduleProcess() external` | `onlySelf`; gates on `pendingBnb >= minProcessAmount + fee` (decides on accumulated pending, NOT per-receipt msg.value) then wraps `getFee()`+`requestTrigger` inside the `receive()` try/catch |
@@ -85,9 +85,18 @@ official spec-checker certification.
 
 ## Open items
 
-- Testnet `FlapTriggerService` address (deploy parameter).
+- Robinhood Chain testnet (46630): Flap has deployed a trigger service
+  (`0x34e7624e2c8F944Db1adD9a604fdB7C439CaEa1c`, `getFee()` = 0.0004 ETH) but ships no Portal or
+  Guardian for that chain, so a vault cannot initialize there. The chain stays unsupported until
+  Flap publishes both; `ChainAddressResolution.t.sol` asserts it still reverts.
+- Fee sizing on Robinhood: the fee is denominated in ETH and is 0.0004 ETH (2x the BSC fee in
+  nominal terms, far more in value). `minProcessAmount` must be set well above the fee or the fee
+  eats the batch — the Robinhood deploy script uses 0.004 ETH (~10% fee share) rather than the
+  1 wei used on BSC. Flap documents that Robinhood pricing is expected to become dynamic, so
+  re-check `getFee()` against that floor before each deployment.
 - gas: the trigger callback (including first-call `deployPool`) must be ≤ `getMaxCallbackGas()`.
   Asserted in tests; if the live limit is exceeded, revisit (e.g. pre-deploy the pool out-of-band).
+  Verified 2,000,000 on both BSC and Robinhood mainnet.
 
 ## Test matrix (TDD)
 

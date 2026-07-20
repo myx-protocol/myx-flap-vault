@@ -1,6 +1,11 @@
 # myx-flap-vault
 
-MYX integration vault for the [Flap](https://docs.flap.sh) launchpad on BNB Chain.
+MYX integration vault for the [Flap](https://docs.flap.sh) launchpad.
+
+Supported chains: BNB Chain (56), BNB Testnet (97) and Robinhood Chain (4663). Per-chain Flap
+addresses (Portal, Guardian, VaultPortal, TriggerService) are hardcoded and resolved by chain id;
+an unsupported chain reverts rather than falling back. Robinhood Chain testnet (46630) is not
+supported — Flap ships a trigger service there but no Portal or Guardian.
 
 Implements a custom `Vault + VaultFactory` pair following the Flap `VaultBaseV2` / `VaultFactoryBaseV2` specification. Tax revenue (native BNB, `mktBps` share) collected from Flap tax tokens is used to buy back the tax token via the Flap Portal and deposit it as base liquidity into the MYX protocol. The resulting MYX base-pool LP (mBase) is itself distributed to holders pro-rata via the token's native Dividend contract — **the LP IS the dividend asset** (no swap, no intermediate WBNB).
 

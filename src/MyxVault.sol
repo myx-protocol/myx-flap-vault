@@ -178,11 +178,13 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
         emit ProcessTriggered(requestId, success);
     }
 
-    /// @dev FlapTriggerService address per chain — hardcoded like _getPortal/_getGuardian. The BSC
-    ///      testnet address is pending (see auto-trigger design doc open items).
+    /// @dev FlapTriggerService address per chain — hardcoded like _getPortal/_getGuardian.
+    ///      Robinhood testnet (46630) has a live service but no Portal/Guardian, so it is omitted
+    ///      here too: scheduling on a chain whose vault cannot initialize is dead weight.
     function _getTriggerService() internal view returns (address) {
         if (block.chainid == 56) return 0xcf4EE25035CF883895110f367F5BA8172416a7F9;
         else if (block.chainid == 97) return 0x560E9830926C9e0EB98a59c6b9902383Fc0D9Eb2;
+        else if (block.chainid == 4663) return 0xD3421B1b616a72bB88993A0cf75709BB8D532cc1;
         revert(unicode"Trigger service not configured / 觸發服務未配置");
     }
 

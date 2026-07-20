@@ -18,13 +18,13 @@ pragma solidity ^0.8.13;
 /// 3. **Use _getPortal() for Portal interactions**
 ///    - Call this internal method to get the Portal address for the current chain
 ///    - The method reverts if the current chain is not supported
-///    - Currently only BNB Chain (chain ID 56) and BNB Testnet (chain ID 97) are supported
+///    - Currently BNB Chain (56), BNB Testnet (97) and Robinhood Chain (4663) are supported
 ///
 /// 4. **Use _getGuardian() for Guardian address**
 ///    - Call this internal method to get the Guardian address for the current chain
 ///    - The Guardian is a privileged address that can always call permissioned functions if you have any
 ///    - The method reverts if the current chain is not supported
-///    - Currently only BNB Chain (chain ID 56) and BNB Testnet (chain ID 97) are supported
+///    - Currently BNB Chain (56), BNB Testnet (97) and Robinhood Chain (4663) are supported
 ///
 /// 5. **Handle tax token revenue**
 ///    - Implement a receive() function to accept BNB from the tax token
@@ -62,7 +62,11 @@ abstract contract VaultBase {
     error UnsupportedChain(uint256 chainId);
 
     /// @notice Get the Portal address for the current chain
-    /// @dev Currently supports BNB Chain (chain ID 56) and BNB Testnet (chain ID 97)
+    /// @dev Supports BNB Chain (56), BNB Testnet (97) and Robinhood Chain mainnet (4663).
+    ///      Robinhood Chain testnet (46630) is deliberately absent: Flap ships a trigger service
+    ///      there but no Portal or Guardian, so the chain stays unsupported rather than half-wired.
+    ///      NEVER add a default branch — Flap reuses CREATE2 addresses across chains, so falling
+    ///      through to another chain's address silently targets an unrelated live contract.
     /// @return portal The Portal contract address
     function _getPortal() internal view returns (address portal) {
         uint256 chainId = block.chainid;
@@ -72,12 +76,16 @@ abstract contract VaultBase {
         } else if (chainId == 97) {
             // BNB Testnet Portal
             return 0x5bEacaF7ABCbB3aB280e80D007FD31fcE26510e9;
+        } else if (chainId == 4663) {
+            // Robinhood Chain Portal
+            return 0x26605f322f7fF986f381bB9A6e3f5DAb0bEaEb09;
         }
         revert UnsupportedChain(chainId);
     }
 
     /// @notice Get the Guardian address for the current chain
-    /// @dev Currently supports BNB Chain (chain ID 56) and BNB Testnet (chain ID 97)
+    /// @dev Supports BNB Chain (56), BNB Testnet (97) and Robinhood Chain mainnet (4663).
+    ///      See _getPortal() for why Robinhood testnet is excluded and why there is no default.
     /// @return guardian The Guardian contract address
     function _getGuardian() internal view returns (address guardian) {
         uint256 chainId = block.chainid;
@@ -87,6 +95,9 @@ abstract contract VaultBase {
         } else if (chainId == 97) {
             // BNB Testnet Guardian address
             return 0x76Fa8C526f8Bc27ba6958B76DeEf92a0dbE46950;
+        } else if (chainId == 4663) {
+            // Robinhood Chain Guardian address
+            return 0x0000b48720d3B4ED6BC5031768B07F2b59270000;
         }
         revert UnsupportedChain(chainId);
     }
