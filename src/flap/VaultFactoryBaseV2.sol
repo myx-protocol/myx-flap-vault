@@ -361,10 +361,13 @@ abstract contract VaultFactoryBaseV2 is IVaultFactory, IVaultFactoryValidationV2
     ///      this contract is deployed on.
     ///
     ///      Currently supports:
-    ///        - BNB Chain   (chain ID 56)  → 0x90497450f2a706f1951b5bdda52B4E5d16f34C06
-    ///        - BNB Testnet (chain ID 97)  → 0x027e3704fC5C16522e9393d04C60A3ac5c0d775f
+    ///        - BNB Chain      (chain ID 56)   → 0x90497450f2a706f1951b5bdda52B4E5d16f34C06
+    ///        - BNB Testnet    (chain ID 97)   → 0x027e3704fC5C16522e9393d04C60A3ac5c0d775f
+    ///        - Robinhood Chain (chain ID 4663) → 0xe9F7AB7DE8FB8756acbB6a1cd13316a43308197B
     ///
-    ///      Reverts with `UnsupportedChain` if called on an unknown chain.
+    ///      Reverts with `UnsupportedChain` if called on an unknown chain. No default branch:
+    ///      Flap reuses CREATE2 addresses across chains, so a fallthrough would target a foreign
+    ///      live contract instead of reverting.
     ///
     /// @return vaultPortal The VaultPortal contract address for the current chain.
     function _getVaultPortal() internal view returns (address vaultPortal) {
@@ -375,6 +378,9 @@ abstract contract VaultFactoryBaseV2 is IVaultFactory, IVaultFactoryValidationV2
         } else if (chainId == 97) {
             // BNB Testnet VaultPortal address
             return 0x027e3704fC5C16522e9393d04C60A3ac5c0d775f;
+        } else if (chainId == 4663) {
+            // Robinhood Chain VaultPortal address
+            return 0xe9F7AB7DE8FB8756acbB6a1cd13316a43308197B;
         }
         revert UnsupportedChain(chainId);
     }
@@ -386,10 +392,12 @@ abstract contract VaultFactoryBaseV2 is IVaultFactory, IVaultFactoryValidationV2
     ///      as a backup mechanism.
     ///
     ///      Currently supports:
-    ///        - BNB Chain   (chain ID 56)  → 0x9e27098dcD8844bcc6287a557E0b4D09C86B8a4b
-    ///        - BNB Testnet (chain ID 97)  → 0x76Fa8C526f8Bc27ba6958B76DeEf92a0dbE46950
+    ///        - BNB Chain      (chain ID 56)   → 0x9e27098dcD8844bcc6287a557E0b4D09C86B8a4b
+    ///        - BNB Testnet    (chain ID 97)   → 0x76Fa8C526f8Bc27ba6958B76DeEf92a0dbE46950
+    ///        - Robinhood Chain (chain ID 4663) → 0x0000b48720d3B4ED6BC5031768B07F2b59270000
     ///
-    ///      Reverts with `UnsupportedChain` if called on an unknown chain.
+    ///      Must mirror VaultBase._getGuardian() exactly (Flap Guardian invariant).
+    ///      Reverts with `UnsupportedChain` if called on an unknown chain; no default branch.
     ///
     /// @return guardian The Guardian contract address for the current chain.
     function _getGuardian() internal view returns (address guardian) {
@@ -400,6 +408,9 @@ abstract contract VaultFactoryBaseV2 is IVaultFactory, IVaultFactoryValidationV2
         } else if (chainId == 97) {
             // BNB Testnet Guardian address
             return 0x76Fa8C526f8Bc27ba6958B76DeEf92a0dbE46950;
+        } else if (chainId == 4663) {
+            // Robinhood Chain Guardian address
+            return 0x0000b48720d3B4ED6BC5031768B07F2b59270000;
         }
         revert UnsupportedChain(chainId);
     }

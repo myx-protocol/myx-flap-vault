@@ -3,7 +3,9 @@ pragma solidity ^0.8.26;
 
 import {Test} from "forge-std/Test.sol";
 import {MyxVault} from "../src/MyxVault.sol";
+import {MyxVaultFactory} from "../src/MyxVaultFactory.sol";
 import {VaultBase} from "../src/flap/VaultBase.sol";
+import {VaultFactoryBaseV2} from "../src/flap/VaultFactoryBaseV2.sol";
 import {FlapDeployed} from "../src/FlapDeployed.sol";
 import {VaultUISchema} from "../src/flap/IVaultSchemasV1.sol";
 import {VaultBaseV2} from "../src/flap/VaultBaseV2.sol";
@@ -30,6 +32,21 @@ contract VaultBaseHarness is VaultBaseV2 {
 contract MyxVaultHarness is MyxVault {
     function exposedGetTriggerService() external view returns (address) {
         return _getTriggerService();
+    }
+}
+
+/// @dev Exposes VaultFactoryBaseV2's per-chain resolvers. These are distinct from VaultBase's:
+///      MyxVaultFactory.onlyGuardian and newVault() gate on THESE, so a missing 4663 branch here
+///      blocks vault launch on Robinhood even when the vault contract itself resolves correctly.
+contract MyxVaultFactoryHarness is MyxVaultFactory {
+    constructor(MyxVaultFactory.GlobalConfig memory c) MyxVaultFactory(c) {}
+
+    function exposedGetVaultPortal() external view returns (address) {
+        return _getVaultPortal();
+    }
+
+    function exposedGetGuardian() external view returns (address) {
+        return _getGuardian();
     }
 }
 
@@ -64,10 +81,22 @@ contract ChainAddressResolutionTest is Test {
 
     VaultBaseHarness base;
     MyxVaultHarness vault;
+    MyxVaultFactoryHarness factory;
 
     function setUp() public {
         base = new VaultBaseHarness();
         vault = new MyxVaultHarness();
+        // The factory's per-chain resolvers ignore config; dummy addresses suffice. The constructor
+        // only stores config and deploys a beacon, neither of which touches a chainid branch.
+        factory = new MyxVaultFactoryHarness(
+            MyxVaultFactory.GlobalConfig({
+                poolManager: makeAddr("poolManager"),
+                basePool: makeAddr("basePool"),
+                poolFactory: makeAddr("poolFactory"),
+                maxSlippageBps: 300,
+                minProcessAmount: 1
+            })
+        );
     }
 
     function test_getPortal_robinhoodMainnet() public {
@@ -116,6 +145,52 @@ contract ChainAddressResolutionTest is Test {
         assertEq(FlapDeployed.vaultPortal(), BSC_VAULT_PORTAL);
         vm.chainId(97);
         assertEq(FlapDeployed.vaultPortal(), BSC_TESTNET_VAULT_PORTAL);
+    }
+
+    // --- VaultFactoryBaseV2 resolvers (distinct from VaultBase; gate launch + guardian ops) ---
+
+    function test_factoryGetVaultPortal_robinhoodMainnet() public {
+        vm.chainId(ROBINHOOD_CHAIN_ID);
+        assertEq(factory.exposedGetVaultPortal(), ROBINHOOD_VAULT_PORTAL);
+    }
+
+    function test_factoryGetGuardian_robinhoodMainnet() public {
+        vm.chainId(ROBINHOOD_CHAIN_ID);
+        assertEq(factory.exposedGetGuardian(), ROBINHOOD_GUARDIAN);
+    }
+
+    function test_factoryGetVaultPortal_bscUnchanged() public {
+        vm.chainId(56);
+        assertEq(factory.exposedGetVaultPortal(), BSC_VAULT_PORTAL);
+        vm.chainId(97);
+        assertEq(factory.exposedGetVaultPortal(), BSC_TESTNET_VAULT_PORTAL);
+    }
+
+    function test_factoryGetGuardian_bscUnchanged() public {
+        vm.chainId(56);
+        assertEq(factory.exposedGetGuardian(), BSC_GUARDIAN);
+        vm.chainId(97);
+        assertEq(factory.exposedGetGuardian(), BSC_TESTNET_GUARDIAN);
+    }
+
+    function test_factoryRobinhoodTestnetUnsupported() public {
+        vm.chainId(ROBINHOOD_TESTNET_CHAIN_ID);
+        vm.expectRevert(
+            abi.encodeWithSelector(VaultFactoryBaseV2.UnsupportedChain.selector, ROBINHOOD_TESTNET_CHAIN_ID)
+        );
+        factory.exposedGetVaultPortal();
+        vm.expectRevert(
+            abi.encodeWithSelector(VaultFactoryBaseV2.UnsupportedChain.selector, ROBINHOOD_TESTNET_CHAIN_ID)
+        );
+        factory.exposedGetGuardian();
+    }
+
+    function test_factoryUnknownChainReverts() public {
+        vm.chainId(1);
+        vm.expectRevert(abi.encodeWithSelector(VaultFactoryBaseV2.UnsupportedChain.selector, uint256(1)));
+        factory.exposedGetVaultPortal();
+        vm.expectRevert(abi.encodeWithSelector(VaultFactoryBaseV2.UnsupportedChain.selector, uint256(1)));
+        factory.exposedGetGuardian();
     }
 
     /// @dev Robinhood testnet must keep reverting: a trigger service alone cannot carry a vault,
