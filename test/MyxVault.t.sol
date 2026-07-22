@@ -122,7 +122,7 @@ contract MyxVaultInitTest is MyxVaultTestBase {
         vm.deal(address(this), 1 ether);
         (bool ok,) = address(vault).call{value: 1 ether}("");
         assertTrue(ok);
-        assertEq(vault.pendingBnb(), 1 ether);
+        assertEq(vault.pendingEth(), 1 ether);
         assertEq(address(vault).balance, 1 ether);
     }
 
@@ -201,7 +201,7 @@ contract MyxVaultProcessTest is MyxVaultTestBase {
         // a random caller can run it — permissionless
         vm.prank(makeAddr("keeper"));
         vault.process();
-        assertEq(vault.pendingBnb(), 0);
+        assertEq(vault.pendingEth(), 0);
         assertEq(basePool.depositCallCount(), 1);
         assertEq(basePool.lastDepositAmount(), 1000 ether);
         assertEq(basePool.lastDepositRecipient(), address(vault)); // LP minted to the vault first
@@ -236,7 +236,7 @@ contract MyxVaultProcessTest is MyxVaultTestBase {
 
     function test_process_belowMinimumAfterSuccess_reverts() public {
         _fund(1 ether);
-        vault.process(); // succeeds, pendingBnb -> 0
+        vault.process(); // succeeds, pendingEth -> 0
         uint256 minAmt = vault.minProcessAmount();
         vm.expectRevert(bytes(unicode"Pending below minimum / 待處理金額低於下限"));
         vault.process();
@@ -257,7 +257,7 @@ contract MyxVaultProcessTest is MyxVaultTestBase {
         _fund(1 ether);
         vm.expectRevert(bytes(unicode"Buyback quote is zero / 回購報價為零"));
         vault.process();
-        assertEq(vault.pendingBnb(), 1 ether); // retained for retry
+        assertEq(vault.pendingEth(), 1 ether); // retained for retry
     }
 
     function test_process_swapReverts_retainsBnb() public {
@@ -266,7 +266,7 @@ contract MyxVaultProcessTest is MyxVaultTestBase {
         vm.expectRevert("PORTAL_FAIL");
         vault.process();
         // state rolled back: BNB safely retained for retry
-        assertEq(vault.pendingBnb(), 1 ether);
+        assertEq(vault.pendingEth(), 1 ether);
         assertEq(address(vault).balance, 1 ether);
     }
 
@@ -276,7 +276,7 @@ contract MyxVaultProcessTest is MyxVaultTestBase {
         vm.expectRevert();
         vault.process();
         // state rolled back: BNB safely retained for retry
-        assertEq(vault.pendingBnb(), 1 ether);
+        assertEq(vault.pendingEth(), 1 ether);
         assertEq(address(vault).balance, 1 ether);
     }
 }
@@ -314,7 +314,7 @@ contract MyxVaultDeployPoolTest is MyxVaultTestBase {
         _fund(1 ether);
         vm.expectRevert("MockPoolManager: market missing");
         vault.process();
-        assertEq(vault.pendingBnb(), 1 ether); // safely retained for retry after governance creates market
+        assertEq(vault.pendingEth(), 1 ether); // safely retained for retry after governance creates market
     }
 
     function test_ensurePoolDeployed_permissionless() public {
@@ -514,16 +514,16 @@ contract MyxVaultEmergencyTest is MyxVaultTestBase {
         vm.deal(address(vault), 2 ether);
         address rescue = makeAddr("rescue");
         vm.prank(GUARDIAN);
-        vault.emergencySweepBnb(rescue);
+        vault.emergencySweepEth(rescue);
         assertEq(rescue.balance, 2 ether);
-        assertEq(vault.pendingBnb(), 0);
+        assertEq(vault.pendingEth(), 0);
     }
 
     function test_emergencySweepBnb_strangerReverts() public {
         vm.deal(address(vault), 1 ether);
         vm.prank(makeAddr("stranger"));
         vm.expectRevert();
-        vault.emergencySweepBnb(makeAddr("stranger"));
+        vault.emergencySweepEth(makeAddr("stranger"));
     }
 
     /// @dev v6 deferred-LP escape: LP retained in the vault (dividend permanently unwired / shares

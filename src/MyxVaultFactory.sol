@@ -97,7 +97,7 @@ contract MyxVaultFactory is VaultFactoryBaseV2, IVaultFactoryDividendV23 {
     }
 
     function isQuoteTokenSupported(address quoteToken) external pure override returns (bool) {
-        return quoteToken == address(0); // native BNB only
+        return quoteToken == address(0); // native ETH only
     }
 
     /// @inheritdoc VaultFactoryBaseV2
@@ -126,7 +126,7 @@ contract MyxVaultFactory is VaultFactoryBaseV2, IVaultFactoryDividendV23 {
                 abi.decode(launchParams, (IVaultPortalTypes.NewTokenV6WithVaultParamsU8));
             require(params.dividendToken == MAGIC_DIVIDEND_COMPUTED, unicode"Expected V6 MAGIC dividend token / 預期 V6 MAGIC 分紅幣");
             // The myx MARKET quote token travels in vaultData — NOT params.quoteToken (Flap bonding
-            // quote = native BNB). MUST match newVault's marketQuoteToken source so the predicted LP
+            // quote = native ETH). MUST match newVault's marketQuoteToken source so the predicted LP
             // and the vault's actual myx pool share the same market — fund-critical.
             address marketQuote = abi.decode(params.vaultData, (address));
             MarketId marketId = MyxMarketId.derive(uint64(block.chainid), marketQuote);
@@ -162,10 +162,10 @@ contract MyxVaultFactory is VaultFactoryBaseV2, IVaultFactoryDividendV23 {
 
     /// @notice Pre-launch validation hook — ON-CHAIN enforcement (unlike tokenCreationPolicies,
     ///         which is UI-only). Rejects any launch that would brick process():
-    ///         1. quoteToken must be native BNB (address(0))
-    ///         2. dividendBps must be 0: Flap's native dividend dispatch would try to swap the BNB
+    ///         1. quoteToken must be native ETH (address(0))
+    ///         2. dividendBps must be 0: Flap's native dividend dispatch would try to swap the ETH
     ///            tax share into the dividendToken (myx LP), but mBase is only mintable via myx
-    ///            deposit — never swappable from BNB. The vault feeds LP itself from mktBps revenue.
+    ///            deposit — never swappable from ETH. The vault feeds LP itself from mktBps revenue.
     ///         3. dividendToken must be MAGIC_DIVIDEND_COMPUTED, resolved to mBase via resolveDividendToken.
     ///         Enforcement order: dividendBps before dividendToken because the Flap UI auto-fills
     ///         dividendToken when dividendBps == 0 — catching the mis-bps case first gives a clearer error.
@@ -176,7 +176,7 @@ contract MyxVaultFactory is VaultFactoryBaseV2, IVaultFactoryDividendV23 {
         returns (bool success, string memory reason)
     {
         if (data.quoteToken != address(0)) {
-            return (false, unicode"Quote token must be native BNB / 報價幣必須為原生 BNB");
+            return (false, unicode"Quote token must be native ETH / 報價幣必須為原生 ETH");
         }
         if (data.dividendBps != 0) {
             return (false, unicode"Dividend BPS must be 0 / 分紅 BPS 必須為 0");
@@ -201,7 +201,7 @@ contract MyxVaultFactory is VaultFactoryBaseV2, IVaultFactoryDividendV23 {
             target: "quoteToken",
             operator: "eq",
             value: abi.encode(address(0)),
-            description: unicode"Quote token must be native BNB (address(0)). / 報價幣必須為原生 BNB（address(0)）。"
+            description: unicode"Quote token must be native ETH (address(0)). / 報價幣必須為原生 ETH（address(0)）。"
         });
         policies[2] = FactoryPolicy({
             target: "dividendBps",

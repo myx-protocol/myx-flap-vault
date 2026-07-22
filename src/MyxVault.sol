@@ -19,16 +19,16 @@ import {IFlapTriggerService, ITriggerReceiver} from "./flap/IFlapTriggerService.
 /// @notice Flap vault that buys back the tax token with tax revenue via the Flap Portal, deposits
 ///         it as MYX base-pool liquidity, and feeds the resulting mBase LP into the token's
 ///         native Flap Dividend contract — the LP ITSELF is the dividend asset.
-/// @dev v6 reward model: tax BNB → receive() accounting → process() [permissionless]
+/// @dev v6 reward model: tax ETH → receive() accounting → process() [permissionless]
 ///      buys back the token via the Portal, deposits it into the MYX base pool (LP minted to the
 ///      vault), then _feedDividend deposits the LP into the Dividend contract whose dividendToken ==
 ///      that same mBase LP (wired at launch). Holders claim the mBase LP via
 ///      the dividend (fairly, via Flap setShare hooks), then earn myx rebates by holding it.
 /// @dev Invariants:
-///      - receive() does accounting (pendingBnb += msg.value) then best-effort schedules a delayed
+///      - receive() does accounting (pendingEth += msg.value) then best-effort schedules a delayed
 ///        process() via FlapTriggerService in try/catch; accounting is the Rule-005 core and the
 ///        schedule never reverts receive() (deliberate Rule-005 deviation, see auto-trigger doc).
-///      - process() is permissionless: anyone may convert pending BNB into liquidity + dividend.
+///      - process() is permissionless: anyone may convert pending ETH into liquidity + dividend.
 ///      - The LP IS the dividend asset: dividendToken == basePoolToken == mBase. _feedDividend
 ///        deposits the whole held LP balance; if the dividend is unwired or deposit() returns false
 ///        (totalShares == 0 early window), the LP is RETAINED (DividendDeferred) — no swap, no
@@ -54,7 +54,7 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
     uint64 public constant PROCESS_DELAY = 60;
 
     event RevenueReceived(uint256 amount, uint256 pendingTotal);
-    event RevenueProcessed(uint256 bnbAmount, uint256 baseAmount, uint256 lpMinted);
+    event RevenueProcessed(uint256 ethAmount, uint256 baseAmount, uint256 lpMinted);
     event PoolDeployed(PoolId poolId);
     /// @notice Emitted when the vault's mBase LP balance is successfully fed into the Dividend
     ///         contract. `lpFed` is the LP amount distributed to holders.
@@ -63,7 +63,7 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
     ///         because totalShares == 0 in the early window). LP is retained for retry.
     event DividendDeferred(uint256 lpAmount);
     event EmergencyWithdrawal(uint256 lpAmount, uint256 amountOut, address to);
-    event EmergencySwept(uint256 bnbAmount, address to);
+    event EmergencySwept(uint256 ethAmount, address to);
     /// @notice Emitted when a stuck ERC20 is rescued to `to`. Generic escape hatch covering deferred
     ///         mBase LP, residual tax tokens, or any accidentally sent token — including cases where
     ///         the myx pool's withdraw path is unusable.
@@ -86,7 +86,7 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
     uint16 public maxSlippageBps;
     uint256 public minProcessAmount;
 
-    uint256 public pendingBnb;
+    uint256 public pendingEth;
     uint256 public totalLpMinted;
     uint256 public totalRewardsForwarded;
 
@@ -127,41 +127,41 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
         _grantRole(EMERGENCY_ROLE, p.creator);
     }
 
-    /// @dev Accounting + best-effort auto-schedule. Accounting (pendingBnb += msg.value) runs first
+    /// @dev Accounting + best-effort auto-schedule. Accounting (pendingEth += msg.value) runs first
     ///      and is the Rule-005 core. Scheduling a delayed process() via FlapTriggerService is wrapped
     ///      in try/catch (self-call) so ANY scheduling failure — service down, fee insufficient, OOG —
     ///      degrades to "not scheduled" and NEVER reverts receive() or loses tax. The external call is
     ///      a deliberate Rule-005 deviation (see auto-trigger design doc); never-revert is preserved.
     receive() external payable {
-        pendingBnb += msg.value;
-        emit RevenueReceived(msg.value, pendingBnb);
-        if (!hasPendingTrigger && pendingBnb >= minProcessAmount) {
+        pendingEth += msg.value;
+        emit RevenueReceived(msg.value, pendingEth);
+        if (!hasPendingTrigger && pendingEth >= minProcessAmount) {
             try this.scheduleProcess() {} catch {}
         }
     }
 
     /// @notice Schedules a delayed process() via FlapTriggerService. ONLY the vault itself may call
     ///         it (from receive()); the self-call lets receive() wrap getFee()+requestTrigger in one
-    ///         try/catch. The fee is paid from tax revenue: pendingBnb is debited ONLY on a successful
-    ///         schedule, preserving the (vault BNB balance == pendingBnb) invariant.
+    ///         try/catch. The fee is paid from tax revenue: pendingEth is debited ONLY on a successful
+    ///         schedule, preserving the (vault ETH balance == pendingEth) invariant.
     function scheduleProcess() external {
         require(msg.sender == address(this), unicode"Caller must be the vault itself / 僅限金庫自身調用");
         IFlapTriggerService service = IFlapTriggerService(_getTriggerService());
         uint256 fee = service.getFee();
-        // Decide on ACCUMULATED pendingBnb (not a single receipt): it must cover the fee AND still
+        // Decide on ACCUMULATED pendingEth (not a single receipt): it must cover the fee AND still
         // leave >= minProcessAmount so the scheduled process() can actually run — no wasted fee, and
-        // pendingBnb -= fee can never underflow.
-        require(pendingBnb >= minProcessAmount + fee, unicode"Pending below minimum plus fee / 待處理低於下限加手續費");
+        // pendingEth -= fee can never underflow.
+        require(pendingEth >= minProcessAmount + fee, unicode"Pending below minimum plus fee / 待處理低於下限加手續費");
         uint64 executeAfter = uint64(block.timestamp) + PROCESS_DELAY;
         uint256 id = service.requestTrigger{value: fee}(executeAfter);
         pendingTriggerId = id;
         hasPendingTrigger = true;
-        pendingBnb -= fee;
+        pendingEth -= fee;
         emit ProcessScheduled(id, executeAfter);
     }
 
     /// @notice FlapTriggerService callback (ITriggerReceiver). Clears the in-flight gate FIRST, then
-    ///         runs process() under try/catch so a revert (e.g. pendingBnb already drained below the
+    ///         runs process() under try/catch so a revert (e.g. pendingEth already drained below the
     ///         minimum by a permissionless process()) cannot deadlock scheduling — the next tax
     ///         receipt re-schedules. Stale/unknown request ids are ignored.
     function trigger(uint256 requestId) external {
@@ -194,16 +194,16 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
         super.revokeRole(role, account);
     }
 
-    /// @notice Converts accumulated BNB into MYX base-pool liquidity by buying back the tax token
+    /// @notice Converts accumulated ETH into MYX base-pool liquidity by buying back the tax token
     ///         via the Flap Portal, then feeds the resulting mBase LP into the token's dividend
     ///         contract. PERMISSIONLESS — anyone may run it.
     /// @dev Buy leg minOut is a same-block Portal quote × (1 - maxSlippageBps): bounds per-call
     ///      deviation but cannot prevent sandwiching (BSC block proposers reorder at no cost).
-    ///      Consumes ALL pendingBnb; the LP IS the reward (v6 model).
+    ///      Consumes ALL pendingEth; the LP IS the reward (v6 model).
     function process() external nonReentrant {
-        uint256 amount = pendingBnb;
+        uint256 amount = pendingEth;
         require(amount >= minProcessAmount, unicode"Pending below minimum / 待處理金額低於下限");
-        pendingBnb = 0;
+        pendingEth = 0;
 
         uint256 received = _buyTaxToken(amount);
         _ensurePoolExists();
@@ -297,12 +297,12 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
         emit EmergencyWithdrawal(lpAmount, amountOut, to);
     }
 
-    /// @notice Sweeps stuck native BNB. Disaster recovery only (e.g. process() permanently broken).
-    function emergencySweepBnb(address to) external nonReentrant onlyRole(EMERGENCY_ROLE) {
+    /// @notice Sweeps stuck native ETH. Disaster recovery only (e.g. process() permanently broken).
+    function emergencySweepEth(address to) external nonReentrant onlyRole(EMERGENCY_ROLE) {
         uint256 amount = address(this).balance;
-        pendingBnb = 0;
+        pendingEth = 0;
         (bool ok,) = to.call{value: amount}("");
-        require(ok, unicode"BNB sweep failed / BNB 清退失敗");
+        require(ok, unicode"ETH sweep failed / ETH 清退失敗");
         emit EmergencySwept(amount, to);
     }
 
@@ -319,28 +319,28 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
         }
     }
 
-    /// @dev BNB → taxToken via the Flap Portal (bonding curve or DEX phase, Portal routes).
+    /// @dev ETH → taxToken via the Flap Portal (bonding curve or DEX phase, Portal routes).
     ///      minOut is a same-block quote bound — caps single-call deviation, cannot prevent sandwiches.
     ///      Returns the BALANCE DELTA (not the Portal return value): DEX-phase buys land net of the
     ///      token's own transfer tax (docs/phase0-v3-findings.md).
-    function _buyTaxToken(uint256 bnbAmount) internal returns (uint256 received) {
+    function _buyTaxToken(uint256 ethAmount) internal returns (uint256 received) {
         IPortalTradeV2 portal = IPortalTradeV2(_getPortal());
         uint256 quoted = portal.quoteExactInput(
             IPortalTradeV2.QuoteExactInputParams({
                 inputToken: address(0),
                 outputToken: taxToken,
-                inputAmount: bnbAmount
+                inputAmount: ethAmount
             })
         );
         require(quoted != 0, unicode"Buyback quote is zero / 回購報價為零");
         uint256 minOut = (quoted * (BPS_DENOMINATOR - maxSlippageBps)) / BPS_DENOMINATOR;
 
         uint256 balanceBefore = IERC20(taxToken).balanceOf(address(this));
-        portal.swapExactInput{value: bnbAmount}(
+        portal.swapExactInput{value: ethAmount}(
             IPortalTradeV2.ExactInputParams({
                 inputToken: address(0),
                 outputToken: taxToken,
-                inputAmount: bnbAmount,
+                inputAmount: ethAmount,
                 minOutputAmount: minOut,
                 permitData: ""
             })
@@ -364,8 +364,8 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
             Decimal18.toString(totalLpMinted),
             unicode" LP minted / LP 已鑄造, ",
             Decimal18.toString(totalRewardsForwarded),
-            unicode" LP distributed / LP 已分發, pending BNB / 待處理 BNB: ",
-            Decimal18.toString(pendingBnb),
+            unicode" LP distributed / LP 已分發, pending ETH / 待處理 ETH: ",
+            Decimal18.toString(pendingEth),
             "."
         );
     }
@@ -376,14 +376,14 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
             unicode"Tax revenue is converted to MYX LP and distributed to holders as dividends. / 稅收轉換為 MYX LP，作為分紅分配給持幣者。";
         schema.methods = new VaultMethodSchema[](5);
 
-        schema.methods[0].name = "pendingBnb";
+        schema.methods[0].name = "pendingEth";
         schema.methods[0].description = unicode"Tax revenue awaiting processing. / 待處理的稅收金額。";
         schema.methods[0].outputs = new FieldDescriptor[](1);
-        schema.methods[0].outputs[0] = FieldDescriptor("amount", "uint256", "BNB amount", 18);
+        schema.methods[0].outputs[0] = FieldDescriptor("amount", "uint256", "ETH amount", 18);
 
         schema.methods[1].name = "process";
         schema.methods[1].description =
-            unicode"Buy back the token with pending BNB, deposit into MYX pool, and feed LP to dividends. Permissionless. / 用待處理 BNB 回購代幣，注入 MYX 池並將 LP 分發為分紅。任何人可調用。";
+            unicode"Buy back the token with pending ETH, deposit into MYX pool, and feed LP to dividends. Permissionless. / 用待處理 ETH 回購代幣，注入 MYX 池並將 LP 分發為分紅。任何人可調用。";
         schema.methods[1].isWriteMethod = true;
 
         schema.methods[2].name = "feedDividend";
