@@ -144,10 +144,19 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
     /// @dev Reserved storage for upgrades. 44 original - 2 (trigger) - 3 (V3 quote/gas) = 39.
     uint256[39] private __gap;
 
-    /// @dev Set only while _refillGas is unwrapping WBNB, so receive() can recognise the BNB coming
-    ///      back from the wrapper and return before doing anything expensive. EIP-1153 transient
-    ///      storage (cleared at end of transaction): it occupies NO persistent slot, so the layout
-    ///      above and __gap are untouched and the beacon upgrade path stays safe.
+    /// @dev Set only while executeGasRefill is unwrapping WBNB, so receive() can recognise the BNB
+    ///      coming back from the wrapper and return before doing anything expensive. EIP-1153
+    ///      transient storage (cleared at end of transaction): it occupies NO persistent slot, so the
+    ///      layout above and __gap are untouched and the beacon upgrade path stays safe.
+    /// @dev DEPLOY REQUIREMENT — EIP-1153: this vault requires the target chain to execute
+    ///      TLOAD/TSTORE (Cancun, or an L2 whose stack has adopted it). receive() reads this flag as
+    ///      its first statement, so on a chain without EIP-1153 EVERY receive() call would revert
+    ///      with an invalid opcode: tax payouts would still land (a native transfer to a reverting
+    ///      receive() reverts the payout; an ERC20 payout lands but its zero-value ping reverts), yet
+    ///      nothing would be recognised or auto-scheduled on arrival. sync() and process() remain
+    ///      callable by hand and recover the accounting, but the automatic path is gone. Confirm the
+    ///      opcodes are live on the chain before deploying there (see the Robinhood deploy script's
+    ///      checklist).
     bool private transient _unwrapping;
 
     constructor() {

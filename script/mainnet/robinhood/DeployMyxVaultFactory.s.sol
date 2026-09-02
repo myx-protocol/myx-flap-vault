@@ -20,6 +20,15 @@ import {MyxVaultFactory} from "../../../src/MyxVaultFactory.sol";
 ///         re-check getFee() against this recommendation before each deployment.
 ///      2. Robinhood Chain testnet (46630) has no script: Flap ships a trigger service there
 ///         but no Portal or Guardian, so a vault cannot initialize on that chain.
+///
+///      Deploy checklist (Robinhood Chain, 4663):
+///      - EIP-1153: confirm the chain executes TLOAD/TSTORE (ArbOS >= 32 / Cancun) BEFORE deploying.
+///        MyxVault.receive() reads a transient-storage flag as its first statement, so without those
+///        opcodes every receive() call reverts: no tax is recognised on arrival and no process() is
+///        auto-scheduled (sync()/process() still work when called manually). Verify against the live
+///        chain, not the docs, e.g. by deploying a probe contract that TSTOREs and TLOADs one slot.
+///      - getFee(): re-check FlapTriggerService.getFee() against the minProcessAmount recommendation
+///        above; Flap documents that Robinhood fees are expected to become dynamic.
 contract DeployMyxVaultFactory is Script {
     function run() external {
         require(block.chainid == 4663, "wrong chain");
