@@ -20,6 +20,7 @@ import {
 import {IVaultPortalTypes} from "./flap/IVaultPortal.sol";
 import {MAGIC_DIVIDEND_COMPUTED} from "./flap/IPortal.sol";
 import {VaultDataSchema, FieldDescriptor, FactoryPolicy} from "./flap/IVaultSchemasV1.sol";
+import {IPortalQuoteConfigU8} from "./flap/IPortalQuoteConfigU8.sol";
 import {BeaconProxy} from "@openzeppelin/proxy/beacon/BeaconProxy.sol";
 import {UpgradeableBeacon} from "@openzeppelin/proxy/beacon/UpgradeableBeacon.sol";
 import {MyxVault} from "./MyxVault.sol";
@@ -34,7 +35,36 @@ contract MyxVaultFactory is VaultFactoryBaseV2, IVaultFactoryDividendV23 {
         address basePool;
         address poolFactory; // myx PoolFactory: authoritative basePoolToken (LP / mBase) predictor
         uint16 maxSlippageBps;
-        uint256 minProcessAmount;
+        /// @dev ERC20-quote launches must have at least this much BNB prepaid (wei). Enforced in newVault.
+        uint256 minInitialGas;
+    }
+
+    /// @notice Creator-supplied per-vault configuration carried in `vaultData`.
+    struct VaultData {
+        address marketQuoteToken; // myx MARKET quote (USDT/USDC); identifies the myx market
+        uint256 minProcessAmount; // quote base units
+        uint256 gasThreshold; // wei; ERC20 quote only
+        uint256 gasRefillAmount; // wei; ERC20 quote only, > gasThreshold
+    }
+
+    function decodeVaultData(bytes calldata vaultData) public pure returns (VaultData memory d) {
+        (d.marketQuoteToken, d.minProcessAmount, d.gasThreshold, d.gasRefillAmount) =
+            abi.decode(vaultData, (address, uint256, uint256, uint256));
+    }
+
+    /// @dev Flap Portal per chain. Mirrors VaultBase._getPortal(); unknown chains revert.
+    function _getPortal() internal view returns (address) {
+        uint256 chainId = block.chainid;
+        if (chainId == 56) return 0xe2cE6ab80874Fa9Fa2aAE65D277Dd6B8e65C9De0;
+        if (chainId == 97) return 0x5bEacaF7ABCbB3aB280e80D007FD31fcE26510e9;
+        if (chainId == 4663) return 0x26605f322f7fF986f381bB9A6e3f5DAb0bEaEb09;
+        revert UnsupportedChain(chainId);
+    }
+
+    mapping(address => uint256) public prepaidGas;
+
+    function prepayGas() external payable {
+        prepaidGas[msg.sender] += msg.value;
     }
 
     /// @notice FeeType.DIVIDEND == 2; identifies the dividend fee slot in V7 feeConfigs.
@@ -67,12 +97,7 @@ contract MyxVaultFactory is VaultFactoryBaseV2, IVaultFactoryDividendV23 {
         returns (address vault)
     {
         require(msg.sender == _getVaultPortal(), unicode"Caller must be the vault portal / 僅限 VaultPortal 調用");
-        require(quoteToken == address(0), unicode"Unsupported quote token / 不支援的報價幣");
-
-        // vaultData carries the myx MARKET quote token (the token's dividendToken). The vault derives
-        // the myx marketId from it on-chain (keccak256(chainId, quoteToken)); zero is rejected there.
-        address marketQuoteToken = abi.decode(vaultData, (address));
-
+        VaultData memory d = decodeVaultData(vaultData);
         GlobalConfig memory c = config;
         vault = address(
             new BeaconProxy(
@@ -84,23 +109,29 @@ contract MyxVaultFactory is VaultFactoryBaseV2, IVaultFactoryDividendV23 {
                             taxToken: taxToken,
                             creator: creator,
                             quoteToken: quoteToken,
-                            marketQuoteToken: marketQuoteToken,
+                            marketQuoteToken: d.marketQuoteToken,
                             poolManager: c.poolManager,
                             basePool: c.basePool,
                             maxSlippageBps: c.maxSlippageBps,
-                            minProcessAmount: c.minProcessAmount,
-                            gasThreshold: 0,
-                            gasRefillAmount: 0
+                            minProcessAmount: d.minProcessAmount,
+                            gasThreshold: d.gasThreshold,
+                            gasRefillAmount: d.gasRefillAmount
                         })
                     )
                 )
             )
         );
-        emit VaultCreated(vault, taxToken, creator, marketQuoteToken);
+        emit VaultCreated(vault, taxToken, creator, d.marketQuoteToken);
     }
 
-    function isQuoteTokenSupported(address quoteToken) external pure override returns (bool) {
-        return quoteToken == address(0); // native ETH only
+    /// @inheritdoc IVaultFactory
+    /// @dev Native always. ERC20 only where the vault's refill leg is wired (BSC mainnet/testnet) and
+    ///      the Portal has the quote enabled. Robinhood stays native-only in this release.
+    function isQuoteTokenSupported(address quoteToken) external view override returns (bool) {
+        if (quoteToken == address(0)) return true;
+        uint256 chainId = block.chainid;
+        if (chainId != 56 && chainId != 97) return false;
+        return IPortalQuoteConfigU8(_getPortal()).getQuoteTokenConfiguration(quoteToken).enabled == 1;
     }
 
     /// @inheritdoc VaultFactoryBaseV2
@@ -131,7 +162,7 @@ contract MyxVaultFactory is VaultFactoryBaseV2, IVaultFactoryDividendV23 {
             // The myx MARKET quote token travels in vaultData — NOT params.quoteToken (Flap bonding
             // quote = native ETH). MUST match newVault's marketQuoteToken source so the predicted LP
             // and the vault's actual myx pool share the same market — fund-critical.
-            address marketQuote = abi.decode(params.vaultData, (address));
+            (address marketQuote,,,) = abi.decode(params.vaultData, (address, uint256, uint256, uint256));
             MarketId marketId = MyxMarketId.derive(uint64(block.chainid), marketQuote);
             return IMyxPoolFactory(config.poolFactory).predictBasePoolToken(
                 marketId, predictedToken, params.symbol
@@ -153,7 +184,7 @@ contract MyxVaultFactory is VaultFactoryBaseV2, IVaultFactoryDividendV23 {
             }
             require(found, unicode"No V7 dividend feeConfig / 無 V7 分紅費用配置");
             // Same source as V6 and newVault: myx MARKET quote in vaultData, NOT params.quoteToken.
-            address marketQuote = abi.decode(params.vaultData, (address));
+            (address marketQuote,,,) = abi.decode(params.vaultData, (address, uint256, uint256, uint256));
             MarketId marketId = MyxMarketId.derive(uint64(block.chainid), marketQuote);
             return IMyxPoolFactory(config.poolFactory).predictBasePoolToken(
                 marketId, predictedToken, params.symbol
@@ -165,22 +196,20 @@ contract MyxVaultFactory is VaultFactoryBaseV2, IVaultFactoryDividendV23 {
 
     /// @notice Pre-launch validation hook — ON-CHAIN enforcement (unlike tokenCreationPolicies,
     ///         which is UI-only). Rejects any launch that would brick process():
-    ///         1. quoteToken must be native ETH (address(0))
-    ///         2. dividendBps must be 0: Flap's native dividend dispatch would try to swap the ETH
-    ///            tax share into the dividendToken (myx LP), but mBase is only mintable via myx
-    ///            deposit — never swappable from ETH. The vault feeds LP itself from mktBps revenue.
-    ///         3. dividendToken must be MAGIC_DIVIDEND_COMPUTED, resolved to mBase via resolveDividendToken.
+    ///         1. dividendBps must be 0: Flap's native dividend dispatch would try to swap the tax
+    ///            share into the dividendToken (myx LP), but mBase is only mintable via myx
+    ///            deposit — never swappable from the quote token. The vault feeds LP itself from
+    ///            mktBps revenue.
+    ///         2. dividendToken must be MAGIC_DIVIDEND_COMPUTED, resolved to mBase via resolveDividendToken.
     ///         Enforcement order: dividendBps before dividendToken because the Flap UI auto-fills
     ///         dividendToken when dividendBps == 0 — catching the mis-bps case first gives a clearer error.
+    ///         Quote token itself is validated separately, off-chain, via isQuoteTokenSupported.
     function _validateBeforeLaunch(IVaultFactoryValidationV2.LaunchValidationDataV1 memory data)
         internal
         view
         override
         returns (bool success, string memory reason)
     {
-        if (data.quoteToken != address(0)) {
-            return (false, unicode"Quote token must be native ETH / 報價幣必須為原生 ETH");
-        }
         if (data.dividendBps != 0) {
             return (false, unicode"Dividend BPS must be 0 / 分紅 BPS 必須為 0");
         }
@@ -193,7 +222,7 @@ contract MyxVaultFactory is VaultFactoryBaseV2, IVaultFactoryDividendV23 {
     /// @notice UI-discovery counterpart to _validateBeforeLaunch — INFORMATIONAL ONLY.
     ///         Lets the Flap UI surface/auto-fill required params.
     function tokenCreationPolicies() public pure override returns (FactoryPolicy[] memory policies) {
-        policies = new FactoryPolicy[](3);
+        policies = new FactoryPolicy[](2);
         policies[0] = FactoryPolicy({
             target: "dividendToken",
             operator: "eq",
@@ -201,12 +230,6 @@ contract MyxVaultFactory is VaultFactoryBaseV2, IVaultFactoryDividendV23 {
             description: unicode"Dividend token must be MAGIC_DIVIDEND_COMPUTED (resolved on-chain to myx LP). / 分紅幣必須設為 MAGIC_DIVIDEND_COMPUTED（由合約解析為 myx LP）。"
         });
         policies[1] = FactoryPolicy({
-            target: "quoteToken",
-            operator: "eq",
-            value: abi.encode(address(0)),
-            description: unicode"Quote token must be native ETH (address(0)). / 報價幣必須為原生 ETH（address(0)）。"
-        });
-        policies[2] = FactoryPolicy({
             target: "dividendBps",
             operator: "eq",
             value: abi.encode(uint256(0)),
@@ -215,18 +238,29 @@ contract MyxVaultFactory is VaultFactoryBaseV2, IVaultFactoryDividendV23 {
     }
 
     function vaultDataSchema() public pure override returns (VaultDataSchema memory schema) {
-        // vaultData carries the myx MARKET quote token (e.g. USDT/USDC): used only to derive the
-        // myx marketId (keccak256(chainId, quoteToken)) and base pool on-chain. The dividend ASSET
-        // is the myx LP (mBase) produced by depositing the bought-back tax token — not this token.
-        // dividendToken is set to MAGIC_DIVIDEND_COMPUTED and resolved to mBase via resolveDividendToken.
         schema.description =
-            unicode"myx market quote token (e.g. USDT/USDC) used to derive the myx pool. The reward is the resulting myx LP, not this token. / myx 市場報價幣（如 USDT/USDC），用於推導 myx 池。獎勵為產出的 myx LP，而非此幣。";
-        schema.fields = new FieldDescriptor[](1);
+            unicode"myx market quote token (e.g. USDT/USDC) plus this vault's thresholds. The reward is the resulting myx LP. / myx 市場報價幣（如 USDT/USDC）與本金庫的閾值設定。獎勵為產出的 myx LP。";
+        schema.fields = new FieldDescriptor[](4);
         schema.fields[0] = FieldDescriptor(
-            "quoteToken",
-            "address",
-            unicode"myx market quote token (e.g. USDT/USDC). Identifies the myx market; the reward is the myx LP. / myx 市場報價幣（如 USDT/USDC），用於識別 myx 市場；獎勵為 myx LP。",
+            "marketQuoteToken", "address", unicode"myx market quote token (e.g. USDT/USDC). / myx 市場報價幣（如 USDT/USDC）。", 0
+        );
+        schema.fields[1] = FieldDescriptor(
+            "minProcessAmount",
+            "uint256",
+            unicode"Minimum tax (in the launch quote token's smallest unit) before a buyback runs. / 執行回購前的最低稅收（以發行報價幣最小單位計）。",
             0
+        );
+        schema.fields[2] = FieldDescriptor(
+            "gasThreshold",
+            "uint256",
+            unicode"ERC20 quote only: refill the BNB gas pool below this balance. 0 for native quote. / 僅 ERC20 報價幣：Gas 池低於此值時補充。原生報價幣填 0。",
+            18
+        );
+        schema.fields[3] = FieldDescriptor(
+            "gasRefillAmount",
+            "uint256",
+            unicode"ERC20 quote only: gas pool target after a refill, must exceed gasThreshold. 0 for native quote. / 僅 ERC20 報價幣：補充後的 Gas 池目標，須大於閾值。原生報價幣填 0。",
+            18
         );
         schema.isArray = false;
     }

@@ -22,7 +22,7 @@ contract DeployMyxVaultFactory is Script {
                 // v2.3 resolveDividendToken callback. Env-driven (MYX not yet live on BSC mainnet).
                 poolFactory: vm.envAddress("MYX_POOL_FACTORY"),
                 maxSlippageBps: 300,
-                minProcessAmount: 1
+                minInitialGas: 0.002 ether
             })
         );
         console2.log("MyxVaultFactory:", address(factory));

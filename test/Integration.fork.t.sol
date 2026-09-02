@@ -80,7 +80,7 @@ contract MyxVaultForkTest is FlapBSCFixture {
                 // 5%: the buyback minOut is bounded by a pre-trade same-block Portal quote,
                 // so the bound must absorb the curve impact of the vault's own buy.
                 maxSlippageBps: 500,
-                minProcessAmount: 0.001 ether // small so a modest trade clears it
+                minInitialGas: 0
             })
         );
 
@@ -107,7 +107,7 @@ contract MyxVaultForkTest is FlapBSCFixture {
         //    resolves to this same VaultPortal on chainId 56, so the access check passes.
         //    vaultData carries the single v4-5 field: the market quote token (= dividendToken).
         //    The vault derives marketId = keccak256(chainId, BSC_USDT) and the pool key from it.
-        bytes memory vaultData = abi.encode(BSC_USDT);
+        bytes memory vaultData = abi.encode(BSC_USDT, uint256(0.001 ether), uint256(0), uint256(0));
         bytes32 salt = _findVanitySalt(VanityType.VANITY_7777, TOKEN_IMPL_TAXED_V3, PORTAL);
 
         IVaultPortalTypes.NewTokenV6WithVaultParams memory params =

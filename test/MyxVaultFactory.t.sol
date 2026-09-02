@@ -8,7 +8,7 @@ import {MarketId, PoolId, MyxPoolId, MyxMarketId, IMyxPoolFactory} from "../src/
 import {IVaultFactoryValidationV2, DIVIDEND_TOKEN_LAUNCH_VERSION_V6, DIVIDEND_TOKEN_LAUNCH_VERSION_V7} from "../src/flap/IVaultFactory.sol";
 import {IVaultPortalTypes} from "../src/flap/IVaultPortal.sol";
 import {MAGIC_DIVIDEND_COMPUTED} from "../src/flap/IPortal.sol";
-import {FactoryPolicy} from "../src/flap/IVaultSchemasV1.sol";
+import {VaultDataSchema, FactoryPolicy} from "../src/flap/IVaultSchemasV1.sol";
 import "./mocks/Mocks.sol";
 
 contract MyxVaultFactoryTest is Test {
@@ -25,6 +25,9 @@ contract MyxVaultFactoryTest is Test {
 
     address constant VAULT_PORTAL = 0x90497450f2a706f1951b5bdda52B4E5d16f34C06; // BSC mainnet
     address constant GUARDIAN = 0x9e27098dcD8844bcc6287a557E0b4D09C86B8a4b;
+    address constant PORTAL = 0xe2cE6ab80874Fa9Fa2aAE65D277Dd6B8e65C9De0;
+    MockPortal portal;
+    MockERC20 rwa;
     // v4-5: the launch param is the market quote token; the vault derives marketId on-chain.
     // Assigned in setUp() once usdt exists; tests run on chainId 56.
     MarketId marketId;
@@ -41,6 +44,11 @@ contract MyxVaultFactoryTest is Test {
         poolManager = new MockPoolManager();
         poolFactory = new MockMyxPoolFactory();
         router = new MockPancakeRouter();
+        rwa = new MockERC20("NVDA bStock", "NVDAB");
+        MockPortal portalImpl = new MockPortal();
+        vm.etch(PORTAL, address(portalImpl).code);
+        portal = MockPortal(PORTAL);
+        portal.setQuoteConfig(address(rwa), true, 0);
 
         factory = new MyxVaultFactory(_baseConfig());
     }
@@ -51,14 +59,18 @@ contract MyxVaultFactoryTest is Test {
             basePool: address(basePool),
             poolFactory: address(poolFactory),
             maxSlippageBps: 300,
-            minProcessAmount: 0.1 ether
+            minInitialGas: 0.002 ether
         });
     }
 
     function _vaultData() internal view returns (bytes memory) {
         // v4-5: vaultData carries the market quote token (= the token's dividendToken); the vault
         // derives marketId = keccak256(chainId, quoteToken) and the pool key from it on-chain.
-        return abi.encode(address(usdt));
+        return abi.encode(address(usdt), uint256(0.1 ether), uint256(0), uint256(0));
+    }
+
+    function _erc20VaultData() internal view returns (bytes memory) {
+        return abi.encode(address(usdt), uint256(10 ether), uint256(0.01 ether), uint256(0.05 ether));
     }
 
     function test_newVault_onlyVaultPortal() public {
@@ -109,20 +121,30 @@ contract MyxVaultFactoryTest is Test {
         // initializer (ZeroMarketQuoteToken), bubbling up through the factory's BeaconProxy deploy.
         vm.prank(VAULT_PORTAL);
         vm.expectRevert(bytes(unicode"Zero market quote token / 市場報價幣為零地址"));
-        factory.newVault(makeAddr("tax"), address(0), makeAddr("creator"), abi.encode(address(0)));
+        factory.newVault(makeAddr("tax"), address(0), makeAddr("creator"), abi.encode(address(0), uint256(1), uint256(0), uint256(0)));
     }
 
-    function test_isQuoteTokenSupported_onlyBnb() public view {
+    function test_isQuoteTokenSupported_nativeAlways() public view {
         assertTrue(factory.isQuoteTokenSupported(address(0)));
-        assertFalse(factory.isQuoteTokenSupported(address(usdt)));
     }
 
-    function test_validateBeforeLaunch_rejectsErc20Quote() public view {
+    function test_isQuoteTokenSupported_portalEnabledErc20() public view {
+        assertTrue(factory.isQuoteTokenSupported(address(rwa)));
+        assertFalse(factory.isQuoteTokenSupported(address(usdc)), "not enabled on the Portal");
+    }
+
+    function test_isQuoteTokenSupported_robinhood_nativeOnly() public {
+        vm.chainId(4663);
+        assertTrue(factory.isQuoteTokenSupported(address(0)));
+        assertFalse(factory.isQuoteTokenSupported(address(rwa)));
+    }
+
+    function test_validateBeforeLaunch_acceptsErc20QuoteWithMagicDividend() public view {
         IVaultFactoryValidationV2.LaunchValidationDataV1 memory data;
-        data.quoteToken = address(usdt);
-        (bool ok, string memory reason) = factory.onBeforeLaunch(abi.encode(data));
-        assertFalse(ok);
-        assertGt(bytes(reason).length, 0);
+        data.quoteToken = address(rwa);
+        data.dividendToken = MAGIC_DIVIDEND_COMPUTED;
+        (bool ok,) = factory.onBeforeLaunch(abi.encode(data));
+        assertTrue(ok);
     }
 
     function test_validateBeforeLaunch_acceptsBnbQuoteWithMagicDividend() public view {
@@ -164,15 +186,43 @@ contract MyxVaultFactoryTest is Test {
 
     function test_tokenCreationPolicies_declaresConstraints() public view {
         FactoryPolicy[] memory policies = factory.tokenCreationPolicies();
-        assertEq(policies.length, 3);
+        assertEq(policies.length, 2);
         assertEq(policies[0].target, "dividendToken");
-        assertEq(policies[0].operator, "eq");
         assertEq(abi.decode(policies[0].value, (address)), MAGIC_DIVIDEND_COMPUTED);
-        assertEq(policies[1].target, "quoteToken");
-        assertEq(abi.decode(policies[1].value, (address)), address(0));
-        assertEq(policies[2].target, "dividendBps");
-        assertEq(abi.decode(policies[2].value, (uint256)), 0);
+        assertEq(policies[1].target, "dividendBps");
+        assertEq(abi.decode(policies[1].value, (uint256)), 0);
     }
+
+    function test_vaultDataSchema_fourFields() public view {
+        VaultDataSchema memory s = factory.vaultDataSchema();
+        assertEq(s.fields.length, 4);
+        assertEq(s.fields[0].name, "marketQuoteToken");
+        assertEq(s.fields[1].name, "minProcessAmount");
+        assertEq(s.fields[2].name, "gasThreshold");
+        assertEq(s.fields[3].name, "gasRefillAmount");
+        assertFalse(s.isArray);
+    }
+
+    function test_newVault_erc20Quote_wiresQuoteAndParams() public {
+        vm.deal(address(this), 1 ether);
+        factory.prepayGas{value: 0.002 ether}(); // Task 10 enforces this; harmless before
+        vm.prank(VAULT_PORTAL);
+        address vaultAddr = factory.newVault(makeAddr("tax"), address(rwa), address(this), _erc20VaultData());
+        MyxVault v = MyxVault(payable(vaultAddr));
+        assertEq(v.vaultQuoteToken(), address(rwa));
+        assertEq(v.minProcessAmount(), 10 ether);
+        assertEq(v.gasThreshold(), 0.01 ether);
+        assertEq(v.gasRefillAmount(), 0.05 ether);
+        assertEq(v.marketQuoteToken(), address(usdt));
+    }
+
+    function test_newVault_nativeQuote_rejectsGasParams() public {
+        vm.prank(VAULT_PORTAL);
+        vm.expectRevert(bytes(unicode"Gas params must be zero for native quote / 原生報價幣的 Gas 參數必須為零"));
+        factory.newVault(makeAddr("tax"), address(0), makeAddr("creator"), abi.encode(address(usdt), uint256(1), uint256(1), uint256(2)));
+    }
+
+    receive() external payable {}
 
     function test_upgradeOnlyGuardian() public {
         address newImpl = address(new MyxVault());
@@ -202,7 +252,7 @@ contract MyxVaultFactoryTest is Test {
         // vaultData — the same source newVault decodes — so the predicted LP and the vault's pool
         // share the same myx market.
         p.quoteToken = address(0);
-        p.vaultData = abi.encode(marketQuote);
+        p.vaultData = abi.encode(marketQuote, uint256(1), uint256(0), uint256(0));
         p.dividendToken = dividendToken;
         return abi.encode(p);
     }
@@ -267,7 +317,7 @@ contract MyxVaultFactoryTest is Test {
         IVaultPortalTypes.NewTokenV7WithVaultParamsU8 memory p;
         p.symbol = symbol;
         p.quoteToken = address(0); // Flap bonding quote is native BNB
-        p.vaultData = abi.encode(marketQuote);
+        p.vaultData = abi.encode(marketQuote, uint256(1), uint256(0), uint256(0));
         // feeConfigs[0] carries the DIVIDEND slot
         p.feeConfigs[0].feeType = 2; // DIVIDEND
         p.feeConfigs[0].dividendToken = dividendInFee;
@@ -304,7 +354,7 @@ contract MyxVaultFactoryTest is Test {
         IVaultPortalTypes.NewTokenV7WithVaultParamsU8 memory p;
         p.symbol = "DEMO";
         p.quoteToken = address(0);
-        p.vaultData = abi.encode(address(usdt));
+        p.vaultData = abi.encode(address(usdt), uint256(1), uint256(0), uint256(0));
         // All feeConfigs stay feeType=0 (NONE) — no DIVIDEND entry
         bytes memory launchParams = abi.encode(p);
         vm.expectRevert(bytes(unicode"No V7 dividend feeConfig / 無 V7 分紅費用配置"));
