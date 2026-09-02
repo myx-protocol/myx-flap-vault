@@ -69,7 +69,11 @@ function computeDividendToken(address predictedToken, bytes calldata hint) exter
 | `claimReward()` | 任意人 | 代理 `dividend.withdrawDividendsFor(msg.sender)` |
 | `pendingReward(user)` | view | 代理 `dividend.withdrawableDividends(user)`（mBase LP 单位） |
 | `ensurePoolDeployed()` | 任意人 | 可选预建池 |
-| `emergencyWithdraw / emergencySweepBnb / emergencyRescueToken` | EMERGENCY_ROLE(Guardian+creator) | 赎回 LP / 清 BNB / 救援滞留 LP 或杂入 ERC20 |
+| `sync()` | 任意人 | 补记未经 `receive()` ping 到账的报价余额（V3 balance-delta 兜底识别） |
+| `fundGas()` | 任意人 | 仅 ERC20 报价金库：充值 BNB gas 池，用于支付 FlapTriggerService 手续费 |
+| `gasBalance()` | view | 金库当前 gas 池余额（原生报价金库恒为 0，其 BNB 全部是收益） |
+| `vaultQuoteToken()` | view | Flap Spec V3 必备接口：返回本金库的报价币（原生 BNB 为 `address(0)`，或 Portal 已启用的 ERC20/RWA 报价币） |
+| `emergencyWithdraw / emergencySweepNative / emergencyRescueToken` | EMERGENCY_ROLE(Guardian+creator) | 赎回 LP / 清空原生币 / 救援滞留 LP 或杂入 ERC20（含重置报价币 baseline） |
 
 - `initialize`：`marketId = derive(chainid, marketQuoteToken)`，`poolId = derive(marketId, taxToken)`；授 Guardian `DEFAULT_ADMIN+EMERGENCY`、creator `EMERGENCY`；`revokeRole` 对 Guardian 不可撤销。
 - **无 trigger / 无三模式 / 无 operator**：`process` 无许可（tax token 无外部喂价，同块 quote minOut 兜底单次损失；这是经过权衡的取舍）。
@@ -97,7 +101,7 @@ function computeDividendToken(address predictedToken, bytes calldata hint) exter
 ## 8. 部署
 - 工厂部署脚本：`script/{mainnet,testnet}/bnb/DeployMyxVaultFactory.s.sol`，GlobalConfig 走 env（`MYX_POOL_MANAGER/MYX_BASE_POOL/MYX_POOL_FACTORY` + maxSlippageBps/minProcessAmount）。
 - 前置依赖：myx 在 BSC 部署 + 对应 quote(USDT/USDC) market 由 RISK_ADMIN 创建。
-- 发币：dividendToken 填 `MAGIC_DIVIDEND_COMPUTED`，vaultFactory 填本工厂，vaultData = `abi.encode(quoteToken)`，hint 带 `(quoteToken, MEME symbol)`。
+- 发币：dividendToken 填 `MAGIC_DIVIDEND_COMPUTED`，vaultFactory 填本工厂，vaultData = `abi.encode(address marketQuoteToken, uint256 minProcessAmount, uint256 gasThreshold, uint256 gasRefillAmount)`，hint 带 `(quoteToken, MEME symbol)`。ERC20 报价币发币前，创建者须先调用 `factory.prepayGas{value: ...}()` 预付 BNB gas（至少 `minInitialGas`）；`newVault` 会把预付余额整笔转入新金库的 gas 池。
 
 ## 9. 参考
 - `.agents/skills/flap-vault-spec-checker/`（Rule 001–009 合规）；最新审计：`docs/spec-checker-findings.md`。

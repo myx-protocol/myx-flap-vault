@@ -7,9 +7,15 @@ import {MyxVaultFactory} from "../../../src/MyxVaultFactory.sol";
 /// @notice Deploys MyxVaultFactory on BNB mainnet (chainId 56).
 ///         MYX protocol addresses (poolManager, basePool) remain env-driven because MYX has
 ///         not yet been deployed on BSC mainnet; hardcoding them here would embed unverified
-///         addresses that will change at launch. v4 removed the DEX router, WBNB, quote token
-///         and Chainlink feed config: harvest distributes the pool quote token directly as the
-///         dividend token (no swap, no feeds), so those mainnet constants are no longer needed.
+///         addresses that will change at launch.
+///         Vault is Flap spec V3 (`VaultBaseV3`): the launch quote may be native BNB or any
+///         ERC20/RWA quote token enabled on the Flap Portal (`vaultQuoteToken()`). Per-vault
+///         `minProcessAmount` is no longer part of `GlobalConfig` — it is creator-supplied per
+///         launch via `vaultData` (`abi.encode(address marketQuoteToken, uint256 minProcessAmount,
+///         uint256 gasThreshold, uint256 gasRefillAmount)`). `minInitialGas` below is the
+///         factory-wide floor on the BNB a creator must prepay via `factory.prepayGas()` before
+///         launching an ERC20-quote vault; the factory forwards the full prepaid balance into the
+///         new vault's gas pool at `newVault`.
 contract DeployMyxVaultFactory is Script {
     function run() external {
         require(block.chainid == 56, "wrong chain");
@@ -22,6 +28,7 @@ contract DeployMyxVaultFactory is Script {
                 // v2.3 resolveDividendToken callback. Env-driven (MYX not yet live on BSC mainnet).
                 poolFactory: vm.envAddress("MYX_POOL_FACTORY"),
                 maxSlippageBps: 300,
+                // ERC20-quote launches must prepay at least 10 FlapTriggerService fees (0.0002 BNB each).
                 minInitialGas: 0.002 ether
             })
         );

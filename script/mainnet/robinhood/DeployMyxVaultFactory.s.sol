@@ -7,12 +7,17 @@ import {MyxVaultFactory} from "../../../src/MyxVaultFactory.sol";
 /// @notice Deploys MyxVaultFactory on Robinhood Chain mainnet (chainId 4663).
 ///         MYX protocol addresses stay env-driven, matching the BNB scripts.
 /// @dev Two deliberate differences from the BNB mainnet script:
-///      1. minProcessAmount is NOT 1 wei. The native currency here is ETH and the
+///      1. ERC20/RWA quote launches are not supported on Robinhood Chain in this release — native
+///         ETH only — so `minInitialGas` is 0: no creator prepay is required or accepted here.
+///         Per-vault `minProcessAmount` is no longer part of `GlobalConfig`; it is creator-supplied
+///         per launch via `vaultData` (`abi.encode(address marketQuoteToken, uint256
+///         minProcessAmount, uint256 gasThreshold, uint256 gasRefillAmount)`). For native launches
+///         on this chain, recommend 0.004 ETH: the native currency here is ETH and the
 ///         FlapTriggerService fee is 0.0004 ETH (vs 0.0002 BNB on BSC), and scheduleProcess()
-///         requires pendingBnb >= minProcessAmount + fee. With a 1 wei floor the fee would
-///         consume essentially the entire scheduled batch. 0.004 ETH keeps the fee at roughly
-///         10% of a batch. Flap documents that Robinhood fees are expected to become dynamic,
-///         so re-check getFee() against this floor before each deployment.
+///         requires pendingQuote >= minProcessAmount + fee — with a 1 wei floor the fee would
+///         consume essentially the entire scheduled batch. 0.004 ETH keeps the fee at roughly 10%
+///         of a batch. Flap documents that Robinhood fees are expected to become dynamic, so
+///         re-check getFee() against this recommendation before each deployment.
 ///      2. Robinhood Chain testnet (46630) has no script: Flap ships a trigger service there
 ///         but no Portal or Guardian, so a vault cannot initialize on that chain.
 contract DeployMyxVaultFactory is Script {
