@@ -6,13 +6,28 @@ import {IERC20} from "@openzeppelin/token/ERC20/IERC20.sol";
 
 import {FlapBSCFixture} from "./FlapBSCFixture.sol";
 import {IVaultPortalTypes} from "../src/flap/IVaultPortal.sol";
-import {IPortalTradeV2} from "../src/flap/IPortal.sol";
+import {MAGIC_DIVIDEND_COMPUTED, IPortalTradeV2} from "../src/flap/IPortal.sol";
 
 import {MyxVault} from "../src/MyxVault.sol";
 import {MyxVaultFactory} from "../src/MyxVaultFactory.sol";
 import {MarketId, PoolId, MyxPoolId, MyxMarketId} from "../src/myx/IMyxPool.sol";
 
-import {MockERC20, MockBasePool, MockPoolManager, MockMyxPoolFactory} from "./mocks/Mocks.sol";
+import {MockERC20, MockBasePool, MockPoolManager} from "./mocks/Mocks.sol";
+
+/// @dev Minimal stand-in for the myx PoolFactory: answers every predictBasePoolToken query with a
+///      fixed, real ERC20 so the VaultPortal's v2.3 resolveDividendToken callback returns a token
+///      the live launch path accepts. The dividend leg itself is unit-tested, not proven here.
+contract FixedLpPredictor {
+    address public immutable lp;
+
+    constructor(address _lp) {
+        lp = _lp;
+    }
+
+    function predictBasePoolToken(MarketId, address, string calldata) external view returns (address) {
+        return lp;
+    }
+}
 
 /// @title MyxVaultForkTest
 /// @notice BSC mainnet fork end-to-end proof of the v6 buyback flow: launches a REAL Flap V3
@@ -36,23 +51,24 @@ contract MyxVaultForkTest is FlapBSCFixture {
     address internal constant PANCAKE_ROUTER = 0x10ED43C718714eb63d5aA57B78B54704E256024E;
     address internal constant BNB_USD_FEED = 0x0567F2323251f0Aab15c8dFb1967E4e8A7D42aeE;
     address internal constant USDT_USD_FEED = 0xB97Ad0E74fa7d920791E90258A6E2085088b4320;
-    // Real BSC USDT (18 decimals). Used as the launched token's dividendToken so the launch
-    // clears the factory's _validateBeforeLaunch precheck (native/self dividend are rejected),
-    // and as the mock pool's quoteToken so harvest reads a real ERC20 (zero balance no-op).
+    // Real BSC USDT (18 decimals). Used as the myx MARKET quote token in vaultData, and as the
+    // address the FixedLpPredictor hands back for resolveDividendToken, so the launched token's
+    // dividend token is a real ERC20 the live VaultPortal accepts.
     address internal constant BSC_USDT = 0x55d398326f99059fF775485246999027B3197955;
 
-    // v4-5: the vault derives the MYX marketId on-chain from (block.chainid, quoteToken). The launch
-    // passes BSC_USDT as the quote token (= the launched token's dividendToken), so the expected
-    // marketId mirrors keccak256(56, BSC_USDT). chainId 56 holds on the BSC mainnet fork.
+    // The vault derives the MYX marketId on-chain from (block.chainid, marketQuoteToken). vaultData
+    // carries BSC_USDT as the market quote, so the expected marketId mirrors keccak256(56, BSC_USDT).
+    // chainId 56 holds on the BSC mainnet fork.
     MarketId internal marketId = MyxMarketId.derive(uint64(56), BSC_USDT);
 
     // ── Our deployments on the fork ───────────────────────────────────────────
     MyxVaultFactory internal factory;
     MockPoolManager internal poolManager;
-    MockMyxPoolFactory internal poolFactory;
+    FixedLpPredictor internal poolFactory;
     MockBasePool internal basePool;
     MockERC20 internal usdt;
     MockERC20 internal lpToken;
+    uint256 internal saltNonce;
 
     function setUp() public {
         _forkBSCMainnet();
@@ -63,15 +79,18 @@ contract MyxVaultForkTest is FlapBSCFixture {
         lpToken = new MockERC20("MYX LP", "MLP");
         basePool = new MockBasePool(lpToken, usdt);
         poolManager = new MockPoolManager();
-        poolFactory = new MockMyxPoolFactory();
+        // The mock's deployPool stamps this as the pool's basePoolToken (mBase LP). It must be a
+        // real contract: process() always ends in _feedDividend, which reads balanceOf(lp).
+        poolManager.setLpTokenForDeploy(address(lpToken));
+        poolFactory = new FixedLpPredictor(BSC_USDT);
 
         // Deploy OUR factory: MYX side pointed at the mocks.
-        // TODO(v6): rework the dividend assertions for the v2.3 resolveDividendToken path — the
-        // launched token will carry MAGIC_DIVIDEND_COMPUTED and the dividend token is the myx mBase
-        // LP resolved via factory.resolveDividendToken(predicted, launchVersion, launchParams), not BSC_USDT. This fork
-        // test proves only the permissionless buyback + deposit leg; the dividend-feed leg against a
-        // real wired LP dividend stays unit-tested. The poolFactory mock here is wired only so the
-        // constructor config is well-formed.
+        // NOTE: the launch carries MAGIC_DIVIDEND_COMPUTED and the live VaultPortal resolves it
+        // through factory.resolveDividendToken(predicted, launchVersion, launchParams), which
+        // delegates to config.poolFactory. The FixedLpPredictor makes that resolve to BSC_USDT, a
+        // real ERC20, so the launch clears the VaultPortal's dividend wiring. This fork test proves
+        // only the permissionless buyback + deposit leg; the dividend-feed leg against a real wired
+        // mBase LP dividend stays unit-tested.
         factory = new MyxVaultFactory(
             MyxVaultFactory.GlobalConfig({
                 poolManager: address(poolManager),
@@ -93,26 +112,38 @@ contract MyxVaultForkTest is FlapBSCFixture {
         vm.label(address(factory), "MyxVaultFactory");
     }
 
+    /// @dev A salt whose predicted token address is both vanity-7777 and UNUSED on mainnet. The
+    ///      VanityHelper salt is seeded from block.number, which on a pinned fork collides with
+    ///      tokens already staged on mainnet (TokenAlreadyStaged) — seed from this contract and a
+    ///      per-call nonce instead, and skip any prediction that already has code.
+    function _freshSalt() internal returns (bytes32 salt) {
+        salt = keccak256(abi.encode(address(this), block.timestamp, saltNonce++, "myx-fork"));
+        while (true) {
+            address predicted = _predictAddress(TOKEN_IMPL_TAXED_V3, salt, PORTAL);
+            if (_endsWith7777(predicted) && predicted.code.length == 0) return salt;
+            salt = bytes32(uint256(salt) + 1);
+        }
+    }
+
     /// @dev Shared launch + trade + dispatch flow used by BOTH fork tests. Launches a REAL Flap V3
     ///      tax token through the REAL VaultPortal pointed at OUR factory, trades on the bonding
     ///      curve to generate tax, then dispatches the real TaxProcessor under the 1M gas cap so the
     ///      vault is credited via receive(). Returns the launched token and its resolved vault, with
     ///      pendingQuote > 0.
-    /// @dev dividendToken is set to REAL BSC USDT (not address(0)): the factory's _validateBeforeLaunch
-    ///      now rejects native-BNB / self dividend, so the launch must carry a real ERC20 dividendToken
-    ///      to clear onBeforeLaunch on the real VaultPortal.
+    /// @dev dividendToken is MAGIC_DIVIDEND_COMPUTED: the factory's _validateBeforeLaunch rejects
+    ///      anything else, and the live VaultPortal resolves the magic value through the factory's
+    ///      v2.3 resolveDividendToken callback (here: BSC_USDT via the FixedLpPredictor).
     function _launchAndFundVault() internal returns (address token, MyxVault vault) {
         // 1. Launch a REAL Flap V3 tax token through the REAL VaultPortal, passing OUR factory.
         //    The VaultPortal will call factory.newVault(...) — the factory's _getVaultPortal()
         //    resolves to this same VaultPortal on chainId 56, so the access check passes.
-        //    vaultData carries the single v4-5 field: the market quote token (= dividendToken).
-        //    The vault derives marketId = keccak256(chainId, BSC_USDT) and the pool key from it.
+        //    vaultData carries the myx MARKET quote token plus this vault's thresholds. The vault
+        //    derives marketId = keccak256(chainId, BSC_USDT) and the pool key from it.
         bytes memory vaultData = abi.encode(BSC_USDT, uint256(0.001 ether), uint256(0), uint256(0));
-        bytes32 salt = _findVanitySalt(VanityType.VANITY_7777, TOKEN_IMPL_TAXED_V3, PORTAL);
 
         IVaultPortalTypes.NewTokenV6WithVaultParams memory params =
-            _buildV3TaxTokenParams("Myx Vault Token", "MVT", salt, address(factory), vaultData);
-        params.dividendToken = BSC_USDT; // real ERC20: clears the factory dividend precheck
+            _buildV3TaxTokenParams("Myx Vault Token", "MVT", _freshSalt(), address(factory), vaultData);
+        params.dividendToken = MAGIC_DIVIDEND_COMPUTED; // resolved on-chain via resolveDividendToken
 
         token = vaultPortal.newTokenV6WithVault{value: params.quoteAmt}(params);
         assertTrue(token != address(0), "launch returned zero token");
