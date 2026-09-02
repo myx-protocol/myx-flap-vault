@@ -25,9 +25,12 @@ import {IFlapTriggerService, ITriggerReceiver} from "./flap/IFlapTriggerService.
 ///      that same mBase LP (wired at launch). Holders claim the mBase LP via
 ///      the dividend (fairly, via Flap setShare hooks), then earn myx rebates by holding it.
 /// @dev Invariants:
-///      - receive() does accounting (pendingQuote += msg.value) then best-effort schedules a delayed
-///        process() via FlapTriggerService in try/catch; accounting is the Rule-005 core and the
-///        schedule never reverts receive() (deliberate Rule-005 deviation, see auto-trigger doc).
+///      - receive() recognizes revenue via Rule-010 balance-delta accounting (pendingQuote advances to
+///        the currency-agnostic quote balance — native: address(this).balance, ERC20: quoteToken
+///        balanceOf(this)) then best-effort schedules a delayed process() via FlapTriggerService in
+///        try/catch; accounting is the Rule-005/010 core and the schedule never reverts receive()
+///        (deliberate Rule-005 deviation, see auto-trigger doc). sync() exposes the same recognition
+///        permissionlessly for callers who cannot reach receive() with a wake call.
 ///      - process() is permissionless: anyone may convert pending ETH into liquidity + dividend.
 ///      - The LP IS the dividend asset: dividendToken == basePoolToken == mBase. _feedDividend
 ///        deposits the whole held LP balance; if the dividend is unwired or deposit() returns false
@@ -163,17 +166,43 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
         return quoteToken;
     }
 
-    /// @dev Accounting + best-effort auto-schedule. Accounting (pendingQuote += msg.value) runs first
-    ///      and is the Rule-005 core. Scheduling a delayed process() via FlapTriggerService is wrapped
-    ///      in try/catch (self-call) so ANY scheduling failure — service down, fee insufficient, OOG —
-    ///      degrades to "not scheduled" and NEVER reverts receive() or loses tax. The external call is
-    ///      a deliberate Rule-005 deviation (see auto-trigger design doc); never-revert is preserved.
+    /// @dev Rule-010 balance-delta recognition, currency-agnostic. Wake sources: native value
+    ///      transfers (native quote), the TaxProcessor's zero-value ping after an ERC20 payout,
+    ///      anyone calling with empty calldata. Zero-delta wakes are silent no-ops. Scheduling a
+    ///      delayed process() via FlapTriggerService is wrapped in try/catch (self-call) so ANY
+    ///      scheduling failure — service down, fee insufficient, OOG — degrades to "not scheduled"
+    ///      and NEVER reverts receive() or loses tax. The external call is a deliberate Rule-005
+    ///      deviation (see auto-trigger design doc); never-revert is preserved. Skipped while the
+    ///      reentrancy guard is entered so process()'s internal WBNB unwrap (Task 7) cannot schedule
+    ///      a trigger mid-process.
     receive() external payable {
-        pendingQuote += msg.value;
-        emit RevenueReceived(msg.value, pendingQuote);
-        if (!hasPendingTrigger && pendingQuote >= minProcessAmount) {
+        _sync();
+        if (!hasPendingTrigger && pendingQuote >= minProcessAmount && !_reentrancyGuardEntered()) {
             try this.scheduleProcess() {} catch {}
         }
+    }
+
+    /// @notice Permissionless recognition entry: credits revenue that arrived without a wake call
+    ///         (e.g. a plain ERC20 transfer with no follow-up ping, or a forced native credit).
+    function sync() external {
+        _sync();
+    }
+
+    /// @dev Currency-agnostic quote balance: native uses address(this).balance, ERC20 the vault's
+    ///      quoteToken balance.
+    function _quoteBalance() internal view returns (uint256) {
+        return quoteToken == address(0) ? address(this).balance : IERC20(quoteToken).balanceOf(address(this));
+    }
+
+    /// @dev Advances pendingQuote to the current quote balance and emits the recognized delta. Never
+    ///      reverts; a balance at or below the current baseline (nothing new, or an outflow already
+    ///      accounted elsewhere) is a silent no-op.
+    function _sync() internal returns (uint256 newRevenue) {
+        uint256 bal = _quoteBalance();
+        if (bal <= pendingQuote) return 0;
+        newRevenue = bal - pendingQuote;
+        pendingQuote = bal;
+        emit RevenueReceived(newRevenue, pendingQuote);
     }
 
     /// @notice Schedules a delayed process() via FlapTriggerService. ONLY the vault itself may call

@@ -127,6 +127,16 @@ contract MyxVaultInitTest is MyxVaultTestBase {
         assertTrue(ok);
         assertEq(vault.pendingQuote(), 1 ether);
         assertEq(address(vault).balance, 1 ether);
+        // zero-value wake with no new revenue is a silent no-op
+        (ok,) = address(vault).call{value: 0}("");
+        assertTrue(ok);
+        assertEq(vault.pendingQuote(), 1 ether);
+    }
+
+    function test_sync_native_recognizesForceSentBalance() public {
+        vm.deal(address(vault), 0.5 ether); // e.g. selfdestruct / coinbase style credit
+        vault.sync();
+        assertEq(vault.pendingQuote(), 0.5 ether);
     }
 
     function test_receive_gasUnder1M() public {
