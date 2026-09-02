@@ -6,6 +6,8 @@ import {IERC20} from "@openzeppelin/token/ERC20/IERC20.sol";
 import {IMyxBasePool, IMyxPoolManager, PoolMetadata, PoolId, MarketId} from "../../src/myx/IMyxPool.sol";
 import {IPortalTradeV2} from "../../src/flap/IPortal.sol";
 import {ITriggerReceiver} from "../../src/flap/IFlapTriggerService.sol";
+import {IPortalQuoteConfigU8} from "../../src/flap/IPortalQuoteConfigU8.sol";
+import {IMultiDexRouter} from "../../src/flap/IMultiDexRouter.sol";
 
 contract MockERC20 is ERC20 {
     constructor(string memory n, string memory s) ERC20(n, s) {}
@@ -99,28 +101,55 @@ contract MockDividendDistributor {
 
 contract MockTaxToken is ERC20 {
     address public dividendContract;
+    address public taxProcessor;
     constructor(address _dividend) ERC20("Mock Tax Token", "MTT") { dividendContract = _dividend; }
     function setDividendContract(address d) external { dividendContract = d; }
+    function setTaxProcessor(address p) external { taxProcessor = p; }
     /// @dev Required so MockPortal can mint the tax token as a buy output.
     function mint(address to, uint256 amount) external { _mint(to, amount); }
 }
 
 /// @dev Buys outputToken at a fixed rate (out = in * rateNum / rateDen), minting MockTaxToken
-///      to the buyer. taxBps simulates the DEX-phase transfer tax: the buyer receives
-///      out * (10000 - taxBps) / 10000 while quoteExactInput still quotes the gross amount.
+///      to the buyer. Input may be native (msg.value == inputAmount) or an ERC20 pulled via
+///      transferFrom, mirroring the real Portal's "BUY with quote" path. taxBps simulates the
+///      DEX-phase transfer tax. Also serves Portal.getQuoteTokenConfiguration (uint8 view).
 contract MockPortal {
     uint256 public rateNum = 1;
     uint256 public rateDen = 1;
     uint16 public taxBps;
+    mapping(address => IPortalQuoteConfigU8.QuoteTokenConfigurationU8) internal quoteConfigs;
+
     function setRate(uint256 num, uint256 den) external { rateNum = num; rateDen = den; }
     function setTaxBps(uint16 t) external { taxBps = t; }
+    function setQuoteConfig(address quote, bool enabled, uint8 dexId) external {
+        quoteConfigs[quote] = IPortalQuoteConfigU8.QuoteTokenConfigurationU8({
+            enabled: enabled ? 1 : 0,
+            defaultCurve: 30,
+            alternativeCurve: 30,
+            nativeToQuoteSwapType: 7,
+            dexId: dexId
+        });
+    }
+
+    function getQuoteTokenConfiguration(address quote)
+        external
+        view
+        returns (IPortalQuoteConfigU8.QuoteTokenConfigurationU8 memory)
+    {
+        return quoteConfigs[quote];
+    }
 
     function quoteExactInput(IPortalTradeV2.QuoteExactInputParams calldata p) external view returns (uint256) {
         return (p.inputAmount * rateNum) / rateDen;
     }
 
     function swapExactInput(IPortalTradeV2.ExactInputParams calldata p) external payable returns (uint256 out) {
-        require(p.inputToken == address(0) && msg.value == p.inputAmount, "MockPortal: BNB in only");
+        if (p.inputToken == address(0)) {
+            require(msg.value == p.inputAmount, "MockPortal: bad msg.value");
+        } else {
+            require(msg.value == 0, "MockPortal: no value for ERC20 input");
+            IERC20(p.inputToken).transferFrom(msg.sender, address(this), p.inputAmount);
+        }
         out = (p.inputAmount * rateNum) / rateDen;
         require(out >= p.minOutputAmount, "MockPortal: INSUFFICIENT_OUTPUT_AMOUNT");
         uint256 net = (out * (10_000 - taxBps)) / 10_000;
@@ -258,5 +287,78 @@ contract MockFlapTriggerService {
     /// @dev Test helper: simulate the Flap backend firing the callback.
     function fire(uint256 requestId) external {
         ITriggerReceiver(requesterOf[requestId]).trigger(requestId);
+    }
+}
+
+/// @dev Stand-in for the per-token Flap TaxProcessor: only the swapRegistry() pointer is needed.
+contract MockTaxProcessor {
+    address public swapRegistry;
+    constructor(address _registry) { swapRegistry = _registry; }
+}
+
+/// @dev Stand-in for Flap's SwapRegistry: points at the MultiDexRouter and the wrapped native token.
+contract MockSwapRegistry {
+    address public multiDexRouter;
+    address public weth;
+    constructor(address _router, address _weth) { multiDexRouter = _router; weth = _weth; }
+    function setMultiDexRouter(address r) external { multiDexRouter = r; }
+}
+
+/// @dev Stand-in for Flap's MultiDexRouter V3 surface. Fee tiers mirror BSC dexId 0
+///      ([2500, 100, 10000, 500]). A pool "exists" when setPool(fee, true) was called; existing
+///      pools resolve to a synthetic contract address (this router) so `code.length > 0` holds,
+///      missing pools resolve to a code-less address. Swaps pay WBNB minted from the router's own
+///      native balance (tests vm.deal the router) so MockWBNB.withdraw is backed.
+contract MockMultiDexRouter is IMultiDexRouter {
+    MockWBNB public immutable wbnb;
+    uint24[] internal fees = [uint24(2500), uint24(100), uint24(10000), uint24(500)];
+    mapping(uint24 => bool) public poolExists;
+    mapping(uint24 => uint256) public rateNum;
+    mapping(uint24 => uint256) public rateDen;
+    mapping(uint24 => bool) public quoteReverts;
+    uint24 public lastFeeUsed;
+    uint256 public lastAmountIn;
+
+    constructor(MockWBNB _wbnb) { wbnb = _wbnb; }
+    receive() external payable {}
+
+    function setPool(uint24 fee, bool exists) external { poolExists[fee] = exists; }
+    function setRate(uint24 fee, uint256 num, uint256 den) external { rateNum[fee] = num; rateDen[fee] = den; }
+    function setQuoteReverts(uint24 fee, bool v) external { quoteReverts[fee] = v; }
+
+    function _out(uint24 fee, uint256 amountIn) internal view returns (uint256) {
+        if (rateDen[fee] == 0) return 0;
+        return (amountIn * rateNum[fee]) / rateDen[fee];
+    }
+
+    function getDEXInfo(uint8) external view returns (DEXInfo memory info) {
+        info.v3SupportedFees = fees;
+    }
+
+    function computeV3PoolAddress(uint8, address, address, uint24 fee) external view returns (address) {
+        if (poolExists[fee]) return address(this); // has code
+        return address(uint160(uint256(keccak256(abi.encode("no-pool", fee))))); // no code
+    }
+
+    function quoteExactInputSingle(uint8, QuoteExactInputSingleParams memory p)
+        external
+        view
+        returns (uint256 amountOut, uint160, uint32, uint256)
+    {
+        require(!quoteReverts[p.fee], "MockMultiDexRouter: quote reverted");
+        require(poolExists[p.fee], "MockMultiDexRouter: no pool");
+        amountOut = _out(p.fee, p.amountIn);
+    }
+
+    function exactInputSingle(uint8, ExactInputSingleParams calldata p) external payable returns (uint256 amountOut) {
+        require(poolExists[p.fee], "MockMultiDexRouter: no pool");
+        require(p.tokenOut == address(wbnb), "MockMultiDexRouter: tokenOut must be WBNB");
+        IERC20(p.tokenIn).transferFrom(msg.sender, address(this), p.amountIn);
+        amountOut = _out(p.fee, p.amountIn);
+        require(amountOut >= p.amountOutMinimum, "MockMultiDexRouter: INSUFFICIENT_OUTPUT_AMOUNT");
+        wbnb.deposit{value: amountOut}();
+        wbnb.transfer(p.recipient, amountOut);
+        lastFeeUsed = p.fee;
+        lastAmountIn = p.amountIn;
     }
 }
