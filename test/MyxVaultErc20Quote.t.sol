@@ -446,3 +446,34 @@ contract MyxVaultErc20EmergencyAndViewsTest is MyxVaultErc20QuoteTestBase {
 
     receive() external payable {}
 }
+
+/// @dev The gas-refill leg ends in WBNB.withdraw(), and the real WETH9/WBNB pays out with
+///      transfer() — a 2300 gas stipend for the vault's receive(). This fixture swaps the plain
+///      MockERC20 quote for MockProxiedERC20, whose balanceOf costs what a live RWA token's costs,
+///      so the stipend budget is measured honestly instead of against a warm mapping read.
+contract MyxVaultErc20StipendTest is MyxVaultErc20QuoteTestBase {
+    MockProxiedERC20 internal proxiedRwa;
+
+    function setUp() public override {
+        super.setUp();
+        proxiedRwa = new MockProxiedERC20("NVDA bStock", "NVDAB");
+        portal.setQuoteConfig(address(proxiedRwa), true, 0);
+        MyxVault.InitParams memory p = _initParams();
+        p.quoteToken = address(proxiedRwa);
+        vault = _deployVault(p);
+    }
+
+    /// @notice The unwrap must not revert because the vault's receive() overran the stipend the
+    ///         real WBNB forwards. receive() has to recognise its own unwrap and return early.
+    function test_process_refillUnwrapSurvivesWbnbTransferStipend() public {
+        proxiedRwa.mint(address(vault), 100 ether);
+        vault.sync();
+        assertEq(address(vault).balance, 0, "gas pool starts empty, below the threshold");
+
+        vault.process();
+
+        assertGe(address(vault).balance, GAS_THRESHOLD, "refill topped the gas pool up");
+        assertEq(vault.pendingQuote(), 0, "remainder bought back");
+        assertGt(basePool.lastDepositAmount(), 0, "buyback still deposited");
+    }
+}

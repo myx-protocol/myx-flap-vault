@@ -142,6 +142,12 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
     /// @dev Reserved storage for upgrades. 44 original - 2 (trigger) - 3 (V3 quote/gas) = 39.
     uint256[39] private __gap;
 
+    /// @dev Set only while _refillGas is unwrapping WBNB, so receive() can recognise the BNB coming
+    ///      back from the wrapper and return before doing anything expensive. EIP-1153 transient
+    ///      storage (cleared at end of transaction): it occupies NO persistent slot, so the layout
+    ///      above and __gap are untouched and the beacon upgrade path stays safe.
+    bool private transient _unwrapping;
+
     constructor() {
         _disableInitializers();
     }
@@ -199,7 +205,14 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
     ///      deviation (see auto-trigger design doc); never-revert is preserved. Skipped while the
     ///      reentrancy guard is entered so process()'s internal WBNB unwrap (Task 7) cannot schedule
     ///      a trigger mid-process.
+    /// @dev GAS STIPEND: the FIRST statement must stay a transient-storage read. The gas-refill leg
+    ///      unwraps WBNB, and the real WETH9/WBNB pays out with transfer() — 2300 gas, which does not
+    ///      cover even one external call, so _sync()'s quote balanceOf would run out of gas and revert
+    ///      the whole withdraw. The _unwrapping flag lets this vault's own unwrap return in ~100 gas.
+    ///      Nothing is lost by returning early: that BNB is gas-pool funding, never quote revenue,
+    ///      and for an ERC20 quote _sync() reads the token balance, which the unwrap does not move.
     receive() external payable {
+        if (_unwrapping) return;
         _sync();
         if (!hasPendingTrigger && pendingQuote >= minProcessAmount && !_reentrancyGuardEntered()) {
             try this.scheduleProcess() {} catch {}
@@ -487,6 +500,8 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
     ///      taxProcessor -> swapRegistry -> router/weth -> Portal quote-config chain degrades to
     ///      GasRefillSkipped rather than bricking process() for every call while the gas pool is
     ///      low. Rule 010: pendingQuote is decremented before the outflow.
+    ///      The closing unwrap runs under _unwrapping: WBNB.withdraw pays out with transfer(), whose
+    ///      2300 gas stipend cannot fund receive()'s normal recognition path (see receive()).
     function _refillGas() internal {
         if (quoteToken == address(0)) return;
         uint256 gasBal = address(this).balance;
@@ -543,7 +558,11 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
         );
         IERC20(quoteToken).forceApprove(address(router), 0); // router is re-resolved from a
             // mutable registry each call; never leave allowance standing for a stale/replaced venue.
-        IWBNB(wbnb).withdraw(got); // pays BNB into receive(); guard flag suppresses scheduling
+        // Real WBNB pays out with transfer() (2300 gas). The flag makes receive() return before it
+        // touches storage or calls out, which is the only way the callback fits that budget.
+        _unwrapping = true;
+        IWBNB(wbnb).withdraw(got); // pays BNB into receive(); flags suppress accounting + scheduling
+        _unwrapping = false;
         emit GasRefilled(quoteIn, got, fee);
     }
 

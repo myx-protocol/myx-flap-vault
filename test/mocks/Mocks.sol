@@ -21,13 +21,47 @@ contract MockERC20Decimals is ERC20 {
     function mint(address to, uint256 amount) external { _mint(to, amount); }
 }
 
+/// @dev Compliance/pause registry consulted by MockProxiedERC20, mirroring the external hooks a
+///      real RWA token (e.g. bStock NVDAB on BSC) calls out to.
+contract MockComplianceRegistry {
+    function isTokenPaused(address) external pure returns (bool) {
+        return false;
+    }
+}
+
+/// @dev Quote-token model with a REAL token's call shape. A bare MockERC20 answers balanceOf from a
+///      warm mapping slot for ~200 gas, which flatters any callback that runs under a gas stipend.
+///      Live quote tokens do not: bStock NVDAB is an upgradeable proxy whose balanceOf hops into an
+///      implementation and whose transfer path consults external compliance contracts, so a single
+///      balanceOf costs an account access or more. Use this wherever a test must be honest about
+///      what a callback can afford.
+contract MockProxiedERC20 is ERC20 {
+    MockComplianceRegistry public immutable compliance;
+
+    constructor(string memory n, string memory s) ERC20(n, s) {
+        compliance = new MockComplianceRegistry();
+    }
+
+    function mint(address to, uint256 amount) external {
+        _mint(to, amount);
+    }
+
+    function balanceOf(address account) public view override returns (uint256) {
+        compliance.isTokenPaused(address(this)); // external hop, as on the real token
+        return super.balanceOf(account);
+    }
+}
+
 contract MockWBNB is ERC20 {
     constructor() ERC20("Wrapped BNB", "WBNB") {}
     function deposit() external payable { _mint(msg.sender, msg.value); }
+    /// @dev WETH9-faithful: the real BSC WBNB pays out with transfer(), i.e. a 2300 gas stipend.
+    ///      Anything heavier than a few opcodes in the recipient's receive() runs out of gas and
+    ///      reverts the withdraw. Do NOT relax this to call{value:} — that divergence hid a live
+    ///      defect in MyxVault._refillGas from the whole unit suite.
     function withdraw(uint256 wad) external {
         _burn(msg.sender, wad);
-        (bool ok,) = msg.sender.call{value: wad}("");
-        require(ok, "MockWBNB: send failed");
+        payable(msg.sender).transfer(wad);
     }
     /// @dev Required so MockPancakeRouter can mint WBNB as a swap output token.
     function mint(address to, uint256 amount) external { _mint(to, amount); }
