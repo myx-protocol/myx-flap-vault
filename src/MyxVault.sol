@@ -68,6 +68,14 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
     uint16 public constant BPS_DENOMINATOR = 10_000;
     /// @notice Delay between a tax receipt and the auto-scheduled process() (seconds).
     uint64 public constant PROCESS_DELAY = 60;
+    /// @notice Hard cap on the gas-refill leg: at most this share of pendingQuote may be sold for
+    ///         BNB in a single process() call, regardless of the linear size estimate. The refill
+    ///         leg uses no external price reference (by design — see _refillGas), so a thinned or
+    ///         sandwiched pool could otherwise make the sizing estimate demand up to all of
+    ///         pendingQuote for a fixed ~gasRefillAmount of BNB; this bounds that per-batch loss to
+    ///         20% of the batch. A capped refill is partial by design — the shortfall is retried on
+    ///         the next process() call.
+    uint16 public constant MAX_REFILL_SHARE_BPS = 2000;
 
     event RevenueReceived(uint256 amount, uint256 pendingTotal);
     event RevenueProcessed(uint256 quoteAmount, uint256 baseAmount, uint256 lpMinted);
@@ -304,6 +312,9 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
         uint256 amount = pendingQuote;
         if (amount < minProcessAmount) {
             emit BuybackSkipped(amount);
+            // Flush any deferred LP from a prior failed feed even when this call's buyback is
+            // skipped — the refill leg alone must not stall a pending dividend distribution.
+            _feedDividend();
             return;
         }
         pendingQuote = 0;
@@ -464,21 +475,46 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
     ///        dexId: Portal.getQuoteTokenConfiguration(quote).dexId;
     ///        pool:  the V3 fee tier with the best quote among getDEXInfo(dexId).v3SupportedFees.
     ///      minOut is the same-block quote x (1 - maxSlippageBps). No pool -> skip with an event.
-    ///      Rule 010: pendingQuote is decremented before the outflow.
+    ///      Sizing uses no external price reference by design (the same quoter that prices the
+    ///      swap also sizes it) — MAX_REFILL_SHARE_BPS bounds the resulting per-batch loss under
+    ///      pool manipulation to 20% of pendingQuote, independent of how far the estimate is off.
+    ///      Venue resolution (swapVenue()) is wrapped in try/catch: a revert anywhere in the
+    ///      taxProcessor -> swapRegistry -> router/weth -> Portal quote-config chain degrades to
+    ///      GasRefillSkipped rather than bricking process() for every call while the gas pool is
+    ///      low. Rule 010: pendingQuote is decremented before the outflow.
     function _refillGas() internal {
         if (quoteToken == address(0)) return;
         uint256 gasBal = address(this).balance;
         if (gasBal >= gasThreshold) return;
         uint256 needed = gasRefillAmount - gasBal;
-
-        (IMultiDexRouter router, address wbnb, uint8 dexId) = _swapVenue();
         uint256 available = pendingQuote;
+
+        address routerAddr;
+        address wbnb;
+        uint8 dexId;
+        try this.swapVenue() returns (address r, address w, uint8 d) {
+            routerAddr = r;
+            wbnb = w;
+            dexId = d;
+        } catch {
+            emit GasRefillSkipped(available);
+            return;
+        }
+        if (routerAddr == address(0) || wbnb == address(0)) {
+            emit GasRefillSkipped(available);
+            return;
+        }
+        IMultiDexRouter router = IMultiDexRouter(routerAddr);
+
         (uint24 fee, uint256 outForAll) = _bestPool(router, wbnb, dexId, available);
         if (outForAll == 0) {
             emit GasRefillSkipped(available);
             return;
         }
-        uint256 quoteIn = outForAll > needed ? Math.mulDiv(available, needed, outForAll) : available;
+        uint256 quoteIn =
+            outForAll > needed ? Math.mulDiv(available, needed, outForAll, Math.Rounding.Up) : available;
+        uint256 cap = (available * MAX_REFILL_SHARE_BPS) / BPS_DENOMINATOR;
+        if (quoteIn > cap) quoteIn = cap;
         uint256 quoted = quoteIn == available ? outForAll : _quoteOut(router, wbnb, dexId, fee, quoteIn);
         if (quoteIn == 0 || quoted == 0) {
             emit GasRefillSkipped(available);
@@ -500,13 +536,19 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
                 sqrtPriceLimitX96: 0
             })
         );
+        IERC20(quoteToken).forceApprove(address(router), 0); // router is re-resolved from a
+            // mutable registry each call; never leave allowance standing for a stale/replaced venue.
         IWBNB(wbnb).withdraw(got); // pays BNB into receive(); guard flag suppresses scheduling
         emit GasRefilled(quoteIn, got, fee);
     }
 
-    function _swapVenue() internal view returns (IMultiDexRouter router, address wbnb, uint8 dexId) {
+    /// @notice Resolves the gas-refill swap venue: the Flap MultiDexRouter and wrapped-native token
+    ///         behind this vault's taxToken, plus the Portal's configured dexId for this quote
+    ///         token. Public so `this.swapVenue()` can be called through try/catch from
+    ///         `_refillGas` (a revert here degrades to GasRefillSkipped, never bricks process()).
+    function swapVenue() public view returns (address router, address wbnb, uint8 dexId) {
         ISwapRegistry registry = ISwapRegistry(ITaxProcessor(IFlapTaxTokenV3(taxToken).taxProcessor()).swapRegistry());
-        router = IMultiDexRouter(registry.multiDexRouter());
+        router = registry.multiDexRouter();
         wbnb = registry.weth();
         dexId = IPortalQuoteConfigU8(_getPortal()).getQuoteTokenConfiguration(quoteToken).dexId;
     }

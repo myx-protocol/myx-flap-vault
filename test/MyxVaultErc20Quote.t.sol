@@ -317,15 +317,32 @@ contract MyxVaultErc20RefillTest is MyxVaultErc20QuoteTestBase {
         assertEq(basePool.lastDepositAmount(), 100_000 ether);
     }
 
-    function test_process_spendsAllQuoteWhenNotEnoughForTarget() public {
-        _sendTax(MIN_PROCESS); // 10 RWA -> 0.03 BNB < 0.05 target
+    /// @dev Uncapped linear sizing would spend all 10 RWA to reach the 0.05 BNB target (a thin
+    ///      pool needing the whole batch to hit gasRefillAmount); MAX_REFILL_SHARE_BPS caps the
+    ///      swap at 20% of pendingQuote instead, leaving 8 RWA below minProcessAmount so the
+    ///      buyback is skipped (not reverted) and retried whole on the next process().
+    function test_process_refillCappedAtShareOfPending_buybackSkipped() public {
+        _sendTax(MIN_PROCESS); // 10 RWA; uncapped sizing would spend all of it on the refill
         vm.expectEmit(true, true, true, true);
-        emit BuybackSkipped(0);
+        emit BuybackSkipped(8 ether);
         vault.process();
-        assertEq(router.lastAmountIn(), MIN_PROCESS, "everything went to gas");
-        assertEq(address(vault).balance, 0.03 ether);
-        assertEq(vault.pendingQuote(), 0);
+        assertEq(router.lastAmountIn(), 2 ether, "capped at MAX_REFILL_SHARE_BPS (20%) of pendingQuote");
+        assertEq(address(vault).balance, 0.006 ether, "gas pool gets only the capped swap's output");
+        assertEq(vault.pendingQuote(), 8 ether, "remainder retained, not reverted");
         assertEq(basePool.depositCallCount(), 0, "buyback skipped, no revert");
+    }
+
+    /// @dev A thinned/sandwiched pool (100 RWA -> only 0.001 BNB, far short of the 0.05 target)
+    ///      cannot make the vault sell more than MAX_REFILL_SHARE_BPS of pendingQuote: the cap
+    ///      bounds the swap to 20 RWA regardless of how bad the quote is, and the buyback still
+    ///      runs on the remaining 80 RWA in the same call.
+    function test_process_thinPool_refillBoundedByCap() public {
+        router.setRate(2500, 1, 100000); // 100 RWA -> 0.001 BNB: far below the 0.05 target
+        _sendTax(100 ether);
+        vault.process();
+        assertEq(router.lastAmountIn(), 20 ether, "capped at 20% of pendingQuote despite the thin pool");
+        assertEq(vault.pendingQuote(), 0);
+        assertEq(basePool.lastDepositAmount(), 80_000 ether, "remaining 80 RWA bought back");
     }
 
     function test_process_refillDoesNotScheduleTriggerMidProcess() public {
@@ -334,13 +351,15 @@ contract MyxVaultErc20RefillTest is MyxVaultErc20QuoteTestBase {
         assertFalse(vault.hasPendingTrigger(), "no trigger scheduled from inside process()");
     }
 
-    function test_process_slippageBreach_reverts() public {
+    /// @dev Proves minOut is re-quoted at the actual (sized) quoteIn, not reused from the
+    ///      full-amount outForAll quote. At maxSlippageBps = 0 there is zero tolerance for a
+    ///      mismatch: the swap only survives because _refillGas calls _quoteOut(quoteIn) — which
+    ///      the mock's linear rate makes exactly equal to the actual swap output — rather than
+    ///      reusing outForAll (quoted at the full `available` amount, a different input size).
+    function test_process_refillMinOutRequotedAtQuoteIn() public {
         _sendTax(100 ether);
-        // quote says 0.003/RWA but execution pays less than (1 - 3%): emulate by lowering the rate
-        // between quote and swap is impossible in the mock, so widen the check: set rate to 0 after
-        // quoting is not observable; instead assert the minOut wiring via a 100% slippage vault.
         MyxVault.InitParams memory p = _initParams();
-        p.maxSlippageBps = 0; // exact quote required; mock returns exactly the quote -> passes
+        p.maxSlippageBps = 0; // zero tolerance: minOut must exactly match the actual swap output
         MyxVault strict = _deployVault(p);
         rwa.mint(address(strict), 100 ether);
         strict.process();
@@ -357,6 +376,20 @@ contract MyxVaultErc20RefillTest is MyxVaultErc20QuoteTestBase {
         vault.process();
         assertGt(other.lastAmountIn(), 0, "router resolved dynamically from SwapRegistry");
         assertEq(router.lastAmountIn(), 0);
+    }
+
+    /// @dev A revert anywhere in the taxProcessor -> swapRegistry -> router/weth -> Portal
+    ///      quote-config chain must degrade to GasRefillSkipped, never brick process() for every
+    ///      call while the gas pool is low. taxProcessor() = address(0) makes swapVenue()'s
+    ///      ITaxProcessor(address(0)).swapRegistry() call revert (call to a code-less address).
+    function test_process_venueUnresolvable_skipsRefill() public {
+        taxToken.setTaxProcessor(address(0));
+        _sendTax(100 ether);
+        vm.expectEmit(true, true, true, true);
+        emit GasRefillSkipped(100 ether);
+        vault.process();
+        assertEq(address(vault).balance, 0);
+        assertEq(basePool.lastDepositAmount(), 100_000 ether);
     }
 
     receive() external payable {}
