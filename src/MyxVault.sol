@@ -82,6 +82,8 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
     event ProcessScheduled(uint256 requestId, uint64 executeAfter);
     /// @notice Emitted when the trigger callback runs; `success` is process()'s try/catch outcome.
     event ProcessTriggered(uint256 requestId, bool success);
+    /// @notice Emitted when someone tops up the BNB gas pool of an ERC20-quote vault.
+    event GasFunded(address indexed from, uint256 amount);
 
     address public taxToken;
     address public creator;
@@ -205,24 +207,41 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
         emit RevenueReceived(newRevenue, pendingQuote);
     }
 
-    /// @notice Schedules a delayed process() via FlapTriggerService. ONLY the vault itself may call
-    ///         it (from receive()); the self-call lets receive() wrap getFee()+requestTrigger in one
-    ///         try/catch. The fee is paid from tax revenue: pendingQuote is debited ONLY on a successful
-    ///         schedule, preserving the (vault ETH balance == pendingQuote) invariant.
+    /// @notice Schedules a delayed process() via FlapTriggerService. ONLY the vault itself may call it
+    ///         (from receive()); the self-call lets receive() wrap getFee()+requestTrigger in one
+    ///         try/catch. Native quote: the fee is paid from pendingQuote and debited only on success.
+    ///         ERC20 quote: the fee is paid from the BNB gas pool; pendingQuote is untouched.
     function scheduleProcess() external {
         require(msg.sender == address(this), unicode"Caller must be the vault itself / 僅限金庫自身調用");
         IFlapTriggerService service = IFlapTriggerService(_getTriggerService());
         uint256 fee = service.getFee();
-        // Decide on ACCUMULATED pendingQuote (not a single receipt): it must cover the fee AND still
-        // leave >= minProcessAmount so the scheduled process() can actually run — no wasted fee, and
-        // pendingQuote -= fee can never underflow.
-        require(pendingQuote >= minProcessAmount + fee, unicode"Pending below minimum plus fee / 待處理低於下限加手續費");
+        if (quoteToken == address(0)) {
+            // Decide on ACCUMULATED pendingQuote (not a single receipt): it must cover the fee AND
+            // still leave >= minProcessAmount so the scheduled process() can actually run — no wasted
+            // fee, and pendingQuote -= fee can never underflow.
+            require(pendingQuote >= minProcessAmount + fee, unicode"Pending below minimum plus fee / 待處理低於下限加手續費");
+        } else {
+            require(pendingQuote >= minProcessAmount, unicode"Pending below minimum / 待處理金額低於下限");
+            require(address(this).balance >= fee, unicode"Gas pool below trigger fee / Gas 池低於觸發手續費");
+        }
         uint64 executeAfter = uint64(block.timestamp) + PROCESS_DELAY;
         uint256 id = service.requestTrigger{value: fee}(executeAfter);
         pendingTriggerId = id;
         hasPendingTrigger = true;
-        pendingQuote -= fee;
+        if (quoteToken == address(0)) pendingQuote -= fee;
         emit ProcessScheduled(id, executeAfter);
+    }
+
+    /// @notice Tops up the BNB gas pool that pays FlapTriggerService fees. ERC20-quote vaults only:
+    ///         on a native-quote vault every BNB is revenue and arrives through receive().
+    function fundGas() external payable {
+        require(quoteToken != address(0), unicode"Gas pool only for ERC20 quote / 僅 ERC20 報價幣金庫可充值 Gas");
+        emit GasFunded(msg.sender, msg.value);
+    }
+
+    /// @notice BNB reserved for trigger fees. Zero for native-quote vaults (their BNB is revenue).
+    function gasBalance() external view returns (uint256) {
+        return quoteToken == address(0) ? 0 : address(this).balance;
     }
 
     /// @notice FlapTriggerService callback (ITriggerReceiver). Clears the in-flight gate FIRST, then

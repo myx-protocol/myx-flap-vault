@@ -153,11 +153,9 @@ contract MyxVaultErc20ProcessTest is MyxVaultErc20QuoteTestBase {
         meta.quoteToken = address(usdt);
         meta.basePoolToken = address(lpToken);
         poolManager.setPool(meta.poolId, meta);
-        // gas pool already above threshold so this suite isolates the buyback leg; also disable
-        // the auto-schedule trigger so its native-fee debit (Task 6 scope) never perturbs
-        // pendingQuote (ERC20 units) here -- receive()'s try/catch swallows the failed schedule.
+        // Gas pool funded above threshold so the auto-schedule trigger in receive() can pay the
+        // FlapTriggerService fee from the BNB gas pool without touching pendingQuote (Task 6).
         vm.deal(address(vault), GAS_REFILL);
-        triggerService.setRequestReverts(true);
     }
 
     function test_process_buysWithErc20QuoteAndFeedsLp() public {
@@ -191,4 +189,61 @@ contract MyxVaultErc20ProcessTest is MyxVaultErc20QuoteTestBase {
         assertEq(vault.pendingQuote(), 20 ether);
         assertEq(rwa.balanceOf(address(vault)), 20 ether);
     }
+}
+
+contract MyxVaultErc20GasPoolTest is MyxVaultErc20QuoteTestBase {
+    event GasFunded(address indexed from, uint256 amount);
+
+    function test_fundGas_anyoneCanTopUp() public {
+        address donor = makeAddr("donor");
+        vm.deal(donor, 1 ether);
+        vm.prank(donor);
+        vm.expectEmit(true, true, true, true);
+        emit GasFunded(donor, 0.2 ether);
+        vault.fundGas{value: 0.2 ether}();
+        assertEq(vault.gasBalance(), 0.2 ether);
+        assertEq(vault.pendingQuote(), 0, "gas is not revenue");
+    }
+
+    function test_receive_noGas_recordsButDoesNotSchedule() public {
+        _sendTax(20 ether);
+        assertEq(vault.pendingQuote(), 20 ether);
+        assertFalse(vault.hasPendingTrigger(), "no BNB in the gas pool -> cannot pay the fee");
+    }
+
+    function test_receive_withGas_schedulesAndPaysFromPool() public {
+        vault.fundGas{value: 0.01 ether}();
+        _sendTax(20 ether);
+        assertTrue(vault.hasPendingTrigger());
+        assertEq(vault.pendingQuote(), 20 ether, "quote revenue untouched by the fee");
+        assertEq(vault.gasBalance(), 0.01 ether - triggerService.getFee());
+        assertEq(triggerService.requesterOf(1), address(vault));
+    }
+
+    function test_fundGas_afterTax_schedulesOnNextWake() public {
+        _sendTax(20 ether);
+        assertFalse(vault.hasPendingTrigger());
+        vault.fundGas{value: 0.01 ether}();
+        assertTrue(_ping(), "spurious wake");
+        assertTrue(vault.hasPendingTrigger(), "gas now available -> scheduled on the next wake");
+    }
+
+    function test_trigger_runsProcessWithErc20Quote() public {
+        PoolMetadata memory meta;
+        meta.marketId = marketId;
+        meta.poolId = MyxPoolId.derive(marketId, address(taxToken));
+        meta.baseToken = address(taxToken);
+        meta.basePoolToken = address(lpToken);
+        poolManager.setPool(meta.poolId, meta);
+        vault.fundGas{value: GAS_REFILL}();
+        _sendTax(20 ether);
+        uint256 id = vault.pendingTriggerId();
+        vm.warp(block.timestamp + 61);
+        triggerService.fire(id);
+        assertEq(vault.pendingQuote(), 0);
+        assertGt(vault.totalLpMinted(), 0);
+        assertFalse(vault.hasPendingTrigger());
+    }
+
+    receive() external payable {}
 }

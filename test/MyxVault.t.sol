@@ -184,6 +184,13 @@ contract MyxVaultInitTest is MyxVaultTestBase {
         assertEq(v.gasThreshold(), 0.01 ether);
         assertEq(v.gasRefillAmount(), 0.02 ether);
     }
+
+    function test_fundGas_rejectedForNativeQuote() public {
+        vm.deal(address(this), 1 ether);
+        vm.expectRevert(bytes(unicode"Gas pool only for ERC20 quote / 僅 ERC20 報價幣金庫可充值 Gas"));
+        vault.fundGas{value: 0.1 ether}();
+        assertEq(vault.gasBalance(), 0);
+    }
 }
 
 contract MyxVaultGuardianTest is MyxVaultTestBase {
