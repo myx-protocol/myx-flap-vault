@@ -61,10 +61,28 @@ contract MyxVaultFactory is VaultFactoryBaseV2, IVaultFactoryDividendV23 {
         revert UnsupportedChain(chainId);
     }
 
+    /// @notice BNB prepaid per creator, forwarded into their vault's gas pool at ERC20-quote launch.
+    ///         Extra msg.value on the launch transaction itself is swallowed by the Flap Portal, so the
+    ///         initial gas pool must be funded through this separate call before launching.
     mapping(address => uint256) public prepaidGas;
 
+    event GasPrepaid(address indexed account, uint256 amount, uint256 total);
+    event PrepaidGasWithdrawn(address indexed account, uint256 amount);
+    event VaultGasFunded(address indexed vault, address indexed creator, uint256 amount);
+
     function prepayGas() external payable {
+        require(msg.value > 0, unicode"Zero prepayment / 預付金額為零");
         prepaidGas[msg.sender] += msg.value;
+        emit GasPrepaid(msg.sender, msg.value, prepaidGas[msg.sender]);
+    }
+
+    function withdrawPrepaidGas() external {
+        uint256 amount = prepaidGas[msg.sender];
+        require(amount > 0, unicode"Nothing prepaid / 無預付款");
+        prepaidGas[msg.sender] = 0;
+        (bool ok,) = msg.sender.call{value: amount}("");
+        require(ok, unicode"Refund failed / 退款失敗");
+        emit PrepaidGasWithdrawn(msg.sender, amount);
     }
 
     /// @notice FeeType.DIVIDEND == 2; identifies the dividend fee slot in V7 feeConfigs.
@@ -121,6 +139,15 @@ contract MyxVaultFactory is VaultFactoryBaseV2, IVaultFactoryDividendV23 {
                 )
             )
         );
+        if (quoteToken != address(0)) {
+            uint256 prepaid = prepaidGas[creator];
+            require(prepaid >= c.minInitialGas, unicode"Prepaid gas below minimum / 預付 Gas 低於最低要求");
+            if (prepaid > 0) {
+                prepaidGas[creator] = 0;
+                MyxVault(payable(vault)).fundGas{value: prepaid}();
+                emit VaultGasFunded(vault, creator, prepaid);
+            }
+        }
         emit VaultCreated(vault, taxToken, creator, d.marketQuoteToken);
     }
 
