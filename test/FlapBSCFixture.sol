@@ -27,7 +27,7 @@ import {VanityHelper} from "./lib/VanityHelper.sol";
 ///
 ///    ```solidity
 ///    function setUp() public {
-///        _forkBSCMainnet();          // pins the fork to a recent block
+///        _forkBSCMainnet();          // forks the LIVE head (no block pin)
 ///        _labelDeployedAddresses();  // registers human-readable labels in traces
 ///    }
 ///    ```
@@ -227,7 +227,13 @@ abstract contract FlapBSCFixture is Test, VanityHelper {
     //  Fork Setup
     // ──────────────────────────────────────────────────────────────────────────
 
-    /// @notice Create and select a BSC mainnet fork, initialise interface handles, and label addresses.
+    /// @notice Create and select a BSC mainnet fork at the LIVE head, initialise interface handles,
+    ///         and label addresses.
+    /// @dev No block pin: `createSelectFork` is called without a block number, so every run forks
+    ///      whatever the RPC currently serves as head. Tests must therefore assert on invariants and
+    ///      relative deltas, never on absolute chain state that moves between runs. A public
+    ///      (non-archive) RPC may also fail a deep tick read with "missing trie node"; that is a
+    ///      node-side limitation of head forking, not a test failure.
     /// @dev Call this in your test's `setUp()`.  Requires the `BSC_RPC_URL` environment variable or
     ///      the `--fork-url` flag on the forge command line.
     ///

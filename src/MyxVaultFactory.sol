@@ -51,12 +51,30 @@ contract MyxVaultFactory is VaultFactoryBaseV2, IVaultFactoryDividendV23 {
         uint256 gasRefillAmount; // wei; ERC20 quote only, > gasThreshold
     }
 
+    /// @notice Decodes the creator-supplied `vaultData` payload. The layout is fund-critical — the
+    ///         marketQuoteToken it carries decides the myx market, hence the predicted mBase LP that
+    ///         becomes the token's dividend asset — so newVault and both resolveDividendToken
+    ///         branches decode through this one place and can never drift apart.
     function decodeVaultData(bytes calldata vaultData) public pure returns (VaultData memory d) {
+        return _decodeVaultData(vaultData);
+    }
+
+    /// @dev Memory-argument twin for callers holding already-decoded launch params
+    ///      (resolveDividendToken). Kept internal and separately named: a public
+    ///      `decodeVaultData(bytes memory)` would be the same ABI signature as the calldata version
+    ///      above, which Solidity rejects.
+    function _decodeVaultData(bytes memory vaultData) internal pure returns (VaultData memory d) {
         (d.marketQuoteToken, d.minProcessAmount, d.gasThreshold, d.gasRefillAmount) =
             abi.decode(vaultData, (address, uint256, uint256, uint256));
     }
 
-    /// @dev Flap Portal per chain. Mirrors VaultBase._getPortal(); unknown chains revert.
+    /// @dev Flap Portal per chain. Mirrors VaultBase._getPortal() (asserted equal in
+    ///      test/ChainAddressResolution.t.sol); unknown chains revert with no default branch.
+    ///      The revert reuses `UnsupportedChain`, the custom error inherited from
+    ///      VaultFactoryBaseV2, deliberately: this resolver is a sibling of that contract's
+    ///      _getVaultPortal/_getGuardian and must fail the same way they do. It is the one revert in
+    ///      this file that is not a bilingual literal, and it fires only on an unsupported chain —
+    ///      never on user input.
     function _getPortal() internal view returns (address) {
         uint256 chainId = block.chainid;
         if (chainId == 56) return 0xe2cE6ab80874Fa9Fa2aAE65D277Dd6B8e65C9De0;
@@ -80,6 +98,9 @@ contract MyxVaultFactory is VaultFactoryBaseV2, IVaultFactoryDividendV23 {
         emit GasPrepaid(msg.sender, msg.value, prepaidGas[msg.sender]);
     }
 
+    /// @dev CEI is the reentrancy defense here: the caller's balance is zeroed BEFORE the value
+    ///      call, so a reentering receive() finds nothing left to withdraw. No guard needed, and no
+    ///      other caller's balance is reachable from this function.
     function withdrawPrepaidGas() external {
         uint256 amount = prepaidGas[msg.sender];
         require(amount > 0, unicode"Nothing prepaid / 無預付款");
@@ -201,10 +222,11 @@ contract MyxVaultFactory is VaultFactoryBaseV2, IVaultFactoryDividendV23 {
                 abi.decode(launchParams, (IVaultPortalTypes.NewTokenV6WithVaultParamsU8));
             require(params.dividendToken == MAGIC_DIVIDEND_COMPUTED, unicode"Expected V6 MAGIC dividend token / 預期 V6 MAGIC 分紅幣");
             // The myx MARKET quote token travels in vaultData — NOT params.quoteToken (Flap bonding
-            // quote = native ETH). MUST match newVault's marketQuoteToken source so the predicted LP
-            // and the vault's actual myx pool share the same market — fund-critical.
-            (address marketQuote,,,) = abi.decode(params.vaultData, (address, uint256, uint256, uint256));
-            MarketId marketId = MyxMarketId.derive(uint64(block.chainid), marketQuote);
+            // quote = native ETH). Decoded through decodeVaultData, the same helper newVault uses,
+            // so the predicted LP and the vault's actual myx pool share the same market —
+            // fund-critical.
+            MarketId marketId =
+                MyxMarketId.derive(uint64(block.chainid), _decodeVaultData(params.vaultData).marketQuoteToken);
             return IMyxPoolFactory(config.poolFactory).predictBasePoolToken(
                 marketId, predictedToken, params.symbol
             );
@@ -224,9 +246,10 @@ contract MyxVaultFactory is VaultFactoryBaseV2, IVaultFactoryDividendV23 {
                 }
             }
             require(found, unicode"No V7 dividend feeConfig / 無 V7 分紅費用配置");
-            // Same source as V6 and newVault: myx MARKET quote in vaultData, NOT params.quoteToken.
-            (address marketQuote,,,) = abi.decode(params.vaultData, (address, uint256, uint256, uint256));
-            MarketId marketId = MyxMarketId.derive(uint64(block.chainid), marketQuote);
+            // Same source and same decoder as V6 and newVault: myx MARKET quote in vaultData, NOT
+            // params.quoteToken.
+            MarketId marketId =
+                MyxMarketId.derive(uint64(block.chainid), _decodeVaultData(params.vaultData).marketQuoteToken);
             return IMyxPoolFactory(config.poolFactory).predictBasePoolToken(
                 marketId, predictedToken, params.symbol
             );

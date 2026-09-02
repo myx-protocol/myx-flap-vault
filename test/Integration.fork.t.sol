@@ -115,7 +115,7 @@ contract MyxVaultForkTest is FlapBSCFixture {
     }
 
     /// @dev A salt whose predicted token address is both vanity-7777 and UNUSED on mainnet. The
-    ///      VanityHelper salt is seeded from block.number, which on a pinned fork collides with
+    ///      VanityHelper salt is seeded from block.number, which on a head fork collides with
     ///      tokens already staged on mainnet (TokenAlreadyStaged) — seed from this contract and a
     ///      per-call nonce instead, and skip any prediction that already has code.
     function _freshSalt() internal returns (bytes32 salt) {

@@ -21,6 +21,15 @@ contract MockERC20Decimals is ERC20 {
     function mint(address to, uint256 amount) external { _mint(to, amount); }
 }
 
+/// @dev ERC20 whose optional metadata reverts. Real tokens are free to omit or revert on symbol()
+///      and decimals() (both optional in EIP-20); description() must degrade rather than revert.
+contract MockERC20NoMetadata is ERC20 {
+    constructor(string memory n, string memory s) ERC20(n, s) {}
+    function mint(address to, uint256 amount) external { _mint(to, amount); }
+    function symbol() public pure override returns (string memory) { revert("no symbol"); }
+    function decimals() public pure override returns (uint8) { revert("no decimals"); }
+}
+
 /// @dev Compliance/pause registry consulted by MockProxiedERC20, mirroring the external hooks a
 ///      real RWA token (e.g. bStock NVDAB on BSC) calls out to.
 contract MockComplianceRegistry {

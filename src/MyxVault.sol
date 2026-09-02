@@ -141,8 +141,11 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
     /// @notice ERC20 quote only: gas pool target after a refill (wei).
     uint256 public gasRefillAmount;
 
-    /// @dev Reserved storage for upgrades. 44 original - 2 (trigger) - 3 (V3 quote/gas) = 39.
-    uint256[39] private __gap;
+    /// @dev Reserved storage for upgrades. 44 original - 2 (trigger) - 2 (gasThreshold,
+    ///      gasRefillAmount; quoteToken packs into the hasPendingTrigger slot) = 40. Verified with
+    ///      `forge inspect MyxVault storage-layout`: quoteToken sits at slot 213 offset 1, so the V3
+    ///      fields consumed only two new slots and the reserved region must give back only two.
+    uint256[40] private __gap;
 
     /// @dev Set only while executeGasRefill is unwrapping WBNB, so receive() can recognise the BNB
     ///      coming back from the wrapper and return before doing anything expensive. EIP-1153
@@ -665,12 +668,27 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
         return block.chainid == 4663 ? "ETH" : "BNB";
     }
 
+    /// @dev DISPLAY ONLY. symbol() and decimals() are optional in EIP-20 and a quote token is free
+    ///      to omit them or revert; description() is a UI read, so it degrades to "?" rather than
+    ///      reverting. Nothing in the accounting or swap path reads these — quote amounts are always
+    ///      handled in base units.
     function _quoteSymbol() internal view returns (string memory) {
-        return quoteToken == address(0) ? _nativeSymbol() : IERC20Metadata(quoteToken).symbol();
+        if (quoteToken == address(0)) return _nativeSymbol();
+        try IERC20Metadata(quoteToken).symbol() returns (string memory sym) {
+            return sym;
+        } catch {
+            return "?";
+        }
     }
 
+    /// @dev DISPLAY ONLY, same contract as _quoteSymbol: the fallback is 18, the EIP-20 default.
     function _quoteDecimals() internal view returns (uint8) {
-        return quoteToken == address(0) ? 18 : IERC20Metadata(quoteToken).decimals();
+        if (quoteToken == address(0)) return 18;
+        try IERC20Metadata(quoteToken).decimals() returns (uint8 dec) {
+            return dec;
+        } catch {
+            return 18;
+        }
     }
 
     function description() public view override returns (string memory) {

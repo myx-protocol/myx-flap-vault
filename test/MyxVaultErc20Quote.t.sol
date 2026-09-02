@@ -451,6 +451,23 @@ contract MyxVaultErc20EmergencyAndViewsTest is MyxVaultErc20QuoteTestBase {
         );
     }
 
+    /// @dev symbol() and decimals() are OPTIONAL in EIP-20; a quote token may omit or revert on
+    ///      them. description() is display-only, so it falls back to "?" / 18 decimals instead of
+    ///      reverting and taking the whole UI read with it.
+    function test_description_quoteMetadataReverts_usesDefaults() public {
+        MockERC20NoMetadata odd = new MockERC20NoMetadata("Odd Quote", "ODD");
+        portal.setQuoteConfig(address(odd), true, 0);
+        MyxVault.InitParams memory p = _initParams();
+        p.quoteToken = address(odd);
+        MyxVault v = _deployVault(p);
+        odd.mint(address(v), 1.5 ether);
+        v.sync();
+        assertEq(
+            v.description(),
+            unicode"MYX liquidity vault / MYX 流動性金庫: 0 LP minted / LP 已鑄造, 0 LP distributed / LP 已分發, pending ? / 待處理 ?: 1.5, gas pool / Gas 池: 0 BNB."
+        );
+    }
+
     function test_description_sixDecimalQuote() public {
         MockERC20Decimals xaut = new MockERC20Decimals("Tether Gold", "XAUt", 6);
         portal.setQuoteConfig(address(xaut), true, 0);

@@ -45,6 +45,13 @@ contract MyxVaultFactoryHarness is MyxVaultFactory {
         return _getVaultPortal();
     }
 
+    /// @dev MyxVaultFactory declares its OWN _getPortal (VaultFactoryBaseV2 ships none). It must
+    ///      resolve identically to VaultBase._getPortal, or isQuoteTokenSupported and the vault's
+    ///      own quote-config reads would consult two different Portals on the same chain.
+    function exposedGetPortal() external view returns (address) {
+        return _getPortal();
+    }
+
     function exposedGetGuardian() external view returns (address) {
         return _getGuardian();
     }
@@ -172,6 +179,29 @@ contract ChainAddressResolutionTest is Test {
         assertEq(factory.exposedGetGuardian(), BSC_GUARDIAN);
         vm.chainId(97);
         assertEq(factory.exposedGetGuardian(), BSC_TESTNET_GUARDIAN);
+    }
+
+    function test_factoryGetPortal_matchesVaultBase() public {
+        vm.chainId(56);
+        assertEq(factory.exposedGetPortal(), BSC_PORTAL);
+        assertEq(factory.exposedGetPortal(), base.exposedGetPortal());
+        vm.chainId(97);
+        assertEq(factory.exposedGetPortal(), BSC_TESTNET_PORTAL);
+        assertEq(factory.exposedGetPortal(), base.exposedGetPortal());
+        vm.chainId(ROBINHOOD_CHAIN_ID);
+        assertEq(factory.exposedGetPortal(), ROBINHOOD_PORTAL);
+        assertEq(factory.exposedGetPortal(), base.exposedGetPortal());
+    }
+
+    function test_factoryGetPortal_unknownChainReverts() public {
+        vm.chainId(1);
+        vm.expectRevert(abi.encodeWithSelector(VaultFactoryBaseV2.UnsupportedChain.selector, uint256(1)));
+        factory.exposedGetPortal();
+        vm.chainId(ROBINHOOD_TESTNET_CHAIN_ID);
+        vm.expectRevert(
+            abi.encodeWithSelector(VaultFactoryBaseV2.UnsupportedChain.selector, ROBINHOOD_TESTNET_CHAIN_ID)
+        );
+        factory.exposedGetPortal();
     }
 
     function test_factoryRobinhoodTestnetUnsupported() public {
