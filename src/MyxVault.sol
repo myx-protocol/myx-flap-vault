@@ -14,6 +14,12 @@ import {IFlapTaxTokenV3} from "./flap/IFlapTaxTokenV3.sol";
 import {IPortalTradeV2} from "./flap/IPortal.sol";
 import {Decimal18} from "./lib/Decimal18.sol";
 import {IFlapTriggerService, ITriggerReceiver} from "./flap/IFlapTriggerService.sol";
+import {Math} from "@openzeppelin/utils/math/Math.sol";
+import {ITaxProcessor} from "./flap/ITaxProcessor.sol";
+import {ISwapRegistry} from "./flap/ISwapRegistry.sol";
+import {IMultiDexRouter} from "./flap/IMultiDexRouter.sol";
+import {IPortalQuoteConfigU8} from "./flap/IPortalQuoteConfigU8.sol";
+import {IWBNB} from "./dex/IWBNB.sol";
 
 /// @title MyxVault
 /// @notice Flap vault that buys back the tax token with tax revenue via the Flap Portal, deposits
@@ -84,6 +90,13 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
     event ProcessTriggered(uint256 requestId, bool success);
     /// @notice Emitted when someone tops up the BNB gas pool of an ERC20-quote vault.
     event GasFunded(address indexed from, uint256 amount);
+    /// @notice Emitted when quote revenue was swapped into BNB for the gas pool.
+    event GasRefilled(uint256 quoteIn, uint256 nativeOut, uint24 fee);
+    /// @notice Emitted when a refill was due but no quote/WBNB V3 pool could quote it. Not a failure:
+    ///         the buyback proceeds and the pool is retried on the next process().
+    event GasRefillSkipped(uint256 pendingQuote);
+    /// @notice Emitted when, after a refill, the remaining quote is below minProcessAmount.
+    event BuybackSkipped(uint256 pendingQuote);
 
     address public taxToken;
     address public creator;
@@ -286,8 +299,13 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
     ///      Consumes ALL pendingQuote; the LP IS the reward (v6 model).
     function process() external nonReentrant {
         _sync();
+        require(pendingQuote >= minProcessAmount, unicode"Pending below minimum / 待處理金額低於下限");
+        _refillGas();
         uint256 amount = pendingQuote;
-        require(amount >= minProcessAmount, unicode"Pending below minimum / 待處理金額低於下限");
+        if (amount < minProcessAmount) {
+            emit BuybackSkipped(amount);
+            return;
+        }
         pendingQuote = 0;
 
         uint256 received = _buyTaxToken(amount);
@@ -438,6 +456,97 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
             })
         );
         received = IERC20(taxToken).balanceOf(address(this)) - balanceBefore;
+    }
+
+    /// @dev ERC20 quote only. When the BNB gas pool is below gasThreshold, swaps just enough quote
+    ///      to bring it to gasRefillAmount (capped by pendingQuote) through Flap's MultiDexRouter:
+    ///        venue: taxToken.taxProcessor().swapRegistry() -> multiDexRouter() / weth();
+    ///        dexId: Portal.getQuoteTokenConfiguration(quote).dexId;
+    ///        pool:  the V3 fee tier with the best quote among getDEXInfo(dexId).v3SupportedFees.
+    ///      minOut is the same-block quote x (1 - maxSlippageBps). No pool -> skip with an event.
+    ///      Rule 010: pendingQuote is decremented before the outflow.
+    function _refillGas() internal {
+        if (quoteToken == address(0)) return;
+        uint256 gasBal = address(this).balance;
+        if (gasBal >= gasThreshold) return;
+        uint256 needed = gasRefillAmount - gasBal;
+
+        (IMultiDexRouter router, address wbnb, uint8 dexId) = _swapVenue();
+        uint256 available = pendingQuote;
+        (uint24 fee, uint256 outForAll) = _bestPool(router, wbnb, dexId, available);
+        if (outForAll == 0) {
+            emit GasRefillSkipped(available);
+            return;
+        }
+        uint256 quoteIn = outForAll > needed ? Math.mulDiv(available, needed, outForAll) : available;
+        uint256 quoted = quoteIn == available ? outForAll : _quoteOut(router, wbnb, dexId, fee, quoteIn);
+        if (quoteIn == 0 || quoted == 0) {
+            emit GasRefillSkipped(available);
+            return;
+        }
+        uint256 minOut = (quoted * (BPS_DENOMINATOR - maxSlippageBps)) / BPS_DENOMINATOR;
+
+        pendingQuote -= quoteIn;
+        IERC20(quoteToken).forceApprove(address(router), quoteIn);
+        uint256 got = router.exactInputSingle(
+            dexId,
+            IMultiDexRouter.ExactInputSingleParams({
+                tokenIn: quoteToken,
+                tokenOut: wbnb,
+                fee: fee,
+                recipient: address(this),
+                amountIn: quoteIn,
+                amountOutMinimum: minOut,
+                sqrtPriceLimitX96: 0
+            })
+        );
+        IWBNB(wbnb).withdraw(got); // pays BNB into receive(); guard flag suppresses scheduling
+        emit GasRefilled(quoteIn, got, fee);
+    }
+
+    function _swapVenue() internal view returns (IMultiDexRouter router, address wbnb, uint8 dexId) {
+        ISwapRegistry registry = ISwapRegistry(ITaxProcessor(IFlapTaxTokenV3(taxToken).taxProcessor()).swapRegistry());
+        router = IMultiDexRouter(registry.multiDexRouter());
+        wbnb = registry.weth();
+        dexId = IPortalQuoteConfigU8(_getPortal()).getQuoteTokenConfiguration(quoteToken).dexId;
+    }
+
+    /// @dev Best V3 quote/WBNB tier for `amountIn`. A tier is considered only if its pool has code;
+    ///      a reverting quoter call on one tier never blocks the others.
+    function _bestPool(IMultiDexRouter router, address wbnb, uint8 dexId, uint256 amountIn)
+        internal
+        returns (uint24 bestFee, uint256 bestOut)
+    {
+        if (amountIn == 0) return (0, 0);
+        uint24[] memory fees = router.getDEXInfo(dexId).v3SupportedFees;
+        for (uint256 i = 0; i < fees.length; i++) {
+            if (router.computeV3PoolAddress(dexId, quoteToken, wbnb, fees[i]).code.length == 0) continue;
+            uint256 out = _quoteOut(router, wbnb, dexId, fees[i], amountIn);
+            if (out > bestOut) {
+                bestOut = out;
+                bestFee = fees[i];
+            }
+        }
+    }
+
+    function _quoteOut(IMultiDexRouter router, address wbnb, uint8 dexId, uint24 fee, uint256 amountIn)
+        internal
+        returns (uint256 out)
+    {
+        try router.quoteExactInputSingle(
+            dexId,
+            IMultiDexRouter.QuoteExactInputSingleParams({
+                tokenIn: quoteToken,
+                tokenOut: wbnb,
+                amountIn: amountIn,
+                fee: fee,
+                sqrtPriceLimitX96: 0
+            })
+        ) returns (uint256 amountOut, uint160, uint32, uint256) {
+            out = amountOut;
+        } catch {
+            out = 0;
+        }
     }
 
     function _ensurePoolExists() internal {
