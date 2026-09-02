@@ -142,3 +142,53 @@ contract MyxVaultErc20AccountingTest is MyxVaultErc20QuoteTestBase {
         assertLt(used, 100_000);
     }
 }
+
+contract MyxVaultErc20ProcessTest is MyxVaultErc20QuoteTestBase {
+    function setUp() public override {
+        super.setUp();
+        PoolMetadata memory meta;
+        meta.marketId = marketId;
+        meta.poolId = MyxPoolId.derive(marketId, address(taxToken));
+        meta.baseToken = address(taxToken);
+        meta.quoteToken = address(usdt);
+        meta.basePoolToken = address(lpToken);
+        poolManager.setPool(meta.poolId, meta);
+        // gas pool already above threshold so this suite isolates the buyback leg; also disable
+        // the auto-schedule trigger so its native-fee debit (Task 6 scope) never perturbs
+        // pendingQuote (ERC20 units) here -- receive()'s try/catch swallows the failed schedule.
+        vm.deal(address(vault), GAS_REFILL);
+        triggerService.setRequestReverts(true);
+    }
+
+    function test_process_buysWithErc20QuoteAndFeedsLp() public {
+        _sendTax(20 ether);
+        vm.prank(makeAddr("keeper"));
+        vault.process();
+        assertEq(vault.pendingQuote(), 0);
+        assertEq(rwa.balanceOf(address(vault)), 0, "all quote spent");
+        assertEq(rwa.balanceOf(PORTAL), 20 ether, "portal pulled the ERC20 input");
+        assertEq(basePool.lastDepositAmount(), 20_000 ether);
+        assertEq(dividend.totalDeposited(), 20_000 ether, "LP fed to dividend");
+    }
+
+    function test_process_recognizesUnpingedRevenueFirst() public {
+        rwa.mint(address(vault), 20 ether); // no ping
+        vault.process(); // must sync then run
+        assertEq(basePool.lastDepositAmount(), 20_000 ether);
+    }
+
+    function test_process_belowMinimum_reverts() public {
+        _sendTax(MIN_PROCESS - 1);
+        vm.expectRevert(bytes(unicode"Pending below minimum / 待處理金額低於下限"));
+        vault.process();
+    }
+
+    function test_process_swapReverts_retainsQuote() public {
+        _sendTax(20 ether);
+        portal.setRate(0, 1);
+        vm.expectRevert(bytes(unicode"Buyback quote is zero / 回購報價為零"));
+        vault.process();
+        assertEq(vault.pendingQuote(), 20 ether);
+        assertEq(rwa.balanceOf(address(vault)), 20 ether);
+    }
+}

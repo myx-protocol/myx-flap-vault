@@ -64,7 +64,7 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
     uint64 public constant PROCESS_DELAY = 60;
 
     event RevenueReceived(uint256 amount, uint256 pendingTotal);
-    event RevenueProcessed(uint256 ethAmount, uint256 baseAmount, uint256 lpMinted);
+    event RevenueProcessed(uint256 quoteAmount, uint256 baseAmount, uint256 lpMinted);
     event PoolDeployed(PoolId poolId);
     /// @notice Emitted when the vault's mBase LP balance is successfully fed into the Dividend
     ///         contract. `lpFed` is the LP amount distributed to holders.
@@ -266,6 +266,7 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
     ///      deviation but cannot prevent sandwiching (BSC block proposers reorder at no cost).
     ///      Consumes ALL pendingQuote; the LP IS the reward (v6 model).
     function process() external nonReentrant {
+        _sync();
         uint256 amount = pendingQuote;
         require(amount >= minProcessAmount, unicode"Pending below minimum / 待處理金額低於下限");
         pendingQuote = 0;
@@ -384,28 +385,35 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
         }
     }
 
-    /// @dev ETH → taxToken via the Flap Portal (bonding curve or DEX phase, Portal routes).
-    ///      minOut is a same-block quote bound — caps single-call deviation, cannot prevent sandwiches.
-    ///      Returns the BALANCE DELTA (not the Portal return value): DEX-phase buys land net of the
-    ///      token's own transfer tax (docs/phase0-v3-findings.md).
-    function _buyTaxToken(uint256 ethAmount) internal returns (uint256 received) {
+    /// @dev quote -> taxToken via the Flap Portal (bonding curve or DEX phase, Portal routes).
+    ///      Native quote sends value; ERC20 quote approves the Portal and sends no value (the
+    ///      Portal pulls the input, "BUY with quote"). minOut is a same-block quote bound — caps
+    ///      single-call deviation, cannot prevent sandwiches. Returns the BALANCE DELTA: DEX-phase
+    ///      buys land net of the token's own transfer tax.
+    function _buyTaxToken(uint256 quoteAmount) internal returns (uint256 received) {
         IPortalTradeV2 portal = IPortalTradeV2(_getPortal());
         uint256 quoted = portal.quoteExactInput(
             IPortalTradeV2.QuoteExactInputParams({
-                inputToken: address(0),
+                inputToken: quoteToken,
                 outputToken: taxToken,
-                inputAmount: ethAmount
+                inputAmount: quoteAmount
             })
         );
         require(quoted != 0, unicode"Buyback quote is zero / 回購報價為零");
         uint256 minOut = (quoted * (BPS_DENOMINATOR - maxSlippageBps)) / BPS_DENOMINATOR;
 
         uint256 balanceBefore = IERC20(taxToken).balanceOf(address(this));
-        portal.swapExactInput{value: ethAmount}(
+        uint256 value;
+        if (quoteToken == address(0)) {
+            value = quoteAmount;
+        } else {
+            IERC20(quoteToken).forceApprove(address(portal), quoteAmount);
+        }
+        portal.swapExactInput{value: value}(
             IPortalTradeV2.ExactInputParams({
-                inputToken: address(0),
+                inputToken: quoteToken,
                 outputToken: taxToken,
-                inputAmount: ethAmount,
+                inputAmount: quoteAmount,
                 minOutputAmount: minOut,
                 permitData: ""
             })
