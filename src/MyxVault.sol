@@ -101,8 +101,10 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
     event GasFunded(address indexed from, uint256 amount);
     /// @notice Emitted when quote revenue was swapped into BNB for the gas pool.
     event GasRefilled(uint256 quoteIn, uint256 nativeOut, uint24 fee);
-    /// @notice Emitted when a refill was due but no quote/WBNB V3 pool could quote it. Not a failure:
-    ///         the buyback proceeds and the pool is retried on the next process().
+    /// @notice Emitted when a refill was due but did not happen: no quote/WBNB V3 pool could quote
+    ///         it, the venue could not be resolved, or the swap itself reverted. Not a failure — the
+    ///         batch is untouched, the buyback proceeds, and the refill is retried on the next
+    ///         process().
     event GasRefillSkipped(uint256 pendingQuote);
     /// @notice Emitted when, after a refill, the remaining quote is below minProcessAmount.
     event BuybackSkipped(uint256 pendingQuote);
@@ -499,9 +501,11 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
     ///      Venue resolution (swapVenue()) is wrapped in try/catch: a revert anywhere in the
     ///      taxProcessor -> swapRegistry -> router/weth -> Portal quote-config chain degrades to
     ///      GasRefillSkipped rather than bricking process() for every call while the gas pool is
-    ///      low. Rule 010: pendingQuote is decremented before the outflow.
-    ///      The closing unwrap runs under _unwrapping: WBNB.withdraw pays out with transfer(), whose
-    ///      2300 gas stipend cannot fund receive()'s normal recognition path (see receive()).
+    ///      low. The outflow itself is equally isolated: it lives in executeGasRefill, a self-call
+    ///      under try/catch, so a swap that reverts (an RWA transfer restriction toward the pool, a
+    ///      venue that prices a swap it will not execute) degrades to GasRefillSkipped and the
+    ///      buyback still runs on the untouched batch. Rule 010 holds because the pendingQuote
+    ///      decrement sits in the same function as the outflow and reverts with it.
     function _refillGas() internal {
         if (quoteToken == address(0)) return;
         uint256 gasBal = address(this).balance;
@@ -535,16 +539,43 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
             outForAll > needed ? Math.mulDiv(available, needed, outForAll, Math.Rounding.Up) : available;
         uint256 cap = (available * MAX_REFILL_SHARE_BPS) / BPS_DENOMINATOR;
         if (quoteIn > cap) quoteIn = cap;
-        uint256 quoted = quoteIn == available ? outForAll : _quoteOut(router, wbnb, dexId, fee, quoteIn);
+        // MAX_REFILL_SHARE_BPS keeps quoteIn strictly below `available`, so the sized amount is
+        // always re-quoted at its own size — never reused from the full-amount outForAll quote.
+        uint256 quoted = _quoteOut(router, wbnb, dexId, fee, quoteIn);
         if (quoteIn == 0 || quoted == 0) {
             emit GasRefillSkipped(available);
             return;
         }
         uint256 minOut = (quoted * (BPS_DENOMINATOR - maxSlippageBps)) / BPS_DENOMINATOR;
 
+        try this.executeGasRefill(address(router), wbnb, dexId, fee, quoteIn, minOut) returns (uint256 got) {
+            emit GasRefilled(quoteIn, got, fee);
+        } catch {
+            // The whole outflow — the pendingQuote decrement included — rolled back with the swap.
+            emit GasRefillSkipped(available);
+        }
+    }
+
+    /// @notice Performs the gas-refill outflow: sells `quoteIn` of the quote token for WBNB on
+    ///         `router` and unwraps it into the vault's BNB gas pool. ONLY the vault itself may call
+    ///         it; `_refillGas` self-calls it through try/catch so a reverting swap cannot brick the
+    ///         buyback leg of process().
+    /// @dev Rule 010: the pendingQuote decrement is the FIRST statement and lives in the same
+    ///      function as the outflow, so a revert anywhere below (approve, swap, unwrap) reverts the
+    ///      decrement with it — the baseline can never drift from the balance.
+    ///      The allowance is zeroed after the swap: the router is re-resolved from a mutable
+    ///      registry on every call, so no allowance may stand for a stale or replaced venue.
+    ///      The closing unwrap runs under _unwrapping: real WBNB pays out with transfer() (2300 gas),
+    ///      and the flag makes receive() return before it touches storage or calls out, which is the
+    ///      only way the callback fits that budget (see receive()).
+    function executeGasRefill(address router, address wbnb, uint8 dexId, uint24 fee, uint256 quoteIn, uint256 minOut)
+        external
+        returns (uint256 got)
+    {
+        require(msg.sender == address(this), unicode"Caller must be the vault itself / 僅限金庫自身調用");
         pendingQuote -= quoteIn;
-        IERC20(quoteToken).forceApprove(address(router), quoteIn);
-        uint256 got = router.exactInputSingle(
+        IERC20(quoteToken).forceApprove(router, quoteIn);
+        got = IMultiDexRouter(router).exactInputSingle(
             dexId,
             IMultiDexRouter.ExactInputSingleParams({
                 tokenIn: quoteToken,
@@ -556,14 +587,10 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
                 sqrtPriceLimitX96: 0
             })
         );
-        IERC20(quoteToken).forceApprove(address(router), 0); // router is re-resolved from a
-            // mutable registry each call; never leave allowance standing for a stale/replaced venue.
-        // Real WBNB pays out with transfer() (2300 gas). The flag makes receive() return before it
-        // touches storage or calls out, which is the only way the callback fits that budget.
+        IERC20(quoteToken).forceApprove(router, 0);
         _unwrapping = true;
-        IWBNB(wbnb).withdraw(got); // pays BNB into receive(); flags suppress accounting + scheduling
+        IWBNB(wbnb).withdraw(got); // pays BNB into receive(); the flag suppresses accounting there
         _unwrapping = false;
-        emit GasRefilled(quoteIn, got, fee);
     }
 
     /// @notice Resolves the gas-refill swap venue: the Flap MultiDexRouter and wrapped-native token

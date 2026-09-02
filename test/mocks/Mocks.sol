@@ -350,6 +350,10 @@ contract MockMultiDexRouter is IMultiDexRouter {
     mapping(uint24 => uint256) public rateNum;
     mapping(uint24 => uint256) public rateDen;
     mapping(uint24 => bool) public quoteReverts;
+    /// @dev When true, exactInputSingle reverts while quoting still works — models a quote token
+    ///      whose transfer toward the pool is blocked (RWA transfer restriction) or a venue that
+    ///      prices a swap it will not execute.
+    bool public swapReverts;
     uint24 public lastFeeUsed;
     uint256 public lastAmountIn;
 
@@ -359,6 +363,7 @@ contract MockMultiDexRouter is IMultiDexRouter {
     function setPool(uint24 fee, bool exists) external { poolExists[fee] = exists; }
     function setRate(uint24 fee, uint256 num, uint256 den) external { rateNum[fee] = num; rateDen[fee] = den; }
     function setQuoteReverts(uint24 fee, bool v) external { quoteReverts[fee] = v; }
+    function setSwapReverts(bool v) external { swapReverts = v; }
 
     function _out(uint24 fee, uint256 amountIn) internal view returns (uint256) {
         if (rateDen[fee] == 0) return 0;
@@ -385,6 +390,7 @@ contract MockMultiDexRouter is IMultiDexRouter {
     }
 
     function exactInputSingle(uint8, ExactInputSingleParams calldata p) external payable returns (uint256 amountOut) {
+        require(!swapReverts, "MockMultiDexRouter: swap reverted");
         require(poolExists[p.fee], "MockMultiDexRouter: no pool");
         require(p.tokenOut == address(wbnb), "MockMultiDexRouter: tokenOut must be WBNB");
         IERC20(p.tokenIn).transferFrom(msg.sender, address(this), p.amountIn);

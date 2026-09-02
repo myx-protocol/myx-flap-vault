@@ -345,6 +345,28 @@ contract MyxVaultErc20RefillTest is MyxVaultErc20QuoteTestBase {
         assertEq(basePool.lastDepositAmount(), 80_000 ether, "remaining 80 RWA bought back");
     }
 
+    /// @dev The refill swap itself reverting (e.g. an RWA transfer restriction toward the DEX pool,
+    ///      or a venue that prices a swap it will not execute) must NOT brick the buyback: the whole
+    ///      outflow lives in executeGasRefill, called through try/catch, so the swap and its
+    ///      pendingQuote decrement revert together (rule 010) and process() falls through to the
+    ///      buyback with the batch intact.
+    function test_process_swapReverts_skipsRefillAndStillBuysBack() public {
+        _sendTax(100 ether);
+        router.setSwapReverts(true);
+        vm.expectEmit(true, true, true, true);
+        emit GasRefillSkipped(100 ether);
+        vault.process();
+        assertEq(address(vault).balance, 0, "no gas refilled");
+        assertEq(vault.pendingQuote(), 0, "rule 010: the reverted decrement rolled back, then the buyback spent it");
+        assertEq(basePool.lastDepositAmount(), 100_000 ether, "full batch bought back, nothing lost");
+    }
+
+    function test_executeGasRefill_onlySelf() public {
+        vm.prank(makeAddr("attacker"));
+        vm.expectRevert(bytes(unicode"Caller must be the vault itself / 僅限金庫自身調用"));
+        vault.executeGasRefill(address(router), address(wbnb), 0, 2500, 1 ether, 0);
+    }
+
     function test_process_refillDoesNotScheduleTriggerMidProcess() public {
         _sendTax(100 ether);
         vault.process(); // WBNB.withdraw pays BNB into receive() while process() holds the guard

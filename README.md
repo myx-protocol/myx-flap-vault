@@ -38,6 +38,11 @@ See [docs/flap-vault-integration-design.md](docs/flap-vault-integration-design.m
 - The refill leg (ERC20 quote → WBNB → BNB via Flap's MultiDexRouter) is capped at
   `MAX_REFILL_SHARE_BPS = 2000` — at most 20% of a processed batch can be diverted to top up the gas
   pool, bounding griefing/slippage exposure from any single `process()` call.
+- A refill swap that reverts (e.g. an RWA transfer restriction toward the DEX pool) does not brick
+  the vault: the refill is skipped (`GasRefillSkipped`), the batch is untouched and the buyback still
+  runs in the same `process()` call. Only the auto-scheduling stops once the gas pool runs dry —
+  anyone can restore it by calling `fundGas()` with more than `gasThreshold`, and `process()` stays
+  permissionless in the meantime.
 
 ## Layout
 
