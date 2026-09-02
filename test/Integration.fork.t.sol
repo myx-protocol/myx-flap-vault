@@ -99,7 +99,9 @@ contract MyxVaultForkTest is FlapBSCFixture {
                 // 5%: the buyback minOut is bounded by a pre-trade same-block Portal quote,
                 // so the bound must absorb the curve impact of the vault's own buy.
                 maxSlippageBps: 500,
-                minInitialGas: 0
+                minInitialGas: 0,
+                // This suite only launches a native-BNB quote; the ERC20-only refill cap is unused.
+                maxGasRefillAmount: 0
             })
         );
 

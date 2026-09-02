@@ -94,7 +94,8 @@ contract ChainAddressResolutionTest is Test {
                 basePool: makeAddr("basePool"),
                 poolFactory: makeAddr("poolFactory"),
                 maxSlippageBps: 300,
-                minInitialGas: 0
+                minInitialGas: 0,
+                maxGasRefillAmount: 0
             })
         );
     }

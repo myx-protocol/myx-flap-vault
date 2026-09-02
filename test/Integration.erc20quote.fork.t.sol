@@ -54,7 +54,8 @@ contract MyxVaultErc20QuoteForkTest is FlapBSCFixture {
                 basePool: address(basePool),
                 poolFactory: address(new FixedLpPredictor(BSC_USDT)),
                 maxSlippageBps: 500,
-                minInitialGas: 0.002 ether
+                minInitialGas: 0.002 ether,
+                maxGasRefillAmount: 0.05 ether
             })
         );
         deal(NVDAB, address(this), 1_000 ether);

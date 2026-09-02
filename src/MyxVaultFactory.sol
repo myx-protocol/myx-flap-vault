@@ -37,6 +37,10 @@ contract MyxVaultFactory is VaultFactoryBaseV2, IVaultFactoryDividendV23 {
         uint16 maxSlippageBps;
         /// @dev ERC20-quote launches must have at least this much BNB prepaid (wei). Enforced in newVault.
         uint256 minInitialGas;
+        /// @dev Ceiling on a creator's `gasRefillAmount` (wei), enforced in newVault for ERC20-quote
+        ///      launches only (native-quote vaults must carry 0 and never refill). Bounds how much
+        ///      BNB a single vault may divert from a tax batch into its gas pool.
+        uint256 maxGasRefillAmount;
     }
 
     /// @notice Creator-supplied per-vault configuration carried in `vaultData`.
@@ -99,6 +103,7 @@ contract MyxVaultFactory is VaultFactoryBaseV2, IVaultFactoryDividendV23 {
     bool public upgradesLocked;
 
     constructor(GlobalConfig memory _config) {
+        require(_config.maxSlippageBps <= 10_000, unicode"Slippage above 100% / 滑點超過 100%");
         config = _config;
         beacon = new UpgradeableBeacon(address(new MyxVault()));
     }
@@ -117,6 +122,15 @@ contract MyxVaultFactory is VaultFactoryBaseV2, IVaultFactoryDividendV23 {
         require(msg.sender == _getVaultPortal(), unicode"Caller must be the vault portal / 僅限 VaultPortal 調用");
         VaultData memory d = decodeVaultData(vaultData);
         GlobalConfig memory c = config;
+        // The three vaultData numbers are creator-supplied and immutable once the vault is
+        // initialized, so this is the only place they can be bounded. A zero minProcessAmount would
+        // let every dust receipt schedule a paid trigger; gasRefillAmount decides how much BNB one
+        // batch may be turned into for the gas pool, so it is capped factory-wide (ERC20 quotes
+        // only — a native-quote vault must carry zero gas params, enforced in the initializer).
+        require(d.minProcessAmount != 0, unicode"Min process amount must be non-zero / 最低處理金額不可為零");
+        if (quoteToken != address(0)) {
+            require(d.gasRefillAmount <= c.maxGasRefillAmount, unicode"Gas refill above factory cap / Gas 補充值超過工廠上限");
+        }
         vault = address(
             new BeaconProxy(
                 address(beacon),

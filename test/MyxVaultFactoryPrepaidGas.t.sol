@@ -34,7 +34,8 @@ contract MyxVaultFactoryPrepaidGasTest is Test {
                 basePool: address(new MockBasePool(new MockERC20("LP", "LP"), usdt)),
                 poolFactory: address(new MockMyxPoolFactory()),
                 maxSlippageBps: 300,
-                minInitialGas: 0.002 ether
+                minInitialGas: 0.002 ether,
+                maxGasRefillAmount: 0.05 ether
             })
         );
         vm.deal(creator, 10 ether);
@@ -109,7 +110,8 @@ contract MyxVaultFactoryPrepaidGasTest is Test {
                 basePool: address(new MockBasePool(new MockERC20("LP", "LP"), usdt)),
                 poolFactory: address(new MockMyxPoolFactory()),
                 maxSlippageBps: 300,
-                minInitialGas: 0
+                minInitialGas: 0,
+                maxGasRefillAmount: 0.05 ether
             })
         );
         vm.prank(VAULT_PORTAL);

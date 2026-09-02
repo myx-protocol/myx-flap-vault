@@ -59,7 +59,8 @@ contract MyxVaultFactoryTest is Test {
             basePool: address(basePool),
             poolFactory: address(poolFactory),
             maxSlippageBps: 300,
-            minInitialGas: 0.002 ether
+            minInitialGas: 0.002 ether,
+            maxGasRefillAmount: 0.05 ether
         });
     }
 
@@ -406,4 +407,88 @@ contract MyxVaultFactoryTest is Test {
         factory.upgradeVaultImplementation(newImpl);
     }
 
+    // ── Bounds on creator-supplied vault parameters ───────────────────────────
+    // minProcessAmount, gasThreshold and gasRefillAmount are creator-supplied at launch and
+    // immutable afterwards, so the factory is the only place that can bound them.
+
+    function test_newVault_zeroMinProcessAmount_reverts_native() public {
+        vm.prank(VAULT_PORTAL);
+        vm.expectRevert(bytes(unicode"Min process amount must be non-zero / 最低處理金額不可為零"));
+        factory.newVault(
+            makeAddr("tax"), address(0), makeAddr("creator"),
+            abi.encode(address(usdt), uint256(0), uint256(0), uint256(0))
+        );
+    }
+
+    function test_newVault_zeroMinProcessAmount_reverts_erc20() public {
+        vm.deal(address(this), 1 ether);
+        factory.prepayGas{value: 0.002 ether}();
+        vm.prank(VAULT_PORTAL);
+        vm.expectRevert(bytes(unicode"Min process amount must be non-zero / 最低處理金額不可為零"));
+        factory.newVault(
+            makeAddr("tax"), address(rwa), address(this),
+            abi.encode(address(usdt), uint256(0), uint256(0.01 ether), uint256(0.05 ether))
+        );
+    }
+
+    function test_newVault_erc20_gasRefillAboveCap_reverts() public {
+        vm.deal(address(this), 1 ether);
+        factory.prepayGas{value: 0.002 ether}();
+        vm.prank(VAULT_PORTAL);
+        vm.expectRevert(bytes(unicode"Gas refill above factory cap / Gas 補充值超過工廠上限"));
+        factory.newVault(
+            makeAddr("tax"), address(rwa), address(this),
+            abi.encode(address(usdt), uint256(10 ether), uint256(0.01 ether), uint256(0.05 ether + 1))
+        );
+    }
+
+    function test_newVault_erc20_gasRefillAtCap_passes() public {
+        vm.deal(address(this), 1 ether);
+        factory.prepayGas{value: 0.002 ether}();
+        vm.prank(VAULT_PORTAL);
+        address vaultAddr = factory.newVault(
+            makeAddr("tax"), address(rwa), address(this),
+            abi.encode(address(usdt), uint256(10 ether), uint256(0.01 ether), uint256(0.05 ether))
+        );
+        assertEq(MyxVault(payable(vaultAddr)).gasRefillAmount(), 0.05 ether, "equal to the cap is allowed");
+    }
+
+    /// @dev The cap is ERC20-quote only: a native-quote vault never refills (its gas params must be
+    ///      zero), so a factory configured with maxGasRefillAmount = 0 still launches native vaults.
+    function test_newVault_nativeQuote_ignoresGasRefillCap() public {
+        MyxVaultFactory strict = new MyxVaultFactory(
+            MyxVaultFactory.GlobalConfig({
+                poolManager: address(poolManager),
+                basePool: address(basePool),
+                poolFactory: address(poolFactory),
+                maxSlippageBps: 300,
+                minInitialGas: 0.002 ether,
+                maxGasRefillAmount: 0
+            })
+        );
+        vm.prank(VAULT_PORTAL);
+        address vaultAddr = strict.newVault(makeAddr("tax"), address(0), makeAddr("creator"), _vaultData());
+        assertEq(MyxVault(payable(vaultAddr)).vaultQuoteToken(), address(0));
+        // Same factory: an ERC20 launch with any non-zero refill is rejected by the same cap.
+        vm.deal(address(this), 1 ether);
+        strict.prepayGas{value: 0.002 ether}();
+        vm.prank(VAULT_PORTAL);
+        vm.expectRevert(bytes(unicode"Gas refill above factory cap / Gas 補充值超過工廠上限"));
+        strict.newVault(makeAddr("tax2"), address(rwa), address(this), _erc20VaultData());
+    }
+
+    function test_constructor_rejectsSlippageAbove100Percent() public {
+        MyxVaultFactory.GlobalConfig memory c = _baseConfig();
+        c.maxSlippageBps = 10_001;
+        vm.expectRevert(bytes(unicode"Slippage above 100% / 滑點超過 100%"));
+        new MyxVaultFactory(c);
+    }
+
+    function test_constructor_acceptsSlippageAt100Percent() public {
+        MyxVaultFactory.GlobalConfig memory c = _baseConfig();
+        c.maxSlippageBps = 10_000;
+        MyxVaultFactory f = new MyxVaultFactory(c);
+        (,,, uint16 bps,,) = f.config();
+        assertEq(bps, 10_000);
+    }
 }

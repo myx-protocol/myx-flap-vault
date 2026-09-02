@@ -32,7 +32,10 @@ contract DeployMyxVaultFactory is Script {
                 // v2.3 resolveDividendToken callback.
                 poolFactory: vm.envAddress("MYX_POOL_FACTORY"),
                 maxSlippageBps: 300,
-                minInitialGas: 0
+                minInitialGas: 0,
+                // Native-quote launches only on this chain: no vault may refill a gas pool, so the
+                // ceiling on gasRefillAmount is 0.
+                maxGasRefillAmount: 0
             })
         );
         console2.log("MyxVaultFactory:", address(factory));

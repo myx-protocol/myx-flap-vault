@@ -167,7 +167,7 @@ function _refillGas() internal {
 
 ### 4.2 MyxVaultFactory
 
-- `GlobalConfig` 去掉 `minProcessAmount`（移入 vaultData）；保留 `poolManager / basePool / poolFactory / maxSlippageBps`；新增 `minInitialGas`（wei，ERC20 quote 发币前必须预付的最低 BNB，建议取 FlapTriggerService 当前手续费的 10 倍，BSC 约 0.002 BNB）。
+- `GlobalConfig` 去掉 `minProcessAmount`（移入 vaultData）；保留 `poolManager / basePool / poolFactory / maxSlippageBps`（构造函数校验 `<= 10_000`）；新增 `maxGasRefillAmount`（wei，ERC20 quote 下创建人 `gasRefillAmount` 的上限，BSC 取 0.05 BNB、Robinhood 取 0）与 `minInitialGas`（wei，ERC20 quote 发币前必须预付的最低 BNB，建议取 FlapTriggerService 当前手续费的 10 倍，BSC 约 0.002 BNB）。
 - **预付 gas**：
   - `prepayGas() external payable`：`prepaidGas[msg.sender] += msg.value`，任何地址可为自己预存，可多次累加。
   - `withdrawPrepaidGas()`：CEI 顺序全额退回 `prepaidGas[msg.sender]`。
@@ -207,7 +207,7 @@ function _refillGas() internal {
 
 ## 7. 安全与风险
 
-- **创建人参数面（rule 001）**：创建人只能给 `minProcessAmount`、`gasThreshold`、`gasRefillAmount`。恶意大 `gasRefillAmount` 只会把税收更多地换成 BNB 留在 gas 池，可被 `emergencySweepNative` 取回；不能卡死 vault。
+- **创建人参数面（rule 001）**：创建人只能给 `minProcessAmount`、`gasThreshold`、`gasRefillAmount`，三者在发币时写入、之后不可变，因此边界只能由工厂在 `newVault` 里强制：`minProcessAmount != 0`；ERC20 quote 下 `gasRefillAmount <= GlobalConfig.maxGasRefillAmount`（BSC 主网/测试网脚本取 0.05 BNB，Robinhood 取 0）；vault `initialize` 另要求 `gasRefillAmount > gasThreshold`（ERC20）或两者为零（native）。剩下的旋钮是：偏大的 `gasRefillAmount` 会把每批税收里更多的额度（受 `MAX_REFILL_SHARE_BPS` = 20% 硬顶）换成 BNB 留在只有 EMERGENCY_ROLE 能清空的 gas 池里。这落在创建人本来就拥有的 EMERGENCY_ROLE 信任范围内——创建人在 `initialize` 时即被授予 EMERGENCY_ROLE，本就可以用 `emergencyRescueToken` 把 100% 的 quote 税收转走，因此这不是新增的攻击面。任何参数组合都卡不死 vault：refill 报不出价或整笔 revert 都会跳过（`GasRefillSkipped`），买回照常执行。
 - **MEV**：买回腿维持同块报价 minOut；refill 腿同样用同块报价 minOut，且金额小。文档化接受。
 - **RWA 代币特性**：bStocks 类代币可能有转账限制或冻结，vault 持有 quote 期间存在合规风险，超出合约层可控范围，需在 README 说明。
 - **MultiDexRouter 未公开文档**：接口来自 Sourcify 验证源，Uniswap 风格；SwapRegistry 可能更换 router 地址，动态读取即可跟随；若未来 Flap 撤掉 `multiDexRouter()` 入口，refill 腿失效但买回与分红不受影响。
