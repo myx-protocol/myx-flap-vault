@@ -150,7 +150,10 @@ contract MyxVaultFactory is VaultFactoryBaseV2, IVaultFactoryDividendV23 {
         // only — a native-quote vault must carry zero gas params, enforced in the initializer).
         require(d.minProcessAmount != 0, unicode"Min process amount must be non-zero / 最低處理金額不可為零");
         if (quoteToken != address(0)) {
-            require(d.gasRefillAmount <= c.maxGasRefillAmount, unicode"Gas refill above factory cap / Gas 補充值超過工廠上限");
+            require(
+                d.gasRefillAmount <= c.maxGasRefillAmount,
+                unicode"Gas refill above factory cap / Gas 補充值超過工廠上限"
+            );
         }
         vault = address(
             new BeaconProxy(
@@ -222,9 +225,9 @@ contract MyxVaultFactory is VaultFactoryBaseV2, IVaultFactoryDividendV23 {
                 abi.decode(launchParams, (IVaultPortalTypes.NewTokenV6WithVaultParamsU8));
             require(params.dividendToken == MAGIC_DIVIDEND_COMPUTED, unicode"Expected V6 MAGIC dividend token / 預期 V6 MAGIC 分紅幣");
             // The myx MARKET quote token travels in vaultData — NOT params.quoteToken (Flap bonding
-            // quote = native ETH). Decoded through decodeVaultData, the same helper newVault uses,
-            // so the predicted LP and the vault's actual myx pool share the same market —
-            // fund-critical.
+            // quote = native ETH). Decoded through _decodeVaultData, the twin of the helper newVault
+            // decodes with, so the predicted LP and the vault's actual myx pool share the same
+            // market — fund-critical.
             MarketId marketId =
                 MyxMarketId.derive(uint64(block.chainid), _decodeVaultData(params.vaultData).marketQuoteToken);
             return IMyxPoolFactory(config.poolFactory).predictBasePoolToken(
