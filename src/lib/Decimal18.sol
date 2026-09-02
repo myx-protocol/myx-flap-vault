@@ -11,13 +11,20 @@ library Decimal18 {
     ///         e.g. 15560495045491564826633 -> "15560.495045491564826633",
     ///              1e18 -> "1", 9409000000000 -> "0.000009409", 1 -> "0.000000000000000001".
     function toString(uint256 value) internal pure returns (string memory) {
-        uint256 whole = value / 1e18;
-        uint256 frac = value % 1e18;
+        return toString(value, 18);
+    }
+
+    /// @notice Renders `value` with `decimals` fractional digits, stripping trailing zeros.
+    function toString(uint256 value, uint8 decimals) internal pure returns (string memory) {
+        if (decimals == 0) return Strings.toString(value);
+        uint256 unit = 10 ** uint256(decimals);
+        uint256 whole = value / unit;
+        uint256 frac = value % unit;
         if (frac == 0) return Strings.toString(whole);
 
-        // frac in [1, 1e18); toString drops its leading zeros, so left-pad back to 18 digits.
+        // frac in [1, unit); toString drops its leading zeros, so left-pad back to `decimals` digits.
         bytes memory fracDigits = bytes(Strings.toString(frac));
-        uint256 leadingZeros = 18 - fracDigits.length;
+        uint256 leadingZeros = uint256(decimals) - fracDigits.length;
 
         // Drop trailing zeros (e.g. 9409000000000 -> keep "9409").
         uint256 end = fracDigits.length;

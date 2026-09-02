@@ -567,20 +567,20 @@ contract MyxVaultEmergencyTest is MyxVaultTestBase {
         vault.emergencyWithdraw(1 ether, 0, makeAddr("stranger"));
     }
 
-    function test_emergencySweepBnb() public {
+    function test_emergencySweepNative() public {
         vm.deal(address(vault), 2 ether);
         address rescue = makeAddr("rescue");
         vm.prank(GUARDIAN);
-        vault.emergencySweepEth(rescue);
+        vault.emergencySweepNative(rescue);
         assertEq(rescue.balance, 2 ether);
         assertEq(vault.pendingQuote(), 0);
     }
 
-    function test_emergencySweepBnb_strangerReverts() public {
+    function test_emergencySweepNative_strangerReverts() public {
         vm.deal(address(vault), 1 ether);
         vm.prank(makeAddr("stranger"));
         vm.expectRevert();
-        vault.emergencySweepEth(makeAddr("stranger"));
+        vault.emergencySweepNative(makeAddr("stranger"));
     }
 
     /// @dev v6 deferred-LP escape: LP retained in the vault (dividend permanently unwired / shares
@@ -659,17 +659,29 @@ contract MyxVaultViewsTest is MyxVaultTestBase {
         bool hasClaim;
         bool hasFeed;
         bool hasPending;
+        bool hasSync;
+        bool hasFundGas;
+        bool hasGasBalance;
+        bool hasQuote;
         for (uint256 i = 0; i < methods.length; i++) {
             bytes32 n = keccak256(bytes(methods[i].name));
             if (n == keccak256("process")) hasProcess = true;
             if (n == keccak256("claimReward")) hasClaim = true;
             if (n == keccak256("feedDividend")) hasFeed = true;
             if (n == keccak256("pendingReward")) hasPending = true;
+            if (n == keccak256("sync")) hasSync = true;
+            if (n == keccak256("fundGas")) hasFundGas = true;
+            if (n == keccak256("gasBalance")) hasGasBalance = true;
+            if (n == keccak256("vaultQuoteToken")) hasQuote = true;
         }
         assertTrue(hasProcess, "schema must expose process");
         assertTrue(hasClaim, "schema must expose claimReward");
         assertTrue(hasFeed, "schema must expose feedDividend");
         assertTrue(hasPending, "schema must expose pendingReward");
+        assertTrue(hasSync, "schema must expose sync");
+        assertTrue(hasFundGas, "schema must expose fundGas");
+        assertTrue(hasGasBalance, "schema must expose gasBalance");
+        assertTrue(hasQuote, "schema must expose vaultQuoteToken");
     }
 }
 

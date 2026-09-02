@@ -394,3 +394,55 @@ contract MyxVaultErc20RefillTest is MyxVaultErc20QuoteTestBase {
 
     receive() external payable {}
 }
+
+contract MyxVaultErc20EmergencyAndViewsTest is MyxVaultErc20QuoteTestBase {
+    function test_emergencySweepNative_clearsGasPoolOnly() public {
+        vault.fundGas{value: 0.5 ether}();
+        // _sendTax's ping auto-schedules a trigger (Task 6/7), which debits the fee from this same
+        // BNB gas pool — see test_process_noRefillWhenGasAboveThreshold for the same caveat.
+        _sendTax(20 ether);
+        address rescue = makeAddr("rescue");
+        vm.prank(GUARDIAN);
+        vault.emergencySweepNative(rescue);
+        assertEq(rescue.balance, 0.5 ether - triggerService.getFee());
+        assertEq(vault.pendingQuote(), 20 ether, "ERC20 revenue baseline untouched");
+    }
+
+    function test_emergencyRescueToken_quote_resetsBaseline() public {
+        _sendTax(20 ether);
+        address rescue = makeAddr("rescue");
+        vm.prank(GUARDIAN);
+        vault.emergencyRescueToken(address(rwa), rescue);
+        assertEq(rwa.balanceOf(rescue), 20 ether);
+        assertEq(vault.pendingQuote(), 0, "rule 010: outflow decrements the baseline");
+        // no deadlock: new revenue is recognized again
+        _sendTax(1 ether);
+        assertEq(vault.pendingQuote(), 1 ether);
+    }
+
+    function test_description_showsQuoteSymbolAndGas() public {
+        _sendTax(12.5 ether);
+        vault.fundGas{value: 0.02 ether}();
+        assertEq(
+            vault.description(),
+            unicode"MYX liquidity vault / MYX 流動性金庫: 0 LP minted / LP 已鑄造, 0 LP distributed / LP 已分發, pending NVDAB / 待處理 NVDAB: 12.5, gas pool / Gas 池: 0.02 BNB."
+        );
+    }
+
+    function test_description_sixDecimalQuote() public {
+        MockERC20Decimals xaut = new MockERC20Decimals("Tether Gold", "XAUt", 6);
+        portal.setQuoteConfig(address(xaut), true, 0);
+        MyxVault.InitParams memory p = _initParams();
+        p.quoteToken = address(xaut);
+        p.minProcessAmount = 1_000_000;
+        MyxVault v = _deployVault(p);
+        xaut.mint(address(v), 2_500_000);
+        v.sync();
+        assertEq(
+            v.description(),
+            unicode"MYX liquidity vault / MYX 流動性金庫: 0 LP minted / LP 已鑄造, 0 LP distributed / LP 已分發, pending XAUt / 待處理 XAUt: 2.5, gas pool / Gas 池: 0 BNB."
+        );
+    }
+
+    receive() external payable {}
+}

@@ -7,6 +7,7 @@ import {Initializable} from "@openzeppelin-contracts-upgradeable/proxy/utils/Ini
 import {AccessControlUpgradeable} from "@openzeppelin-contracts-upgradeable/access/AccessControlUpgradeable.sol";
 import {ReentrancyGuardUpgradeable} from "@openzeppelin-contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
 import {IERC20} from "@openzeppelin/token/ERC20/IERC20.sol";
+import {IERC20Metadata} from "@openzeppelin/token/ERC20/extensions/IERC20Metadata.sol";
 import {SafeERC20} from "@openzeppelin/token/ERC20/utils/SafeERC20.sol";
 import {MarketId, PoolId, MyxPoolId, MyxMarketId, PoolMetadata, IMyxPoolManager, IMyxBasePool} from "./myx/IMyxPool.sol";
 import {IDividendDistributor} from "./dividend/IDividendDistributor.sol";
@@ -411,12 +412,13 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
         emit EmergencyWithdrawal(lpAmount, amountOut, to);
     }
 
-    /// @notice Sweeps stuck native ETH. Disaster recovery only (e.g. process() permanently broken).
-    function emergencySweepEth(address to) external nonReentrant onlyRole(EMERGENCY_ROLE) {
+    /// @notice Sweeps the vault's native balance. Native quote: this is the tax revenue, baseline
+    ///         reset to zero (rule 010). ERC20 quote: this is only the gas pool, revenue untouched.
+    function emergencySweepNative(address to) external nonReentrant onlyRole(EMERGENCY_ROLE) {
         uint256 amount = address(this).balance;
-        pendingQuote = 0;
+        if (quoteToken == address(0)) pendingQuote = 0;
         (bool ok,) = to.call{value: amount}("");
-        require(ok, unicode"ETH sweep failed / ETH 清退失敗");
+        require(ok, unicode"Native sweep failed / 原生幣清退失敗");
         emit EmergencySwept(amount, to);
     }
 
@@ -424,9 +426,12 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
     ///         Generic escape hatch for deferred mBase LP (retained when the dividend stays unwired
     ///         or totalShares == 0 indefinitely) and residual tax tokens from a failed buyback —
     ///         covering cases where emergencyWithdraw is unusable (myx pool withdraw path broken).
+    ///         Rule 010: rescuing the quote token itself is an outflow of tax revenue, so the
+    ///         baseline is reset to zero.
     function emergencyRescueToken(address token, address to) external nonReentrant onlyRole(EMERGENCY_ROLE) {
         require(token != address(0) && to != address(0), unicode"Zero address / 零地址");
         uint256 bal = IERC20(token).balanceOf(address(this));
+        if (token == quoteToken) pendingQuote = 0;
         if (bal > 0) {
             IERC20(token).safeTransfer(to, bal);
             emit EmergencyTokenRescued(token, to, bal);
@@ -601,15 +606,35 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
         }
     }
 
+    function _nativeSymbol() internal view returns (string memory) {
+        return block.chainid == 4663 ? "ETH" : "BNB";
+    }
+
+    function _quoteSymbol() internal view returns (string memory) {
+        return quoteToken == address(0) ? _nativeSymbol() : IERC20Metadata(quoteToken).symbol();
+    }
+
+    function _quoteDecimals() internal view returns (uint8) {
+        return quoteToken == address(0) ? 18 : IERC20Metadata(quoteToken).decimals();
+    }
+
     function description() public view override returns (string memory) {
-        return string.concat(
+        string memory sym = _quoteSymbol();
+        string memory head = string.concat(
             unicode"MYX liquidity vault / MYX 流動性金庫: ",
             Decimal18.toString(totalLpMinted),
             unicode" LP minted / LP 已鑄造, ",
             Decimal18.toString(totalRewardsForwarded),
-            unicode" LP distributed / LP 已分發, pending ETH / 待處理 ETH: ",
-            Decimal18.toString(pendingQuote),
-            "."
+            unicode" LP distributed / LP 已分發, pending ",
+            sym,
+            unicode" / 待處理 ",
+            sym,
+            ": ",
+            Decimal18.toString(pendingQuote, _quoteDecimals())
+        );
+        if (quoteToken == address(0)) return string.concat(head, ".");
+        return string.concat(
+            head, unicode", gas pool / Gas 池: ", Decimal18.toString(address(this).balance), " ", _nativeSymbol(), "."
         );
     }
 
@@ -617,12 +642,13 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
         schema.vaultType = "MyxVault";
         schema.description =
             unicode"Tax revenue is converted to MYX LP and distributed to holders as dividends. / 稅收轉換為 MYX LP，作為分紅分配給持幣者。";
-        schema.methods = new VaultMethodSchema[](5);
+        schema.methods = new VaultMethodSchema[](9);
 
         schema.methods[0].name = "pendingQuote";
-        schema.methods[0].description = unicode"Tax revenue awaiting processing. / 待處理的稅收金額。";
+        schema.methods[0].description =
+            unicode"Tax revenue awaiting processing, in quote token units. / 待處理的稅收金額（報價幣單位）。";
         schema.methods[0].outputs = new FieldDescriptor[](1);
-        schema.methods[0].outputs[0] = FieldDescriptor("amount", "uint256", "ETH amount", 18);
+        schema.methods[0].outputs[0] = FieldDescriptor("amount", "uint256", "Quote amount", 0);
 
         schema.methods[1].name = "process";
         schema.methods[1].description =
@@ -645,5 +671,26 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
         schema.methods[4].inputs[0] = FieldDescriptor("user", "address", "Holder address", 0);
         schema.methods[4].outputs = new FieldDescriptor[](1);
         schema.methods[4].outputs[0] = FieldDescriptor("amount", "uint256", "Claimable LP amount", 18);
+
+        schema.methods[5].name = "vaultQuoteToken";
+        schema.methods[5].description =
+            unicode"Revenue currency of this vault (zero address = native). / 本金庫的稅收幣種（零地址為原生幣）。";
+        schema.methods[5].outputs = new FieldDescriptor[](1);
+        schema.methods[5].outputs[0] = FieldDescriptor("quoteToken", "address", "Quote token", 0);
+
+        schema.methods[6].name = "sync";
+        schema.methods[6].description =
+            unicode"Recognize quote revenue that arrived without a wake call. Permissionless. / 確認未觸發喚醒的稅收入賬。任何人可調用。";
+        schema.methods[6].isWriteMethod = true;
+
+        schema.methods[7].name = "fundGas";
+        schema.methods[7].description =
+            unicode"Top up the BNB gas pool that pays auto-trigger fees (ERC20 quote vaults). / 為自動觸發手續費充值 BNB Gas 池（ERC20 報價幣金庫）。";
+        schema.methods[7].isWriteMethod = true;
+
+        schema.methods[8].name = "gasBalance";
+        schema.methods[8].description = unicode"BNB reserved for auto-trigger fees. / 保留給自動觸發手續費的 BNB。";
+        schema.methods[8].outputs = new FieldDescriptor[](1);
+        schema.methods[8].outputs[0] = FieldDescriptor("amount", "uint256", "BNB amount", 18);
     }
 }

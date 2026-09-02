@@ -36,4 +36,18 @@ contract Decimal18Test is Test {
     function test_leadingFractionalZero() public pure {
         assertEq(Decimal18.toString(1010000000000000000), "1.01");
     }
+
+    function test_toString_sixDecimals() public pure {
+        assertEq(Decimal18.toString(1_500_000, 6), "1.5");
+        assertEq(Decimal18.toString(1, 6), "0.000001");
+        assertEq(Decimal18.toString(2_000_000, 6), "2");
+    }
+
+    function test_toString_zeroDecimals() public pure {
+        assertEq(Decimal18.toString(42, 0), "42");
+    }
+
+    function test_toString_18DecimalsMatchesLegacy() public pure {
+        assertEq(Decimal18.toString(15560495045491564826633, 18), Decimal18.toString(15560495045491564826633));
+    }
 }
