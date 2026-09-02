@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 pragma solidity ^0.8.26;
 
-import {VaultBaseV2} from "./flap/VaultBaseV2.sol";
+import {VaultBaseV3} from "./flap/VaultBaseV3.sol";
 import {VaultUISchema, VaultMethodSchema, FieldDescriptor} from "./flap/IVaultSchemasV1.sol";
 import {Initializable} from "@openzeppelin-contracts-upgradeable/proxy/utils/Initializable.sol";
 import {AccessControlUpgradeable} from "@openzeppelin-contracts-upgradeable/access/AccessControlUpgradeable.sol";
@@ -25,7 +25,7 @@ import {IFlapTriggerService, ITriggerReceiver} from "./flap/IFlapTriggerService.
 ///      that same mBase LP (wired at launch). Holders claim the mBase LP via
 ///      the dividend (fairly, via Flap setShare hooks), then earn myx rebates by holding it.
 /// @dev Invariants:
-///      - receive() does accounting (pendingEth += msg.value) then best-effort schedules a delayed
+///      - receive() does accounting (pendingQuote += msg.value) then best-effort schedules a delayed
 ///        process() via FlapTriggerService in try/catch; accounting is the Rule-005 core and the
 ///        schedule never reverts receive() (deliberate Rule-005 deviation, see auto-trigger doc).
 ///      - process() is permissionless: anyone may convert pending ETH into liquidity + dividend.
@@ -35,17 +35,24 @@ import {IFlapTriggerService, ITriggerReceiver} from "./flap/IFlapTriggerService.
 ///        price feed, no fallback path. Anti-fallback: retry via feedDividend() or next process().
 ///      - Guardian roles cannot be revoked by any other account; only the guardian itself may
 ///        voluntarily renounce (Flap mandate).
-contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, ReentrancyGuardUpgradeable, ITriggerReceiver {
+contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, ReentrancyGuardUpgradeable, ITriggerReceiver {
     using SafeERC20 for IERC20;
 
     struct InitParams {
         address taxToken;
         address creator;
+        /// @dev Launch quote token of the tax token (address(0) = native). Equals vaultQuoteToken().
+        address quoteToken;
         address marketQuoteToken;
         address poolManager;
         address basePool;
         uint16 maxSlippageBps;
+        /// @dev Minimum recognized quote balance before process() runs; in quote base units.
         uint256 minProcessAmount;
+        /// @dev ERC20 quote only: refill the BNB gas pool when it drops below this (wei).
+        uint256 gasThreshold;
+        /// @dev ERC20 quote only: target BNB gas pool after a refill (wei); must exceed gasThreshold.
+        uint256 gasRefillAmount;
     }
 
     bytes32 public constant EMERGENCY_ROLE = keccak256("EMERGENCY_ROLE");
@@ -86,7 +93,9 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
     uint16 public maxSlippageBps;
     uint256 public minProcessAmount;
 
-    uint256 public pendingEth;
+    /// @notice Recognized-and-unspent quote revenue (Flap rule 010 baseline). Native quote: equals
+    ///         address(this).balance. ERC20 quote: <= IERC20(quoteToken).balanceOf(this).
+    uint256 public pendingQuote;
     uint256 public totalLpMinted;
     uint256 public totalRewardsForwarded;
 
@@ -96,8 +105,15 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
     uint256 public pendingTriggerId;
     bool public hasPendingTrigger;
 
-    /// @dev Reserved storage for upgrades. Reduced from 44 to 42 for the two slots added above.
-    uint256[42] private __gap;
+    /// @notice Revenue currency (address(0) = native gas token). Immutable after initialize.
+    address public quoteToken;
+    /// @notice ERC20 quote only: refill the BNB gas pool below this balance (wei).
+    uint256 public gasThreshold;
+    /// @notice ERC20 quote only: gas pool target after a refill (wei).
+    uint256 public gasRefillAmount;
+
+    /// @dev Reserved storage for upgrades. 44 original - 2 (trigger) - 3 (V3 quote/gas) = 39.
+    uint256[39] private __gap;
 
     constructor() {
         _disableInitializers();
@@ -121,47 +137,67 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
         maxSlippageBps = p.maxSlippageBps;
         minProcessAmount = p.minProcessAmount;
 
+        quoteToken = p.quoteToken;
+        if (p.quoteToken == address(0)) {
+            require(
+                p.gasThreshold == 0 && p.gasRefillAmount == 0,
+                unicode"Gas params must be zero for native quote / 原生報價幣的 Gas 參數必須為零"
+            );
+        } else {
+            require(
+                p.gasRefillAmount > p.gasThreshold,
+                unicode"Gas refill must exceed threshold / Gas 補充值必須大於閾值"
+            );
+        }
+        gasThreshold = p.gasThreshold;
+        gasRefillAmount = p.gasRefillAmount;
+
         address guardian = _getGuardian();
         _grantRole(DEFAULT_ADMIN_ROLE, guardian);
         _grantRole(EMERGENCY_ROLE, guardian);
         _grantRole(EMERGENCY_ROLE, p.creator);
     }
 
-    /// @dev Accounting + best-effort auto-schedule. Accounting (pendingEth += msg.value) runs first
+    /// @inheritdoc VaultBaseV3
+    function vaultQuoteToken() public view override returns (address) {
+        return quoteToken;
+    }
+
+    /// @dev Accounting + best-effort auto-schedule. Accounting (pendingQuote += msg.value) runs first
     ///      and is the Rule-005 core. Scheduling a delayed process() via FlapTriggerService is wrapped
     ///      in try/catch (self-call) so ANY scheduling failure — service down, fee insufficient, OOG —
     ///      degrades to "not scheduled" and NEVER reverts receive() or loses tax. The external call is
     ///      a deliberate Rule-005 deviation (see auto-trigger design doc); never-revert is preserved.
     receive() external payable {
-        pendingEth += msg.value;
-        emit RevenueReceived(msg.value, pendingEth);
-        if (!hasPendingTrigger && pendingEth >= minProcessAmount) {
+        pendingQuote += msg.value;
+        emit RevenueReceived(msg.value, pendingQuote);
+        if (!hasPendingTrigger && pendingQuote >= minProcessAmount) {
             try this.scheduleProcess() {} catch {}
         }
     }
 
     /// @notice Schedules a delayed process() via FlapTriggerService. ONLY the vault itself may call
     ///         it (from receive()); the self-call lets receive() wrap getFee()+requestTrigger in one
-    ///         try/catch. The fee is paid from tax revenue: pendingEth is debited ONLY on a successful
-    ///         schedule, preserving the (vault ETH balance == pendingEth) invariant.
+    ///         try/catch. The fee is paid from tax revenue: pendingQuote is debited ONLY on a successful
+    ///         schedule, preserving the (vault ETH balance == pendingQuote) invariant.
     function scheduleProcess() external {
         require(msg.sender == address(this), unicode"Caller must be the vault itself / 僅限金庫自身調用");
         IFlapTriggerService service = IFlapTriggerService(_getTriggerService());
         uint256 fee = service.getFee();
-        // Decide on ACCUMULATED pendingEth (not a single receipt): it must cover the fee AND still
+        // Decide on ACCUMULATED pendingQuote (not a single receipt): it must cover the fee AND still
         // leave >= minProcessAmount so the scheduled process() can actually run — no wasted fee, and
-        // pendingEth -= fee can never underflow.
-        require(pendingEth >= minProcessAmount + fee, unicode"Pending below minimum plus fee / 待處理低於下限加手續費");
+        // pendingQuote -= fee can never underflow.
+        require(pendingQuote >= minProcessAmount + fee, unicode"Pending below minimum plus fee / 待處理低於下限加手續費");
         uint64 executeAfter = uint64(block.timestamp) + PROCESS_DELAY;
         uint256 id = service.requestTrigger{value: fee}(executeAfter);
         pendingTriggerId = id;
         hasPendingTrigger = true;
-        pendingEth -= fee;
+        pendingQuote -= fee;
         emit ProcessScheduled(id, executeAfter);
     }
 
     /// @notice FlapTriggerService callback (ITriggerReceiver). Clears the in-flight gate FIRST, then
-    ///         runs process() under try/catch so a revert (e.g. pendingEth already drained below the
+    ///         runs process() under try/catch so a revert (e.g. pendingQuote already drained below the
     ///         minimum by a permissionless process()) cannot deadlock scheduling — the next tax
     ///         receipt re-schedules. Stale/unknown request ids are ignored.
     function trigger(uint256 requestId) external {
@@ -199,11 +235,11 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
     ///         contract. PERMISSIONLESS — anyone may run it.
     /// @dev Buy leg minOut is a same-block Portal quote × (1 - maxSlippageBps): bounds per-call
     ///      deviation but cannot prevent sandwiching (BSC block proposers reorder at no cost).
-    ///      Consumes ALL pendingEth; the LP IS the reward (v6 model).
+    ///      Consumes ALL pendingQuote; the LP IS the reward (v6 model).
     function process() external nonReentrant {
-        uint256 amount = pendingEth;
+        uint256 amount = pendingQuote;
         require(amount >= minProcessAmount, unicode"Pending below minimum / 待處理金額低於下限");
-        pendingEth = 0;
+        pendingQuote = 0;
 
         uint256 received = _buyTaxToken(amount);
         _ensurePoolExists();
@@ -300,7 +336,7 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
     /// @notice Sweeps stuck native ETH. Disaster recovery only (e.g. process() permanently broken).
     function emergencySweepEth(address to) external nonReentrant onlyRole(EMERGENCY_ROLE) {
         uint256 amount = address(this).balance;
-        pendingEth = 0;
+        pendingQuote = 0;
         (bool ok,) = to.call{value: amount}("");
         require(ok, unicode"ETH sweep failed / ETH 清退失敗");
         emit EmergencySwept(amount, to);
@@ -365,7 +401,7 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
             unicode" LP minted / LP 已鑄造, ",
             Decimal18.toString(totalRewardsForwarded),
             unicode" LP distributed / LP 已分發, pending ETH / 待處理 ETH: ",
-            Decimal18.toString(pendingEth),
+            Decimal18.toString(pendingQuote),
             "."
         );
     }
@@ -376,7 +412,7 @@ contract MyxVault is VaultBaseV2, Initializable, AccessControlUpgradeable, Reent
             unicode"Tax revenue is converted to MYX LP and distributed to holders as dividends. / 稅收轉換為 MYX LP，作為分紅分配給持幣者。";
         schema.methods = new VaultMethodSchema[](5);
 
-        schema.methods[0].name = "pendingEth";
+        schema.methods[0].name = "pendingQuote";
         schema.methods[0].description = unicode"Tax revenue awaiting processing. / 待處理的稅收金額。";
         schema.methods[0].outputs = new FieldDescriptor[](1);
         schema.methods[0].outputs[0] = FieldDescriptor("amount", "uint256", "ETH amount", 18);

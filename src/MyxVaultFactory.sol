@@ -83,11 +83,14 @@ contract MyxVaultFactory is VaultFactoryBaseV2, IVaultFactoryDividendV23 {
                         MyxVault.InitParams({
                             taxToken: taxToken,
                             creator: creator,
+                            quoteToken: quoteToken,
                             marketQuoteToken: marketQuoteToken,
                             poolManager: c.poolManager,
                             basePool: c.basePool,
                             maxSlippageBps: c.maxSlippageBps,
-                            minProcessAmount: c.minProcessAmount
+                            minProcessAmount: c.minProcessAmount,
+                            gasThreshold: 0,
+                            gasRefillAmount: 0
                         })
                     )
                 )

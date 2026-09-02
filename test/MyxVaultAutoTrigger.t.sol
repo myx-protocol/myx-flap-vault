@@ -59,6 +59,7 @@ contract MyxVaultAutoTriggerTest is Test {
         MyxVault.InitParams memory p;
         p.taxToken = address(taxToken);
         p.creator = creator;
+        p.quoteToken = address(0);
         p.marketQuoteToken = address(usdt);
         p.poolManager = address(poolManager);
         p.basePool = address(basePool);
@@ -81,7 +82,7 @@ contract MyxVaultAutoTriggerTest is Test {
         _fund(1 ether);
         assertTrue(vault.hasPendingTrigger(), "trigger scheduled");
         assertEq(vault.pendingTriggerId(), 1);
-        assertEq(vault.pendingEth(), 1 ether - fee, "fee deducted from pending");
+        assertEq(vault.pendingQuote(), 1 ether - fee, "fee deducted from pending");
         assertEq(triggerService.requesterOf(1), address(vault));
         assertEq(triggerService.lastExecuteAfter(), uint64(block.timestamp + 60));
     }
@@ -91,62 +92,62 @@ contract MyxVaultAutoTriggerTest is Test {
         _fund(1 ether); // second receipt while a trigger is in-flight
         assertEq(triggerService.lastRequestId(), 1, "must not schedule a second trigger");
         assertEq(vault.pendingTriggerId(), 1);
-        assertEq(vault.pendingEth(), 2 ether - triggerService.getFee(), "both receipts accrued, fee once");
+        assertEq(vault.pendingQuote(), 2 ether - triggerService.getFee(), "both receipts accrued, fee once");
     }
 
     function test_receive_belowThreshold_noSchedule() public {
         _fund(0.05 ether); // < minProcessAmount 0.1
         assertFalse(vault.hasPendingTrigger());
-        assertEq(vault.pendingEth(), 0.05 ether, "full tax retained, no fee");
+        assertEq(vault.pendingQuote(), 0.05 ether, "full tax retained, no fee");
     }
 
     function test_receive_belowMinPlusFee_noScheduleNoLoss() public {
         triggerService.setFee(0.2 ether); // minProcessAmount + fee = 0.3
         _fund(0.15 ether); // >= min 0.1 but < min + fee 0.3 -> can't schedule and still keep min
         assertFalse(vault.hasPendingTrigger());
-        assertEq(vault.pendingEth(), 0.15 ether, "no fee charged, no tax lost");
+        assertEq(vault.pendingQuote(), 0.15 ether, "no fee charged, no tax lost");
     }
 
     function test_receive_serviceReverts_doesNotRevertReceive() public {
         triggerService.setRequestReverts(true);
         _fund(1 ether); // must not revert
         assertFalse(vault.hasPendingTrigger());
-        assertEq(vault.pendingEth(), 1 ether, "full tax retained when scheduling fails");
+        assertEq(vault.pendingQuote(), 1 ether, "full tax retained when scheduling fails");
     }
 
-    /// @dev The schedule decision compares ACCUMULATED pendingEth against (min + fee), NOT the
+    /// @dev The schedule decision compares ACCUMULATED pendingQuote against (min + fee), NOT the
     ///      per-receipt msg.value. A small receipt must still schedule once the accrued balance
     ///      crosses the threshold.
     function test_receive_comparesAccumulatedPendingNotReceipt() public {
         triggerService.setFee(0.05 ether);
-        // First receipt can't schedule (service down) — pendingEth accumulates.
+        // First receipt can't schedule (service down) — pendingQuote accumulates.
         triggerService.setRequestReverts(true);
         _fund(0.14 ether);
         assertFalse(vault.hasPendingTrigger());
-        assertEq(vault.pendingEth(), 0.14 ether);
+        assertEq(vault.pendingQuote(), 0.14 ether);
 
         // Service recovers. A small receipt (0.02 <= fee 0.05) must STILL schedule because the
-        // accumulated pendingEth (0.16) >= minProcessAmount + fee (0.15).
+        // accumulated pendingQuote (0.16) >= minProcessAmount + fee (0.15).
         triggerService.setRequestReverts(false);
         _fund(0.02 ether);
-        assertTrue(vault.hasPendingTrigger(), "schedule decided on accumulated pendingEth");
-        assertEq(vault.pendingEth(), 0.16 ether - 0.05 ether, "fee deducted from accumulated pending");
+        assertTrue(vault.hasPendingTrigger(), "schedule decided on accumulated pendingQuote");
+        assertEq(vault.pendingQuote(), 0.16 ether - 0.05 ether, "fee deducted from accumulated pending");
     }
 
     /// @dev Audit v2 F1 is a false positive: `requestTrigger{value: fee}` sends the fee OUT of the
-    ///      vault, so the actual BNB balance drops by exactly the same `fee` debited from pendingEth.
-    ///      The (balance == pendingEth) invariant holds, and process() forwards amount == pendingEth
+    ///      vault, so the actual BNB balance drops by exactly the same `fee` debited from pendingQuote.
+    ///      The (balance == pendingQuote) invariant holds, and process() forwards amount == pendingQuote
     ///      == balance — it can never run out of BNB / be bricked.
-    function test_invariant_vaultBalanceEqualsPendingEth() public {
+    function test_invariant_vaultBalanceEqualsPendingQuote() public {
         _fund(1 ether);
         assertTrue(vault.hasPendingTrigger());
-        assertEq(address(vault).balance, vault.pendingEth(), "balance must equal pendingEth after schedule");
+        assertEq(address(vault).balance, vault.pendingQuote(), "balance must equal pendingQuote after schedule");
 
         vm.warp(block.timestamp + 61);
         vm.prank(makeAddr("keeper"));
-        vault.process(); // forwards amount == pendingEth == balance; cannot revert on insufficient BNB
-        assertEq(vault.pendingEth(), 0);
-        assertEq(address(vault).balance, 0, "balance and pendingEth both drained after process");
+        vault.process(); // forwards amount == pendingQuote == balance; cannot revert on insufficient BNB
+        assertEq(vault.pendingQuote(), 0);
+        assertEq(address(vault).balance, 0, "balance and pendingQuote both drained after process");
     }
 
     // ── trigger() callback ───────────────────────────────────────────────────
@@ -156,7 +157,7 @@ contract MyxVaultAutoTriggerTest is Test {
         uint256 id = vault.pendingTriggerId();
         vm.warp(block.timestamp + 61);
         triggerService.fire(id);
-        assertEq(vault.pendingEth(), 0, "process consumed pendingEth");
+        assertEq(vault.pendingQuote(), 0, "process consumed pendingQuote");
         assertFalse(vault.hasPendingTrigger(), "in-flight flag cleared");
         assertEq(vault.pendingTriggerId(), 0);
         assertGt(vault.totalLpMinted(), 0, "process minted LP");
@@ -165,8 +166,8 @@ contract MyxVaultAutoTriggerTest is Test {
     function test_trigger_processReverts_stillClears() public {
         _fund(1 ether);
         uint256 id = vault.pendingTriggerId();
-        vault.process(); // drain pendingEth via permissionless process first
-        assertEq(vault.pendingEth(), 0);
+        vault.process(); // drain pendingQuote via permissionless process first
+        assertEq(vault.pendingQuote(), 0);
         vm.warp(block.timestamp + 61);
         triggerService.fire(id); // callback's process() reverts (0 < min) but must still clear state
         assertFalse(vault.hasPendingTrigger(), "cleared even when process reverts");

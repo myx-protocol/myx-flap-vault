@@ -97,7 +97,7 @@ contract MyxVaultForkTest is FlapBSCFixture {
     ///      tax token through the REAL VaultPortal pointed at OUR factory, trades on the bonding
     ///      curve to generate tax, then dispatches the real TaxProcessor under the 1M gas cap so the
     ///      vault is credited via receive(). Returns the launched token and its resolved vault, with
-    ///      pendingEth > 0.
+    ///      pendingQuote > 0.
     /// @dev dividendToken is set to REAL BSC USDT (not address(0)): the factory's _validateBeforeLaunch
     ///      now rejects native-BNB / self dividend, so the launch must carry a real ERC20 dividendToken
     ///      to clear onBeforeLaunch on the real VaultPortal.
@@ -146,13 +146,13 @@ contract MyxVaultForkTest is FlapBSCFixture {
         _dispatchTax(token);
 
         // 4. The vault must have been credited through receive() (accounting only, no revert).
-        assertGt(vault.pendingEth(), 0, "dispatch must credit vault via receive()");
+        assertGt(vault.pendingQuote(), 0, "dispatch must credit vault via receive()");
     }
 
     function test_endToEnd_launchTradeDispatchProcess() public {
         (address token, MyxVault vault) = _launchAndFundVault();
 
-        uint256 dispatchedBnb = vault.pendingEth();
+        uint256 dispatchedBnb = vault.pendingQuote();
         console2.log("dispatched BNB to vault (wei):", dispatchedBnb);
 
         // Pre-trade quote for the exact amount the vault is about to swap, on the same curve
@@ -169,7 +169,7 @@ contract MyxVaultForkTest is FlapBSCFixture {
         vault.process();
 
         // All pending BNB was consumed by the buyback.
-        assertEq(vault.pendingEth(), 0, "pendingEth must zero after process");
+        assertEq(vault.pendingQuote(), 0, "pendingQuote must zero after process");
 
         // Balance-delta accounting, end to end: the deposit amount recorded by the pool equals
         // the LP minted 1:1 to the vault AND the bought tokens still sitting in the vault

@@ -62,11 +62,14 @@ contract MyxVaultTestBase is Test {
     function _initParams() internal view returns (MyxVault.InitParams memory p) {
         p.taxToken = address(taxToken);
         p.creator = creator;
+        p.quoteToken = address(0); // native BNB quote
         p.marketQuoteToken = address(usdt);
         p.poolManager = address(poolManager);
         p.basePool = address(basePool);
         p.maxSlippageBps = 300; // 3%
         p.minProcessAmount = 0.1 ether; // BNB
+        p.gasThreshold = 0; // native quote: no gas pool
+        p.gasRefillAmount = 0;
     }
 
     function _fund(uint256 amount) internal {
@@ -122,7 +125,7 @@ contract MyxVaultInitTest is MyxVaultTestBase {
         vm.deal(address(this), 1 ether);
         (bool ok,) = address(vault).call{value: 1 ether}("");
         assertTrue(ok);
-        assertEq(vault.pendingEth(), 1 ether);
+        assertEq(vault.pendingQuote(), 1 ether);
         assertEq(address(vault).balance, 1 ether);
     }
 
@@ -133,6 +136,43 @@ contract MyxVaultInitTest is MyxVaultTestBase {
         uint256 used = gasBefore - gasleft();
         assertTrue(ok);
         assertLt(used, 100_000); // gross call cost incl. CALL overhead — far below the 1M Rule-005 budget
+    }
+
+    function test_v3Surface_nativeQuote() public view {
+        assertEq(vault.vaultQuoteToken(), address(0));
+        assertEq(vault.quoteToken(), address(0));
+        assertEq(vault.vaultSpecVersion(), "v3");
+        assertEq(vault.gasThreshold(), 0);
+        assertEq(vault.gasRefillAmount(), 0);
+    }
+
+    function test_initialize_nativeQuote_rejectsGasParams() public {
+        MyxVault.InitParams memory p = _initParams();
+        p.gasThreshold = 1;
+        MyxVault impl = new MyxVault();
+        vm.expectRevert(bytes(unicode"Gas params must be zero for native quote / 原生報價幣的 Gas 參數必須為零"));
+        new ERC1967Proxy(address(impl), abi.encodeCall(MyxVault.initialize, (p)));
+    }
+
+    function test_initialize_erc20Quote_requiresRefillAboveThreshold() public {
+        MyxVault.InitParams memory p = _initParams();
+        p.quoteToken = address(usdt);
+        p.gasThreshold = 0.01 ether;
+        p.gasRefillAmount = 0.01 ether; // not strictly greater
+        MyxVault impl = new MyxVault();
+        vm.expectRevert(bytes(unicode"Gas refill must exceed threshold / Gas 補充值必須大於閾值"));
+        new ERC1967Proxy(address(impl), abi.encodeCall(MyxVault.initialize, (p)));
+    }
+
+    function test_initialize_erc20Quote_storesQuote() public {
+        MyxVault.InitParams memory p = _initParams();
+        p.quoteToken = address(usdt);
+        p.gasThreshold = 0.01 ether;
+        p.gasRefillAmount = 0.02 ether;
+        MyxVault v = _deployVault(p);
+        assertEq(v.vaultQuoteToken(), address(usdt));
+        assertEq(v.gasThreshold(), 0.01 ether);
+        assertEq(v.gasRefillAmount(), 0.02 ether);
     }
 }
 
@@ -201,7 +241,7 @@ contract MyxVaultProcessTest is MyxVaultTestBase {
         // a random caller can run it — permissionless
         vm.prank(makeAddr("keeper"));
         vault.process();
-        assertEq(vault.pendingEth(), 0);
+        assertEq(vault.pendingQuote(), 0);
         assertEq(basePool.depositCallCount(), 1);
         assertEq(basePool.lastDepositAmount(), 1000 ether);
         assertEq(basePool.lastDepositRecipient(), address(vault)); // LP minted to the vault first
@@ -236,7 +276,7 @@ contract MyxVaultProcessTest is MyxVaultTestBase {
 
     function test_process_belowMinimumAfterSuccess_reverts() public {
         _fund(1 ether);
-        vault.process(); // succeeds, pendingEth -> 0
+        vault.process(); // succeeds, pendingQuote -> 0
         uint256 minAmt = vault.minProcessAmount();
         vm.expectRevert(bytes(unicode"Pending below minimum / 待處理金額低於下限"));
         vault.process();
@@ -257,7 +297,7 @@ contract MyxVaultProcessTest is MyxVaultTestBase {
         _fund(1 ether);
         vm.expectRevert(bytes(unicode"Buyback quote is zero / 回購報價為零"));
         vault.process();
-        assertEq(vault.pendingEth(), 1 ether); // retained for retry
+        assertEq(vault.pendingQuote(), 1 ether); // retained for retry
     }
 
     function test_process_swapReverts_retainsBnb() public {
@@ -266,7 +306,7 @@ contract MyxVaultProcessTest is MyxVaultTestBase {
         vm.expectRevert("PORTAL_FAIL");
         vault.process();
         // state rolled back: BNB safely retained for retry
-        assertEq(vault.pendingEth(), 1 ether);
+        assertEq(vault.pendingQuote(), 1 ether);
         assertEq(address(vault).balance, 1 ether);
     }
 
@@ -276,7 +316,7 @@ contract MyxVaultProcessTest is MyxVaultTestBase {
         vm.expectRevert();
         vault.process();
         // state rolled back: BNB safely retained for retry
-        assertEq(vault.pendingEth(), 1 ether);
+        assertEq(vault.pendingQuote(), 1 ether);
         assertEq(address(vault).balance, 1 ether);
     }
 }
@@ -314,7 +354,7 @@ contract MyxVaultDeployPoolTest is MyxVaultTestBase {
         _fund(1 ether);
         vm.expectRevert("MockPoolManager: market missing");
         vault.process();
-        assertEq(vault.pendingEth(), 1 ether); // safely retained for retry after governance creates market
+        assertEq(vault.pendingQuote(), 1 ether); // safely retained for retry after governance creates market
     }
 
     function test_ensurePoolDeployed_permissionless() public {
@@ -516,7 +556,7 @@ contract MyxVaultEmergencyTest is MyxVaultTestBase {
         vm.prank(GUARDIAN);
         vault.emergencySweepEth(rescue);
         assertEq(rescue.balance, 2 ether);
-        assertEq(vault.pendingEth(), 0);
+        assertEq(vault.pendingQuote(), 0);
     }
 
     function test_emergencySweepBnb_strangerReverts() public {

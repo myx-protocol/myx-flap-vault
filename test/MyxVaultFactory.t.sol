@@ -79,9 +79,9 @@ contract MyxVaultFactoryTest is Test {
         vm.expectRevert();
         v.initialize(
             MyxVault.InitParams({
-                taxToken: address(1), creator: address(1),
+                taxToken: address(1), creator: address(1), quoteToken: address(0),
                 marketQuoteToken: address(usdt), poolManager: address(1), basePool: address(1),
-                maxSlippageBps: 0, minProcessAmount: 0
+                maxSlippageBps: 0, minProcessAmount: 0, gasThreshold: 0, gasRefillAmount: 0
             })
         );
     }
