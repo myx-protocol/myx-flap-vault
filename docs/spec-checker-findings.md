@@ -45,7 +45,7 @@ per-call deviation (it cannot prevent a same-block sandwich — accepted, docume
 | # | Rule | Verdict | Evidence |
 |---|------|---------|----------|
 | 001 | Vault inherits `VaultBaseV3`; `vaultUISchema()` + `description()` present; `vaultQuoteToken()` immutable after init | **PASS** | `MyxVault.sol` inherits `VaultBaseV3` and implements `vaultQuoteToken()` returning the `quoteToken` state var, which is set exactly once in `initialize` (from the factory-decoded `marketQuoteToken`) and has no setter — stable for the life of the vault per Rule 010 item 5. `vaultUISchema()` / `description()` remain present and v3-accurate. |
-| 001 | Guardian granted every privileged role | **PASS** | `initialize` grants the guardian `DEFAULT_ADMIN_ROLE` + `EMERGENCY_ROLE` (`:118-119`); creator also gets `EMERGENCY_ROLE` (`:120`). Guardian can call every gated function (`emergencyWithdraw`, `emergencySweepBnb`, `emergencyRescueToken`). |
+| 001 | Guardian granted every privileged role | **PASS** | `initialize` grants the guardian `DEFAULT_ADMIN_ROLE` + `EMERGENCY_ROLE` (`:118-119`); creator also gets `EMERGENCY_ROLE` (`:120`). Guardian can call every gated function (`emergencyWithdraw`, `emergencySweepNative`, `emergencyRescueToken`). |
 | 001 | Guardian role irrevocable by others | **PASS** | `revokeRole` override (`:131-134`) is role-agnostic — reverts `CannotRevokeGuardianRole` for any `account == _getGuardian()`. Only the guardian may `renounceRole` itself. Tested (`test_revokeGuardianRole_reverts`, `test_revokeGuardianAdminRole_reverts`, `test_guardianCanRenounceItself`). |
 | 001 | No DOS via dev parameter manipulation | **PASS** | All economic params (`maxSlippageBps`, `minProcessAmount`) are set once in `initialize` from the factory `config`; **no post-init setter exists**. Nothing the creator can flip to brick or degrade the vault. |
 | 002 | Factory inherits `VaultFactoryBaseV2` | **PASS** | `MyxVaultFactory.sol:15` inherits `VaultFactoryBaseV2`. |
@@ -71,7 +71,7 @@ per-call deviation (it cannot prevent a same-block sandwich — accepted, docume
 **Finding.** `_feedDividend` (`MyxVault.sol:180-198`) retains the **whole** LP balance in the vault
 whenever the dividend is unwired or `deposit()` returns false (Lista deferral). The only escape
 hatches were `emergencyWithdraw` — which can **only** move LP through `basePool.withdraw(poolId, ...)`
-— and `emergencySweepBnb`, which handles native BNB only. There was **no generic ERC20 sweep**. So if
+— and `emergencySweepNative`, which handles native BNB only. There was **no generic ERC20 sweep**. So if
 the myx pool's `withdraw` path were itself unusable (pool paused / wedged / migrated — exactly the
 black-swan class emergency controls exist for), or if the dividend stayed permanently unwired, the
 deferred LP would be **permanently stuck** with no recovery. The same gap stranded any residual tax
