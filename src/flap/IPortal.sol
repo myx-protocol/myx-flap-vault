@@ -750,12 +750,9 @@ interface IPortalTypes is IPortalCommonTypes {
         SWAP_VIA_V3_500_POOL, // 3: swap through v3 500 pool
         SWAP_VIA_V3_3000_POOL, // 4: swap through v3 3000 pool
         SWAP_VIA_V3_10000_POOL, // 5: swap through v3 10000 pool
-        SWAP_VIA_MIXED_ROUTER // 6: multi-hop via PancakeSwap Infinity MixedQuoter + UniversalRouter (BSC only)
-        //    used for tokens like uUSD that route BNB ↔ USDT(V3) ↔ uUSD(BinPool).
-        //    The actual routing logic is bypassed in _shouldUseMixedRouter() before
-        //    the enum is checked, so this value serves as a meaningful marker when
-        //    calling setQuoteTokenConfiguration — any non-SWAP_DISABLED value would
-        //    work, but this makes intent explicit.
+        SWAP_VIA_MIXED_ROUTER, // 6: multi-hop via PancakeSwap Infinity MixedQuoter + UniversalRouter (BSC only)
+        SWAP_VIA_ROUTE // 7: generic multi-hop route stored per quote token (Portal v5.22+). Hops describe
+        //    native->quote; quote->native walks them in reverse. Set via setQuoteSwapRoute; no getter.
     }
 
     /// @dev  the quote token configurations
@@ -768,9 +765,22 @@ interface IPortalTypes is IPortalCommonTypes {
     }
 
     /// @dev Enum for DEX pool types
+    // Synced with Portal v5.22.0 verified source (2026-09-02).
     enum PoolType {
         V2, // Uniswap V2 style pools
-        V3 // Uniswap V3 style pools
+        V3, // Uniswap V3 style pools
+        V4, // Uniswap V4 style pools
+        PCS_INFINITY_CL // PancakeSwap Infinity concentrated-liquidity pools
+    }
+
+    /// @dev One hop of a generic quote-token swap route (NativeToQuoteSwapType.SWAP_VIA_ROUTE).
+    struct QuoteHop {
+        PoolType poolType;
+        uint8 dexId;
+        uint24 fee;
+        int24 tickSpacing;
+        address tokenOut;
+        address hooks;
     }
 
     /// @dev Packed DEX pool information
