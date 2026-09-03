@@ -5,6 +5,13 @@ libs = ["lib"]
 evm_version = "cancun"
 solc_version = "0.8.30"
 optimizer = true
-optimizer_runs = 99999 
+# 200 runs favours code size over runtime gas: MyxVault must stay under EIP-170 (24,576 B) and the
+# factory, whose constructor embeds the vault creation code, under EIP-3860 (49,152 B initcode).
+# test/CodeSize.t.sol locks both limits. 99999 runs pushed the vault to 31 KB (2026-09-03 BSC testnet
+# deploy failed with "max initcode size exceeded").
+optimizer_runs = 200
+# MyxVault.vaultUISchema() delegates to the externally linked library src/lib/MyxVaultUISchema.sol.
+# `forge script` deploys and links it automatically; explorer verification of MyxVault needs
+# --libraries src/lib/MyxVaultUISchema.sol:MyxVaultUISchema:<deployed address>.
 
 # See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options

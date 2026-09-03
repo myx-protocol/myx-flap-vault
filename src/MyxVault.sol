@@ -2,7 +2,9 @@
 pragma solidity ^0.8.26;
 
 import {VaultBaseV3} from "./flap/VaultBaseV3.sol";
-import {VaultUISchema, VaultMethodSchema, FieldDescriptor} from "./flap/IVaultSchemasV1.sol";
+import {VaultBaseV2} from "./flap/VaultBaseV2.sol";
+import {VaultUISchema} from "./flap/IVaultSchemasV1.sol";
+import {MyxVaultUISchema} from "./lib/MyxVaultUISchema.sol";
 import {Initializable} from "@openzeppelin-contracts-upgradeable/proxy/utils/Initializable.sol";
 import {AccessControlUpgradeable} from "@openzeppelin-contracts-upgradeable/access/AccessControlUpgradeable.sol";
 import {ReentrancyGuardUpgradeable} from "@openzeppelin-contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
@@ -711,59 +713,9 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
         );
     }
 
+    /// @inheritdoc VaultBaseV2
+    /// @dev Delegated to the linked MyxVaultUISchema library to keep the vault under EIP-170.
     function vaultUISchema() public pure override returns (VaultUISchema memory schema) {
-        schema.vaultType = "MyxVault";
-        schema.description =
-            unicode"Tax revenue is converted to MYX LP and distributed to holders as dividends. / 稅收轉換為 MYX LP，作為分紅分配給持幣者。";
-        schema.methods = new VaultMethodSchema[](9);
-
-        schema.methods[0].name = "pendingQuote";
-        schema.methods[0].description =
-            unicode"Tax revenue awaiting processing, in quote token units. / 待處理的稅收金額（報價幣單位）。";
-        schema.methods[0].outputs = new FieldDescriptor[](1);
-        schema.methods[0].outputs[0] = FieldDescriptor("amount", "uint256", "Quote amount", 0);
-
-        schema.methods[1].name = "process";
-        schema.methods[1].description =
-            unicode"Buy back the token with pending ETH, deposit into MYX pool, and feed LP to dividends. Permissionless. / 用待處理 ETH 回購代幣，注入 MYX 池並將 LP 分發為分紅。任何人可調用。";
-        schema.methods[1].isWriteMethod = true;
-
-        schema.methods[2].name = "feedDividend";
-        schema.methods[2].description =
-            unicode"Feed held mBase LP into the dividend contract. Permissionless; retries a deferred feed. / 將持有的 mBase LP 注入分紅合約。任何人可調用，可重試延遲分發。";
-        schema.methods[2].isWriteMethod = true;
-
-        schema.methods[3].name = "claimReward";
-        schema.methods[3].description =
-            unicode"Claim your mBase LP dividend. You may also claim directly on the dividend contract. / 領取您的 mBase LP 分紅，也可直接在分紅合約上領取。";
-        schema.methods[3].isWriteMethod = true;
-
-        schema.methods[4].name = "pendingReward";
-        schema.methods[4].description = unicode"Claimable mBase LP dividend for a holder. / 持幣者可領取的 mBase LP 分紅金額。";
-        schema.methods[4].inputs = new FieldDescriptor[](1);
-        schema.methods[4].inputs[0] = FieldDescriptor("user", "address", "Holder address", 0);
-        schema.methods[4].outputs = new FieldDescriptor[](1);
-        schema.methods[4].outputs[0] = FieldDescriptor("amount", "uint256", "Claimable LP amount", 18);
-
-        schema.methods[5].name = "vaultQuoteToken";
-        schema.methods[5].description =
-            unicode"Revenue currency of this vault (zero address = native). / 本金庫的稅收幣種（零地址為原生幣）。";
-        schema.methods[5].outputs = new FieldDescriptor[](1);
-        schema.methods[5].outputs[0] = FieldDescriptor("quoteToken", "address", "Quote token", 0);
-
-        schema.methods[6].name = "sync";
-        schema.methods[6].description =
-            unicode"Recognize quote revenue that arrived without a wake call. Permissionless. / 確認未觸發喚醒的稅收入賬。任何人可調用。";
-        schema.methods[6].isWriteMethod = true;
-
-        schema.methods[7].name = "fundGas";
-        schema.methods[7].description =
-            unicode"Top up the BNB gas pool that pays auto-trigger fees (ERC20 quote vaults). / 為自動觸發手續費充值 BNB Gas 池（ERC20 報價幣金庫）。";
-        schema.methods[7].isWriteMethod = true;
-
-        schema.methods[8].name = "gasBalance";
-        schema.methods[8].description = unicode"BNB reserved for auto-trigger fees. / 保留給自動觸發手續費的 BNB。";
-        schema.methods[8].outputs = new FieldDescriptor[](1);
-        schema.methods[8].outputs[0] = FieldDescriptor("amount", "uint256", "BNB amount", 18);
+        return MyxVaultUISchema.build();
     }
 }
