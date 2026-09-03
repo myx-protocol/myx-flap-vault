@@ -28,7 +28,7 @@ import {IWBNB} from "./dex/IWBNB.sol";
 /// @notice Flap vault that buys back the tax token with tax revenue via the Flap Portal, deposits
 ///         it as MYX base-pool liquidity, and feeds the resulting mBase LP into the token's
 ///         native Flap Dividend contract — the LP ITSELF is the dividend asset.
-/// @dev v6 reward model: tax ETH → receive() accounting → process() [permissionless]
+/// @dev v6 reward model: tax (native or ERC20 quote) → receive() accounting → process() [permissionless]
 ///      buys back the token via the Portal, deposits it into the MYX base pool (LP minted to the
 ///      vault), then _feedDividend deposits the LP into the Dividend contract whose dividendToken ==
 ///      that same mBase LP (wired at launch). Holders claim the mBase LP via
@@ -40,7 +40,7 @@ import {IWBNB} from "./dex/IWBNB.sol";
 ///        try/catch; accounting is the Rule-005/010 core and the schedule never reverts receive()
 ///        (deliberate Rule-005 deviation, see auto-trigger doc). sync() exposes the same recognition
 ///        permissionlessly for callers who cannot reach receive() with a wake call.
-///      - process() is permissionless: anyone may convert pending ETH into liquidity + dividend.
+///      - process() is permissionless: anyone may convert the pending quote revenue into liquidity + dividend.
 ///      - The LP IS the dividend asset: dividendToken == basePoolToken == mBase. _feedDividend
 ///        deposits the whole held LP balance; if the dividend is unwired or deposit() returns false
 ///        (totalShares == 0 early window), the LP is RETAINED (DividendDeferred) — no swap, no
@@ -329,7 +329,7 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
         super.revokeRole(role, account);
     }
 
-    /// @notice Converts accumulated ETH into MYX base-pool liquidity by buying back the tax token
+    /// @notice Converts the accumulated quote revenue into MYX base-pool liquidity by buying back the tax token
     ///         via the Flap Portal, then feeds the resulting mBase LP into the token's dividend
     ///         contract. PERMISSIONLESS — anyone may run it.
     /// @dev Buy leg minOut is a same-block Portal quote × (1 - maxSlippageBps): bounds per-call

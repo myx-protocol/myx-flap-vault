@@ -23,7 +23,7 @@ library MyxVaultUISchema {
 
         schema.methods[1].name = "process";
         schema.methods[1].description =
-            unicode"Buy back the token with pending ETH, deposit into MYX pool, and feed LP to dividends. Permissionless. / 用待處理 ETH 回購代幣，注入 MYX 池並將 LP 分發為分紅。任何人可調用。";
+            unicode"Buy back the token with the pending quote revenue, deposit into MYX pool, and feed LP to dividends. Permissionless. / 用待處理的報價幣稅收回購代幣，注入 MYX 池並將 LP 分發為分紅。任何人可調用。";
         schema.methods[1].isWriteMethod = true;
 
         schema.methods[2].name = "feedDividend";
