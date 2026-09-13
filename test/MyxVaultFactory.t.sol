@@ -67,11 +67,11 @@ contract MyxVaultFactoryTest is Test {
     function _vaultData() internal view returns (bytes memory) {
         // v4-5: vaultData carries the market quote token (= the token's dividendToken); the vault
         // derives marketId = keccak256(chainId, quoteToken) and the pool key from it on-chain.
-        return abi.encode(address(usdt), uint256(0.1 ether), uint256(0), uint256(0));
+        return abi.encode(address(usdt), uint256(0.1 ether), uint256(0), uint256(0), type(uint256).max);
     }
 
     function _erc20VaultData() internal view returns (bytes memory) {
-        return abi.encode(address(usdt), uint256(10 ether), uint256(0.01 ether), uint256(0.05 ether));
+        return abi.encode(address(usdt), uint256(10 ether), uint256(0.01 ether), uint256(0.05 ether), type(uint256).max);
     }
 
     function test_newVault_onlyVaultPortal() public {
@@ -94,7 +94,8 @@ contract MyxVaultFactoryTest is Test {
             MyxVault.InitParams({
                 taxToken: address(1), creator: address(1), quoteToken: address(0),
                 marketQuoteToken: address(usdt), poolManager: address(1), basePool: address(1),
-                maxSlippageBps: 0, minProcessAmount: 0, gasThreshold: 0, gasRefillAmount: 0
+                maxSlippageBps: 0, minProcessAmount: 0, gasThreshold: 0, gasRefillAmount: 0,
+                maxProcessAmount: 0
             })
         );
     }
@@ -122,7 +123,7 @@ contract MyxVaultFactoryTest is Test {
         // initializer (ZeroMarketQuoteToken), bubbling up through the factory's BeaconProxy deploy.
         vm.prank(VAULT_PORTAL);
         vm.expectRevert(bytes(unicode"Zero market quote token / 市場報價幣為零地址"));
-        factory.newVault(makeAddr("tax"), address(0), makeAddr("creator"), abi.encode(address(0), uint256(1), uint256(0), uint256(0)));
+        factory.newVault(makeAddr("tax"), address(0), makeAddr("creator"), abi.encode(address(0), uint256(1), uint256(0), uint256(0), type(uint256).max));
     }
 
     function test_isQuoteTokenSupported_nativeAlways() public view {
@@ -194,13 +195,14 @@ contract MyxVaultFactoryTest is Test {
         assertEq(abi.decode(policies[1].value, (uint256)), 0);
     }
 
-    function test_vaultDataSchema_fourFields() public view {
+    function test_vaultDataSchema_fiveFields() public view {
         VaultDataSchema memory s = factory.vaultDataSchema();
-        assertEq(s.fields.length, 4);
+        assertEq(s.fields.length, 5);
         assertEq(s.fields[0].name, "marketQuoteToken");
         assertEq(s.fields[1].name, "minProcessAmount");
         assertEq(s.fields[2].name, "gasThreshold");
         assertEq(s.fields[3].name, "gasRefillAmount");
+        assertEq(s.fields[4].name, "maxProcessAmount");
         assertFalse(s.isArray);
     }
 
@@ -220,7 +222,7 @@ contract MyxVaultFactoryTest is Test {
     function test_newVault_nativeQuote_rejectsGasParams() public {
         vm.prank(VAULT_PORTAL);
         vm.expectRevert(bytes(unicode"Gas params must be zero for native quote / 原生報價幣的 Gas 參數必須為零"));
-        factory.newVault(makeAddr("tax"), address(0), makeAddr("creator"), abi.encode(address(usdt), uint256(1), uint256(1), uint256(2)));
+        factory.newVault(makeAddr("tax"), address(0), makeAddr("creator"), abi.encode(address(usdt), uint256(1), uint256(1), uint256(2), type(uint256).max));
     }
 
     receive() external payable {}
@@ -253,7 +255,7 @@ contract MyxVaultFactoryTest is Test {
         // vaultData — the same source newVault decodes — so the predicted LP and the vault's pool
         // share the same myx market.
         p.quoteToken = address(0);
-        p.vaultData = abi.encode(marketQuote, uint256(1), uint256(0), uint256(0));
+        p.vaultData = abi.encode(marketQuote, uint256(1), uint256(0), uint256(0), type(uint256).max);
         p.dividendToken = dividendToken;
         return abi.encode(p);
     }
@@ -318,7 +320,7 @@ contract MyxVaultFactoryTest is Test {
         IVaultPortalTypes.NewTokenV7WithVaultParamsU8 memory p;
         p.symbol = symbol;
         p.quoteToken = address(0); // Flap bonding quote is native BNB
-        p.vaultData = abi.encode(marketQuote, uint256(1), uint256(0), uint256(0));
+        p.vaultData = abi.encode(marketQuote, uint256(1), uint256(0), uint256(0), type(uint256).max);
         // feeConfigs[0] carries the DIVIDEND slot
         p.feeConfigs[0].feeType = 2; // DIVIDEND
         p.feeConfigs[0].dividendToken = dividendInFee;
@@ -355,7 +357,7 @@ contract MyxVaultFactoryTest is Test {
         IVaultPortalTypes.NewTokenV7WithVaultParamsU8 memory p;
         p.symbol = "DEMO";
         p.quoteToken = address(0);
-        p.vaultData = abi.encode(address(usdt), uint256(1), uint256(0), uint256(0));
+        p.vaultData = abi.encode(address(usdt), uint256(1), uint256(0), uint256(0), type(uint256).max);
         // All feeConfigs stay feeType=0 (NONE) — no DIVIDEND entry
         bytes memory launchParams = abi.encode(p);
         vm.expectRevert(bytes(unicode"No V7 dividend feeConfig / 無 V7 分紅費用配置"));
@@ -416,7 +418,7 @@ contract MyxVaultFactoryTest is Test {
         vm.expectRevert(bytes(unicode"Min process amount must be non-zero / 最低處理金額不可為零"));
         factory.newVault(
             makeAddr("tax"), address(0), makeAddr("creator"),
-            abi.encode(address(usdt), uint256(0), uint256(0), uint256(0))
+            abi.encode(address(usdt), uint256(0), uint256(0), uint256(0), type(uint256).max)
         );
     }
 
@@ -427,7 +429,7 @@ contract MyxVaultFactoryTest is Test {
         vm.expectRevert(bytes(unicode"Min process amount must be non-zero / 最低處理金額不可為零"));
         factory.newVault(
             makeAddr("tax"), address(rwa), address(this),
-            abi.encode(address(usdt), uint256(0), uint256(0.01 ether), uint256(0.05 ether))
+            abi.encode(address(usdt), uint256(0), uint256(0.01 ether), uint256(0.05 ether), type(uint256).max)
         );
     }
 
@@ -438,7 +440,7 @@ contract MyxVaultFactoryTest is Test {
         vm.expectRevert(bytes(unicode"Gas refill above factory cap / Gas 補充值超過工廠上限"));
         factory.newVault(
             makeAddr("tax"), address(rwa), address(this),
-            abi.encode(address(usdt), uint256(10 ether), uint256(0.01 ether), uint256(0.05 ether + 1))
+            abi.encode(address(usdt), uint256(10 ether), uint256(0.01 ether), uint256(0.05 ether + 1), type(uint256).max)
         );
     }
 
@@ -448,7 +450,7 @@ contract MyxVaultFactoryTest is Test {
         vm.prank(VAULT_PORTAL);
         address vaultAddr = factory.newVault(
             makeAddr("tax"), address(rwa), address(this),
-            abi.encode(address(usdt), uint256(10 ether), uint256(0.01 ether), uint256(0.05 ether))
+            abi.encode(address(usdt), uint256(10 ether), uint256(0.01 ether), uint256(0.05 ether), type(uint256).max)
         );
         assertEq(MyxVault(payable(vaultAddr)).gasRefillAmount(), 0.05 ether, "equal to the cap is allowed");
     }
@@ -490,5 +492,25 @@ contract MyxVaultFactoryTest is Test {
         MyxVaultFactory f = new MyxVaultFactory(c);
         (,,, uint16 bps,,) = f.config();
         assertEq(bps, 10_000);
+    }
+}
+
+contract MyxVaultFactoryMaxProcessTest is MyxVaultFactoryTest {
+    function test_newVault_maxProcessBelowMin_reverts() public {
+        vm.prank(VAULT_PORTAL);
+        vm.expectRevert(bytes(unicode"Max process amount below minimum / 單批處理上限低於最低處理金額"));
+        factory.newVault(
+            makeAddr("tax"), address(0), makeAddr("creator"),
+            abi.encode(address(usdt), uint256(10 ether), uint256(0), uint256(0), uint256(10 ether - 1))
+        );
+    }
+
+    function test_newVault_wiresMaxProcessAmount() public {
+        vm.prank(VAULT_PORTAL);
+        address v = factory.newVault(
+            makeAddr("tax"), address(0), makeAddr("creator"),
+            abi.encode(address(usdt), uint256(10 ether), uint256(0), uint256(0), uint256(25 ether))
+        );
+        assertEq(MyxVault(payable(v)).maxProcessAmount(), 25 ether);
     }
 }

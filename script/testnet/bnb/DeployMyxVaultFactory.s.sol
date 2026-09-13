@@ -10,7 +10,7 @@ import {MyxVaultFactory} from "../../../src/MyxVaultFactory.sol";
 ///         ERC20/RWA quote token enabled on the Flap Portal (`vaultQuoteToken()`). Per-vault
 ///         `minProcessAmount` is no longer part of `GlobalConfig` — it is creator-supplied per
 ///         launch via `vaultData` (`abi.encode(address marketQuoteToken, uint256 minProcessAmount,
-///         uint256 gasThreshold, uint256 gasRefillAmount)`). `minInitialGas` below is the
+///         uint256 gasThreshold, uint256 gasRefillAmount, uint256 maxProcessAmount)`). `minInitialGas` below is the
 ///         factory-wide floor on the BNB a creator must prepay via `factory.prepayGas()` before
 ///         launching an ERC20-quote vault; the factory forwards the full prepaid balance into the
 ///         new vault's gas pool at `newVault`.
@@ -27,7 +27,7 @@ contract DeployMyxVaultFactory is Script {
                 poolFactory: vm.envAddress("MYX_POOL_FACTORY"),
                 maxSlippageBps: 500,
                 // ERC20-quote launches must prepay at least 10 FlapTriggerService fees (0.0002 BNB each).
-                minInitialGas: 0.002 ether,
+                minInitialGas: 0.001 ether,
                 // Caps the BNB a vault may divert from one batch into its gas pool: a creator's
                 // gasRefillAmount may not exceed this. 0.05 BNB is ~250 trigger fees.
                 maxGasRefillAmount: 0.05 ether

@@ -65,6 +65,7 @@ contract MyxVaultAutoTriggerTest is Test {
         p.basePool = address(basePool);
         p.maxSlippageBps = 300;
         p.minProcessAmount = 0.1 ether;
+        p.maxProcessAmount = type(uint256).max;
         bytes memory initData = abi.encodeCall(MyxVault.initialize, (p));
         return MyxVault(payable(address(new ERC1967Proxy(address(impl), initData))));
     }
@@ -203,4 +204,96 @@ contract MyxVaultAutoTriggerTest is Test {
     }
 
     receive() external payable {}
+}
+
+/// @dev Batched buyback: a single process() consumes at most maxProcessAmount of pendingQuote and,
+///      when a remainder >= minProcessAmount is left, schedules its own follow-up trigger. Bounds the
+///      per-call sandwich exposure after any accumulation (e.g. a failed first callback).
+contract MyxVaultBatchedProcessTest is MyxVaultAutoTriggerTest {
+    event ProcessBatched(uint256 processed, uint256 remaining);
+
+    function _deployCappedVault(uint256 cap) internal returns (MyxVault) {
+        MyxVault impl = new MyxVault();
+        MyxVault.InitParams memory p;
+        p.taxToken = address(taxToken);
+        p.creator = creator;
+        p.quoteToken = address(0);
+        p.marketQuoteToken = address(usdt);
+        p.poolManager = address(poolManager);
+        p.basePool = address(basePool);
+        p.maxSlippageBps = 300;
+        p.minProcessAmount = 0.1 ether;
+        p.maxProcessAmount = cap;
+        return MyxVault(payable(address(new ERC1967Proxy(address(impl), abi.encodeCall(MyxVault.initialize, (p))))));
+    }
+
+    function test_initialize_maxProcessBelowMin_reverts() public {
+        MyxVault impl = new MyxVault();
+        MyxVault.InitParams memory p;
+        p.taxToken = address(taxToken);
+        p.creator = creator;
+        p.marketQuoteToken = address(usdt);
+        p.poolManager = address(poolManager);
+        p.basePool = address(basePool);
+        p.minProcessAmount = 0.1 ether;
+        p.maxProcessAmount = 0.1 ether - 1;
+        vm.expectRevert(bytes(unicode"Max process amount below minimum / 單批處理上限低於最低處理金額"));
+        new ERC1967Proxy(address(impl), abi.encodeCall(MyxVault.initialize, (p)));
+    }
+
+    function test_process_capsAtMaxAndSchedulesFollowUp() public {
+        vault = _deployCappedVault(1 ether);
+        uint256 fee = triggerService.getFee();
+        _fund(3 ether); // schedules #1, pendingQuote = 3 - fee
+        uint256 id = vault.pendingTriggerId();
+        vm.warp(block.timestamp + 61);
+
+        vm.expectEmit(true, true, true, true);
+        emit ProcessBatched(1 ether, 3 ether - fee - 1 ether);
+        triggerService.fire(id); // batch 1: consumes 1 ether, remainder 2 - fee -> follow-up #2 (fee again)
+        assertEq(vault.pendingQuote(), 3 ether - 2 * fee - 1 ether, "remainder kept, follow-up fee paid");
+        assertTrue(vault.hasPendingTrigger(), "follow-up scheduled by process()");
+        assertEq(vault.pendingTriggerId(), id + 1);
+        assertEq(address(vault).balance, vault.pendingQuote(), "native invariant holds across batches");
+
+        vm.warp(block.timestamp + 61);
+        triggerService.fire(id + 1); // batch 2: another 1 ether, remainder 1 - 3 fee -> follow-up #3
+        assertTrue(vault.hasPendingTrigger());
+        vm.warp(block.timestamp + 61);
+        triggerService.fire(id + 2); // batch 3: below cap, consumes everything, no follow-up
+        assertEq(vault.pendingQuote(), 0);
+        assertFalse(vault.hasPendingTrigger(), "nothing left to schedule");
+        assertEq(vault.totalLpMinted(), (3 ether - 3 * fee) * 1000, "all three batches bought back");
+    }
+
+    function test_process_manualCall_alsoCapsAndSchedules() public {
+        vault = _deployCappedVault(1 ether);
+        triggerService.setRequestReverts(true); // receive() cannot schedule
+        _fund(2.5 ether);
+        assertFalse(vault.hasPendingTrigger());
+        triggerService.setRequestReverts(false);
+        vm.prank(makeAddr("keeper"));
+        vault.process();
+        assertEq(vault.pendingQuote(), 1.5 ether - triggerService.getFee());
+        assertTrue(vault.hasPendingTrigger(), "manual process() schedules the remainder");
+    }
+
+    function test_process_noFollowUpWhenRemainderBelowMin() public {
+        vault = _deployCappedVault(1 ether);
+        triggerService.setRequestReverts(true);
+        _fund(1.05 ether); // remainder 0.05 < min 0.1
+        triggerService.setRequestReverts(false);
+        vault.process();
+        assertEq(vault.pendingQuote(), 0.05 ether, "dust remainder retained for the next batch");
+        assertFalse(vault.hasPendingTrigger(), "no follow-up below minProcessAmount");
+    }
+
+    function test_process_uncapped_behavesAsBefore() public {
+        _fund(3 ether); // default vault: maxProcessAmount = max
+        uint256 id = vault.pendingTriggerId();
+        vm.warp(block.timestamp + 61);
+        triggerService.fire(id);
+        assertEq(vault.pendingQuote(), 0);
+        assertFalse(vault.hasPendingTrigger());
+    }
 }

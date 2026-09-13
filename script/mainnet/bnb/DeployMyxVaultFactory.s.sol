@@ -12,7 +12,7 @@ import {MyxVaultFactory} from "../../../src/MyxVaultFactory.sol";
 ///         ERC20/RWA quote token enabled on the Flap Portal (`vaultQuoteToken()`). Per-vault
 ///         `minProcessAmount` is no longer part of `GlobalConfig` — it is creator-supplied per
 ///         launch via `vaultData` (`abi.encode(address marketQuoteToken, uint256 minProcessAmount,
-///         uint256 gasThreshold, uint256 gasRefillAmount)`). `minInitialGas` below is the
+///         uint256 gasThreshold, uint256 gasRefillAmount, uint256 maxProcessAmount)`). `minInitialGas` below is the
 ///         factory-wide floor on the BNB a creator must prepay via `factory.prepayGas()` before
 ///         launching an ERC20-quote vault; the factory forwards the full prepaid balance into the
 ///         new vault's gas pool at `newVault`.

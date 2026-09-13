@@ -70,6 +70,7 @@ contract MyxVaultTestBase is Test {
         p.minProcessAmount = 0.1 ether; // BNB
         p.gasThreshold = 0; // native quote: no gas pool
         p.gasRefillAmount = 0;
+        p.maxProcessAmount = type(uint256).max; // no batching in the legacy suites
     }
 
     function _fund(uint256 amount) internal {

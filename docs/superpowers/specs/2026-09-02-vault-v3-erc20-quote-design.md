@@ -73,6 +73,7 @@ struct InitParams {
     uint256 minProcessAmount;  // in quote base units (creator-supplied, quote decimals aware)
     uint256 gasThreshold;      // wei; ERC20 quote only, 0 for native
     uint256 gasRefillAmount;   // wei; ERC20 quote only, must be > gasThreshold
+    uint256 maxProcessAmount;  // quote base units; per-call buyback cap, >= minProcessAmount (added 2026-09-13 after pre-audit)
 }
 ```
 
@@ -173,7 +174,7 @@ function _refillGas() internal {
   - `withdrawPrepaidGas()`：CEI 顺序全额退回 `prepaidGas[msg.sender]`。
   - `newVault` 中，若 `quoteToken != address(0)`：`require(prepaidGas[creator] >= config.minInitialGas)`（双语文案），随后清零记账并 `MyxVault(vault).fundGas{value: amount}()` 全额转入新 vault；转账失败则整笔发币 revert。`creator` 是 VaultPortal 传入的发币交易 `msg.sender`，不可伪造。native quote 时忽略预存，不转、不要求，创建人可自行取回。
   - 发币交易里多付的 `msg.value` 会被 Portal 吞掉（§2），因此预付必须是发给工厂的独立交易；前端把 approve / prepayGas / 发币串成一个流程。`onBeforeLaunch` 载荷不含 creator，无法在发币前预检预付额，只能在 `newVault` 内强制并由 VaultPortal 抛出文案。
-- `vaultData = abi.encode(address marketQuoteToken, uint256 minProcessAmount, uint256 gasThreshold, uint256 gasRefillAmount)`；`vaultDataSchema()` 同步描述四个字段，其中 `minProcessAmount` 的 decimals 由 UI 按 quote 处理，schema 里标 0 并在描述中说明"以 quote 最小单位计"。
+- `vaultData = abi.encode(address marketQuoteToken, uint256 minProcessAmount, uint256 gasThreshold, uint256 gasRefillAmount, uint256 maxProcessAmount)`；`vaultDataSchema()` 同步描述五个字段，其中 `minProcessAmount` 的 decimals 由 UI 按 quote 处理，schema 里标 0 并在描述中说明"以 quote 最小单位计"。
 - `newVault(taxToken, quoteToken, creator, vaultData)`：把 `quoteToken` 直传 `InitParams.quoteToken`；解码 vaultData 并做同 §4.1 的校验，失败用双语 `require` 文案。
 - `isQuoteTokenSupported(quote)`：chainid 56/97 → `quote == 0 || IPortal(portal).getQuoteTokenConfiguration(quote).enabled == 1`；chainid 4663 → `quote == 0`。
 - `_validateBeforeLaunch`：删除"quote 必须为原生币"；保留 dividendBps == 0 与 MAGIC 校验。`tokenCreationPolicies` 去掉 quote 策略。

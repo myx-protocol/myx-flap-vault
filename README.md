@@ -28,7 +28,8 @@ See [docs/flap-vault-integration-design.md](docs/flap-vault-integration-design.m
 
 ## Launch parameters
 
-`vaultData = abi.encode(address marketQuoteToken, uint256 minProcessAmount, uint256 gasThreshold, uint256 gasRefillAmount)`;
+`vaultData = abi.encode(address marketQuoteToken, uint256 minProcessAmount, uint256 gasThreshold, uint256 gasRefillAmount, uint256 maxProcessAmount)`;
+`maxProcessAmount` (>= `minProcessAmount`, quote smallest unit) caps a single `process()` buyback; a larger balance is bought back in successive batches, each `process()` scheduling the next one via FlapTriggerService. Size it to roughly 1 BNB worth of the quote. After launching, call `ensurePoolDeployed()` once so the first trigger callback stays under the service's 2,000,000-gas cap.
 `dividendToken = MAGIC_DIVIDEND_COMPUTED`; `dividendBps = 0`.
 
 ## Risks

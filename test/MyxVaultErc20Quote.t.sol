@@ -82,6 +82,7 @@ contract MyxVaultErc20QuoteTestBase is Test {
         p.minProcessAmount = MIN_PROCESS;
         p.gasThreshold = GAS_THRESHOLD;
         p.gasRefillAmount = GAS_REFILL;
+        p.maxProcessAmount = type(uint256).max; // no batching in the legacy suites
     }
 
     function _deployVault(MyxVault.InitParams memory p) internal returns (MyxVault) {
@@ -515,4 +516,48 @@ contract MyxVaultErc20StipendTest is MyxVaultErc20QuoteTestBase {
         assertEq(vault.pendingQuote(), 0, "remainder bought back");
         assertGt(basePool.lastDepositAmount(), 0, "buyback still deposited");
     }
+}
+
+/// @dev Batched buyback on an ERC20 quote: the follow-up trigger fee comes from the gas pool.
+contract MyxVaultErc20BatchedProcessTest is MyxVaultErc20QuoteTestBase {
+    function setUp() public override {
+        super.setUp();
+        PoolMetadata memory meta;
+        meta.marketId = marketId;
+        meta.poolId = MyxPoolId.derive(marketId, address(taxToken));
+        meta.baseToken = address(taxToken);
+        meta.basePoolToken = address(lpToken);
+        poolManager.setPool(meta.poolId, meta);
+        MyxVault.InitParams memory p = _initParams();
+        p.maxProcessAmount = 30 ether; // 30 RWA per batch
+        vault = _deployVault(p);
+    }
+
+    function test_process_capsAtMax_followUpPaidFromGasPool() public {
+        vault.fundGas{value: GAS_REFILL}();
+        _sendTax(100 ether); // schedules #1 from the gas pool
+        uint256 fee = triggerService.getFee();
+        uint256 id = vault.pendingTriggerId();
+        vm.warp(block.timestamp + 61);
+        triggerService.fire(id);
+        assertEq(vault.pendingQuote(), 70 ether, "one 30 RWA batch consumed, quote baseline untouched by fees");
+        assertEq(basePool.lastDepositAmount(), 30_000 ether);
+        assertTrue(vault.hasPendingTrigger(), "follow-up scheduled");
+        assertEq(vault.gasBalance(), GAS_REFILL - 2 * fee, "two fees paid from the gas pool");
+    }
+
+    function test_process_capsAtMax_noGas_keepsRemainderWithoutFollowUp() public {
+        // Empty gas pool and no quote/WBNB pool, so the refill leg skips and the follow-up cannot pay
+        // its fee: the remainder must simply wait for the next wake or a manual process().
+        router.setPool(2500, false);
+        _sendTax(100 ether); // cannot schedule: no BNB
+        assertFalse(vault.hasPendingTrigger());
+        vault.process();
+        assertEq(vault.pendingQuote(), 70 ether, "one batch bought back, remainder retained");
+        assertEq(basePool.lastDepositAmount(), 30_000 ether);
+        assertEq(address(vault).balance, 0, "refill skipped, nothing to pay a fee with");
+        assertFalse(vault.hasPendingTrigger(), "no BNB for the follow-up fee; manual process() picks it up");
+    }
+
+    receive() external payable {}
 }

@@ -141,7 +141,7 @@ contract MyxVaultForkTest is FlapBSCFixture {
         //    resolves to this same VaultPortal on chainId 56, so the access check passes.
         //    vaultData carries the myx MARKET quote token plus this vault's thresholds. The vault
         //    derives marketId = keccak256(chainId, BSC_USDT) and the pool key from it.
-        bytes memory vaultData = abi.encode(BSC_USDT, uint256(0.001 ether), uint256(0), uint256(0));
+        bytes memory vaultData = abi.encode(BSC_USDT, uint256(0.001 ether), uint256(0), uint256(0), type(uint256).max);
 
         IVaultPortalTypes.NewTokenV6WithVaultParams memory params =
             _buildV3TaxTokenParams("Myx Vault Token", "MVT", _freshSalt(), address(factory), vaultData);

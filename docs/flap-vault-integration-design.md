@@ -101,7 +101,7 @@ function computeDividendToken(address predictedToken, bytes calldata hint) exter
 ## 8. 部署
 - 工厂部署脚本：`script/{mainnet,testnet}/bnb/DeployMyxVaultFactory.s.sol`，GlobalConfig 走 env（`MYX_POOL_MANAGER/MYX_BASE_POOL/MYX_POOL_FACTORY` + maxSlippageBps/minProcessAmount）。
 - 前置依赖：myx 在 BSC 部署 + 对应 quote(USDT/USDC) market 由 RISK_ADMIN 创建。
-- 发币：dividendToken 填 `MAGIC_DIVIDEND_COMPUTED`，vaultFactory 填本工厂，vaultData = `abi.encode(address marketQuoteToken, uint256 minProcessAmount, uint256 gasThreshold, uint256 gasRefillAmount)`，hint 带 `(quoteToken, MEME symbol)`。ERC20 报价币发币前，创建者须先调用 `factory.prepayGas{value: ...}()` 预付 BNB gas（至少 `minInitialGas`）；`newVault` 会把预付余额整笔转入新金库的 gas 池。
+- 发币：dividendToken 填 `MAGIC_DIVIDEND_COMPUTED`，vaultFactory 填本工厂，vaultData = `abi.encode(address marketQuoteToken, uint256 minProcessAmount, uint256 gasThreshold, uint256 gasRefillAmount, uint256 maxProcessAmount)`，hint 带 `(quoteToken, MEME symbol)`。ERC20 报价币发币前，创建者须先调用 `factory.prepayGas{value: ...}()` 预付 BNB gas（至少 `minInitialGas`）；`newVault` 会把预付余额整笔转入新金库的 gas 池。
 
 ## 9. 参考
 - `.agents/skills/flap-vault-spec-checker/`（Rule 001–009 合规）；最新审计：`docs/spec-checker-findings.md`。

@@ -53,7 +53,8 @@ myx 侧：`PoolManager.deployPool/getPool`、`BasePool.deposit/withdraw`、`Pool
    params.dividendBps     = 0            （由工厂 _validateBeforeLaunch 强制）
    params.vaultFactory    = MyxVaultFactory
    params.vaultData       = abi.encode(address marketQuoteToken, uint256 minProcessAmount,
-                                       uint256 gasThreshold, uint256 gasRefillAmount)
+                                       uint256 gasThreshold, uint256 gasRefillAmount,
+                                       uint256 maxProcessAmount)
 VaultPortal:
    1. factory.isQuoteTokenSupported(quote)       → native 恒 true；ERC20 在 56/97 上按 Portal 配置 enabled==1
    2. factory.onBeforeLaunch(...)                → dividendBps == 0 且 dividendToken == MAGIC
@@ -61,13 +62,13 @@ VaultPortal:
         → marketId = keccak256(chainId, marketQuoteToken)
         → return myx PoolFactory.predictBasePoolToken(marketId, predictedToken, symbol)   // mBase 地址
    4. factory.newVault(taxToken, quote, creator, vaultData)
-        → 校验 minProcessAmount != 0；ERC20 时 gasRefillAmount ∈ (gasThreshold, maxGasRefillAmount]
+        → 校验 minProcessAmount != 0，maxProcessAmount ≥ minProcessAmount；ERC20 时 gasRefillAmount ∈ (gasThreshold, maxGasRefillAmount]
         → 部署 BeaconProxy，initialize(InitParams{…, quoteToken = quote, …})
         → ERC20 时 require(prepaidGas[creator] ≥ minInitialGas)，清零并 vault.fundGas{value: 全额}()
    5. VaultPortal 校验 vault.vaultQuoteToken() == quote
 ```
 
-`vaultData` 四个字段全部由创建人给出；工厂只做边界校验，发币后不可修改。
+`vaultData` 五个字段全部由创建人给出；工厂只做边界校验，发币后不可修改。
 
 ---
 
@@ -111,11 +112,12 @@ _sync()
 require(pendingQuote >= minProcessAmount)
 _refillGas()                                     // 仅 ERC20 quote 且 gas 池 < gasThreshold
 if (pendingQuote < minProcessAmount) { emit BuybackSkipped; _feedDividend(); return; }
-amount = pendingQuote; pendingQuote = 0
+amount = min(pendingQuote, maxProcessAmount); pendingQuote -= amount     // 单批上限，见 §6.4
 received = _buyTaxToken(amount)                  // Portal.swapExactInput(inputToken = quote)，minOut = 同块报价 × (1 − maxSlippageBps)，按余额差值入账
 _ensurePoolExists()                              // myx deployPool（首次）
 basePool.deposit(poolId, received, 0, vault, vault)   → mBase LP
 _feedDividend()                                  // LP 全额 deposit 进 Dividend；未接线 / deposit 返回 false 或 revert → 保留 LP，发 DividendDeferred，下次重试
+if (pendingQuote != 0) { emit ProcessBatched; if (pendingQuote >= minProcessAmount) try scheduleProcess() }   // 续约下一批
 ```
 
 ### 6.1 gas refill（quote → WBNB → BNB）
@@ -135,6 +137,10 @@ _feedDividend()                                  // LP 全额 deposit 进 Divide
 真实 WBNB 的 `withdraw()` 用 `transfer()` 付款，只给 2300 gas；vault 的 `receive()` 要读 ERC20 余额，装不下。解决：`bool transient _unwrapping`（EIP-1153），`executeGasRefill` 在 unwrap 前后置位/清除，`receive()` 第一条语句检查该标志直接返回。这意味着 vault 依赖 Cancun 的 TLOAD/TSTORE。
 
 ---
+
+### 6.4 单批上限与分批（回应预审 Section 3）
+
+一次 `process()` 最多买回 `maxProcessAmount`（创建人在 vaultData 给出，工厂校验 ≥ `minProcessAmount`），剩余留在 `pendingQuote`。若剩余仍 ≥ `minProcessAmount`，`process()` 自己再预约一次触发（原生 quote 从税收扣手续费，ERC20 从 gas 池扣），没有新税也能继续排空。同块内拆单对夹子无意义，所以分批只跨块进行。效果：任何累积（首次回调 OOG、自动路径中断后再恢复）都以 `maxProcessAmount` 为单笔敞口上界排空，而不是一次性买回全部。
 
 ## 7. 应急与升级
 
@@ -178,6 +184,7 @@ _feedDividend()                                  // LP 全额 deposit 进 Divide
 8. **RWA 代币特性**：bStocks 类代币是否存在转账限制、黑名单或暂停机制？vault 在 dispatch 与 `process()` 之间会短暂持有 quote，若被冻结会影响买回。
 9. **Rule 001 参数面**：`minProcessAmount / gasThreshold / gasRefillAmount` 由创建人在 vaultData 给出、发币后不可改，工厂只校验 `!= 0`、`refill > threshold`、`refill ≤ maxGasRefillAmount`。创建人最坏能做的是把每批最多 20% 的税转成只有 EMERGENCY_ROLE 能取的 BNB，而 creator 本来就持有 EMERGENCY_ROLE。这样的参数面是否符合 Flap 对 Rule 001 的要求？
 10. **20% refill 上限**是否合理，或者 Flap 是否推荐某种价格参考来做更精确的 minOut？
+11. **单批上限 `maxProcessAmount`**：预审建议单笔买回 ≤ 约 1 BNB。该上限以 quote 最小单位由创建人配置，工厂无法用统一的 BNB 值约束不同 quote（USD、XAUT 精度各异）。Flap 是否有推荐的换算方式，或希望工厂增加按 quote 的全局上限表？
 
 ---
 
@@ -187,6 +194,7 @@ _feedDividend()                                  // LP 全额 deposit 进 Divide
 function vaultQuoteToken() external view returns (address);   // address(0) = native
 function vaultSpecVersion() external pure returns (string);   // "v3"
 function pendingQuote() external view returns (uint256);
+function maxProcessAmount() external view returns (uint256);   // per-call buyback cap
 function gasBalance() external view returns (uint256);        // ERC20 quote 的 BNB gas 池
 function sync() external;                                     // 无副作用的收入确认
 function fundGas() external payable;                          // 任何人充值 gas 池（仅 ERC20 quote）
@@ -212,6 +220,7 @@ function factorySpecVersion() external pure returns (string);   // "v2.3"
 | 参数 | 建议 | 说明 |
 |---|---|---|
 | `minProcessAmount` | 一批税的价值远大于 0.0002 BNB 触发费（如 ≥ 1 USD 等值） | 太小会让每笔尘埃税都花一次触发费 |
+| `maxProcessAmount` | 约 1 BNB 等值的 quote（如 600 USD） | 单笔买回上限，超出部分分批；每多一批多付一次触发费 |
 | `gasThreshold` | ≈ 2 次触发费（0.0004 BNB） | |
 | `gasRefillAmount` | ≈ 10 次触发费（0.002 BNB），≤ 工厂 `maxGasRefillAmount`（0.05 BNB） | |
 | 工厂 `minInitialGas` | 0.002 BNB | 发币前预付 |

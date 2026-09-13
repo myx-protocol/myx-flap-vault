@@ -49,6 +49,7 @@ contract MyxVaultFactory is VaultFactoryBaseV2, IVaultFactoryDividendV23 {
         uint256 minProcessAmount; // quote base units
         uint256 gasThreshold; // wei; ERC20 quote only
         uint256 gasRefillAmount; // wei; ERC20 quote only, > gasThreshold
+        uint256 maxProcessAmount; // quote base units; per-call buyback cap, >= minProcessAmount
     }
 
     /// @notice Decodes the creator-supplied `vaultData` payload. The layout is fund-critical — the
@@ -64,8 +65,8 @@ contract MyxVaultFactory is VaultFactoryBaseV2, IVaultFactoryDividendV23 {
     ///      `decodeVaultData(bytes memory)` would be the same ABI signature as the calldata version
     ///      above, which Solidity rejects.
     function _decodeVaultData(bytes memory vaultData) internal pure returns (VaultData memory d) {
-        (d.marketQuoteToken, d.minProcessAmount, d.gasThreshold, d.gasRefillAmount) =
-            abi.decode(vaultData, (address, uint256, uint256, uint256));
+        (d.marketQuoteToken, d.minProcessAmount, d.gasThreshold, d.gasRefillAmount, d.maxProcessAmount) =
+            abi.decode(vaultData, (address, uint256, uint256, uint256, uint256));
     }
 
     /// @dev Flap Portal per chain. Mirrors VaultBase._getPortal() (asserted equal in
@@ -149,6 +150,10 @@ contract MyxVaultFactory is VaultFactoryBaseV2, IVaultFactoryDividendV23 {
         // batch may be turned into for the gas pool, so it is capped factory-wide (ERC20 quotes
         // only — a native-quote vault must carry zero gas params, enforced in the initializer).
         require(d.minProcessAmount != 0, unicode"Min process amount must be non-zero / 最低處理金額不可為零");
+        require(
+            d.maxProcessAmount >= d.minProcessAmount,
+            unicode"Max process amount below minimum / 單批處理上限低於最低處理金額"
+        );
         if (quoteToken != address(0)) {
             require(
                 d.gasRefillAmount <= c.maxGasRefillAmount,
@@ -171,7 +176,8 @@ contract MyxVaultFactory is VaultFactoryBaseV2, IVaultFactoryDividendV23 {
                             maxSlippageBps: c.maxSlippageBps,
                             minProcessAmount: d.minProcessAmount,
                             gasThreshold: d.gasThreshold,
-                            gasRefillAmount: d.gasRefillAmount
+                            gasRefillAmount: d.gasRefillAmount,
+                            maxProcessAmount: d.maxProcessAmount
                         })
                     )
                 )
@@ -307,7 +313,7 @@ contract MyxVaultFactory is VaultFactoryBaseV2, IVaultFactoryDividendV23 {
     function vaultDataSchema() public pure override returns (VaultDataSchema memory schema) {
         schema.description =
             unicode"myx market quote token (e.g. USDT/USDC) plus this vault's thresholds. The reward is the resulting myx LP. / myx 市場報價幣（如 USDT/USDC）與本金庫的閾值設定。獎勵為產出的 myx LP。";
-        schema.fields = new FieldDescriptor[](4);
+        schema.fields = new FieldDescriptor[](5);
         schema.fields[0] = FieldDescriptor(
             "marketQuoteToken", "address", unicode"myx market quote token (e.g. USDT/USDC). / myx 市場報價幣（如 USDT/USDC）。", 0
         );
@@ -328,6 +334,12 @@ contract MyxVaultFactory is VaultFactoryBaseV2, IVaultFactoryDividendV23 {
             "uint256",
             unicode"ERC20 quote only: gas pool target after a refill, must exceed gasThreshold. 0 for native quote. / 僅 ERC20 報價幣：補充後的 Gas 池目標，須大於閾值。原生報價幣填 0。",
             18
+        );
+        schema.fields[4] = FieldDescriptor(
+            "maxProcessAmount",
+            "uint256",
+            unicode"Per-call buyback cap (launch quote smallest unit), must be >= minProcessAmount. Larger balances are bought back in successive batches. / 單次回購上限（發行報價幣最小單位），須不小於最低處理金額。超出部分分批回購。",
+            0
         );
         schema.isArray = false;
     }

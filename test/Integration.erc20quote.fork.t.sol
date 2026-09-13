@@ -78,7 +78,7 @@ contract MyxVaultErc20QuoteForkTest is FlapBSCFixture {
 
     function _launch() internal returns (address token, MyxVault vault) {
         // vaultData: myx market quote, 1 NVDAB min, refill below 0.005 BNB up to 0.01 BNB
-        bytes memory vaultData = abi.encode(BSC_USDT, uint256(1 ether), uint256(0.005 ether), uint256(0.01 ether));
+        bytes memory vaultData = abi.encode(BSC_USDT, uint256(1 ether), uint256(0.005 ether), uint256(0.01 ether), type(uint256).max);
         IVaultPortalTypes.NewTokenV6WithVaultParams memory p =
             _buildV3TaxTokenParams("Myx RWA Vault Token", "MRV", _freshSalt(), address(factory), vaultData);
         p.quoteToken = NVDAB;
@@ -131,7 +131,7 @@ contract MyxVaultErc20QuoteForkTest is FlapBSCFixture {
     }
 
     function test_erc20Quote_launchWithoutPrepay_reverts() public {
-        bytes memory vaultData = abi.encode(BSC_USDT, uint256(1 ether), uint256(0.005 ether), uint256(0.01 ether));
+        bytes memory vaultData = abi.encode(BSC_USDT, uint256(1 ether), uint256(0.005 ether), uint256(0.01 ether), type(uint256).max);
         IVaultPortalTypes.NewTokenV6WithVaultParams memory p =
             _buildV3TaxTokenParams("Myx RWA Vault Token", "MRV", _freshSalt(), address(factory), vaultData);
         p.quoteToken = NVDAB;

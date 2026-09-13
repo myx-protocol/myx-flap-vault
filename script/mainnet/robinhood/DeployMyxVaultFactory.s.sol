@@ -11,7 +11,7 @@ import {MyxVaultFactory} from "../../../src/MyxVaultFactory.sol";
 ///         ETH only — so `minInitialGas` is 0: no creator prepay is required or accepted here.
 ///         Per-vault `minProcessAmount` is no longer part of `GlobalConfig`; it is creator-supplied
 ///         per launch via `vaultData` (`abi.encode(address marketQuoteToken, uint256
-///         minProcessAmount, uint256 gasThreshold, uint256 gasRefillAmount)`). For native launches
+///         minProcessAmount, uint256 gasThreshold, uint256 gasRefillAmount, uint256 maxProcessAmount)`). For native launches
 ///         on this chain, recommend 0.004 ETH: the native currency here is ETH and the
 ///         FlapTriggerService fee is 0.0004 ETH (vs 0.0002 BNB on BSC), and scheduleProcess()
 ///         requires pendingQuote >= minProcessAmount + fee — with a 1 wei floor the fee would

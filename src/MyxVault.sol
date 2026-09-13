@@ -65,6 +65,9 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
         uint256 gasThreshold;
         /// @dev ERC20 quote only: target BNB gas pool after a refill (wei); must exceed gasThreshold.
         uint256 gasRefillAmount;
+        /// @dev Per-call buyback cap in quote base units (>= minProcessAmount). A larger pendingQuote is
+        ///      processed in successive batches, each scheduled by the previous one.
+        uint256 maxProcessAmount;
     }
 
     bytes32 public constant EMERGENCY_ROLE = keccak256("EMERGENCY_ROLE");
@@ -110,6 +113,9 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
     event GasRefillSkipped(uint256 pendingQuote);
     /// @notice Emitted when, after a refill, the remaining quote is below minProcessAmount.
     event BuybackSkipped(uint256 pendingQuote);
+    /// @notice Emitted when process() hit maxProcessAmount: `processed` was bought back this call and
+    ///         `remaining` stays in pendingQuote for the follow-up batch process() tries to schedule.
+    event ProcessBatched(uint256 processed, uint256 remaining);
 
     address public taxToken;
     address public creator;
@@ -142,12 +148,14 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
     uint256 public gasThreshold;
     /// @notice ERC20 quote only: gas pool target after a refill (wei).
     uint256 public gasRefillAmount;
+    /// @notice Per-call buyback cap (quote base units). Bounds the sandwich exposure of a single
+    ///         process() after any accumulation; the remainder is processed in follow-up batches.
+    uint256 public maxProcessAmount;
 
     /// @dev Reserved storage for upgrades. 44 original - 2 (trigger) - 2 (gasThreshold,
-    ///      gasRefillAmount; quoteToken packs into the hasPendingTrigger slot) = 40. Verified with
-    ///      `forge inspect MyxVault storage-layout`: quoteToken sits at slot 213 offset 1, so the V3
-    ///      fields consumed only two new slots and the reserved region must give back only two.
-    uint256[40] private __gap;
+    ///      gasRefillAmount; quoteToken packs into the hasPendingTrigger slot) - 1 (maxProcessAmount)
+    ///      = 39. Verified with `forge inspect MyxVault storage-layout`.
+    uint256[39] private __gap;
 
     /// @dev Set only while executeGasRefill is unwrapping WBNB, so receive() can recognise the BNB
     ///      coming back from the wrapper and return before doing anything expensive. EIP-1153
@@ -200,6 +208,11 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
         }
         gasThreshold = p.gasThreshold;
         gasRefillAmount = p.gasRefillAmount;
+        require(
+            p.maxProcessAmount >= p.minProcessAmount,
+            unicode"Max process amount below minimum / 單批處理上限低於最低處理金額"
+        );
+        maxProcessAmount = p.maxProcessAmount;
 
         address guardian = _getGuardian();
         _grantRole(DEFAULT_ADMIN_ROLE, guardian);
@@ -339,15 +352,20 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
         _sync();
         require(pendingQuote >= minProcessAmount, unicode"Pending below minimum / 待處理金額低於下限");
         _refillGas();
-        uint256 amount = pendingQuote;
-        if (amount < minProcessAmount) {
-            emit BuybackSkipped(amount);
+        uint256 available = pendingQuote;
+        if (available < minProcessAmount) {
+            emit BuybackSkipped(available);
             // Flush any deferred LP from a prior failed feed even when this call's buyback is
             // skipped — the refill leg alone must not stall a pending dividend distribution.
             _feedDividend();
             return;
         }
-        pendingQuote = 0;
+        // Batch cap: never swap more than maxProcessAmount in one call. Splitting inside one
+        // transaction would not help (a sandwich brackets the whole tx); the remainder is left in
+        // pendingQuote and a follow-up trigger is scheduled below, so accumulated revenue (e.g. after
+        // a failed callback) drains across blocks instead of in one oversized buy.
+        uint256 amount = available > maxProcessAmount ? maxProcessAmount : available;
+        pendingQuote = available - amount;
 
         uint256 received = _buyTaxToken(amount);
         _ensurePoolExists();
@@ -363,6 +381,17 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
         // Distribute freshly minted LP (+ any deferred LP from a prior failed feed) to holders.
         // Deferral-safe: never reverts the buyback.
         _feedDividend();
+
+        uint256 remaining = pendingQuote;
+        if (remaining != 0) {
+            emit ProcessBatched(amount, remaining);
+            // No new tax means no receive() wake, so the follow-up must be scheduled here. Same
+            // best-effort semantics as receive(): a failed schedule (no gas, service down) is not an
+            // error — the remainder waits for the next wake or a manual process().
+            if (remaining >= minProcessAmount && !hasPendingTrigger) {
+                try this.scheduleProcess() {} catch {}
+            }
+        }
     }
 
     /// @notice Feeds the vault's whole held mBase LP balance into the token's native Dividend

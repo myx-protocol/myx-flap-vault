@@ -42,7 +42,7 @@ contract MyxVaultFactoryPrepaidGasTest is Test {
     }
 
     function _erc20VaultData() internal view returns (bytes memory) {
-        return abi.encode(address(usdt), uint256(10 ether), uint256(0.01 ether), uint256(0.05 ether));
+        return abi.encode(address(usdt), uint256(10 ether), uint256(0.01 ether), uint256(0.05 ether), type(uint256).max);
     }
 
     function test_prepayGas_accumulatesAndEmits() public {
@@ -98,7 +98,7 @@ contract MyxVaultFactoryPrepaidGasTest is Test {
         vm.prank(creator);
         factory.prepayGas{value: 0.005 ether}();
         vm.prank(VAULT_PORTAL);
-        address vaultAddr = factory.newVault(makeAddr("tax"), address(0), creator, abi.encode(address(usdt), uint256(1), uint256(0), uint256(0)));
+        address vaultAddr = factory.newVault(makeAddr("tax"), address(0), creator, abi.encode(address(usdt), uint256(1), uint256(0), uint256(0), type(uint256).max));
         assertEq(address(vaultAddr).balance, 0);
         assertEq(factory.prepaidGas(creator), 0.005 ether, "still withdrawable");
     }
