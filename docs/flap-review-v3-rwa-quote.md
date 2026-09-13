@@ -105,9 +105,10 @@ receive():
 
 ---
 
-## 6. `process()`（无许可）
+## 6. `process()`（仅触发服务回调可执行）
 
 ```
+require(msg.sender == vault)                     // 只能由 trigger() 回调自调用；手动入口是 requestProcess()
 _sync()
 require(pendingQuote >= minProcessAmount)
 _refillGas()                                     // 仅 ERC20 quote 且 gas 池 < gasThreshold
@@ -141,6 +142,10 @@ if (pendingQuote != 0) { emit ProcessBatched; if (pendingQuote >= minProcessAmou
 ### 6.4 单批上限与分批（回应预审 Section 3）
 
 一次 `process()` 最多买回 `maxProcessAmount`（创建人在 vaultData 给出，工厂校验 ≥ `minProcessAmount`），剩余留在 `pendingQuote`。若剩余仍 ≥ `minProcessAmount`，`process()` 自己再预约一次触发（原生 quote 从税收扣手续费，ERC20 从 gas 池扣），没有新税也能继续排空。同块内拆单对夹子无意义，所以分批只跨块进行。效果：任何累积（首次回调 OOG、自动路径中断后再恢复）都以 `maxProcessAmount` 为单笔敞口上界排空，而不是一次性买回全部。
+
+### 6.5 手动触发也走 trigger（回应 Flap 反馈）
+
+`process()` 只能由 vault 自身调用，即只在 `trigger()` 回调内执行；Flap 的回调通过 MEV 保护通道提交。任何人都可以调用 `requestProcess()` 预约一次回调（ERC20 quote 可附带 BNB 充作触发费；原生 quote 从税收扣费），但没有人能在自己的交易里直接执行买回，因此不存在"公开 swap 被抢跑 + 夹子"的攻击面。`sync()`、`feedDividend()`、`ensurePoolDeployed()`、`fundGas()` 不涉及兑换，仍然无许可。
 
 ## 7. 应急与升级
 
@@ -198,7 +203,8 @@ function maxProcessAmount() external view returns (uint256);   // per-call buyba
 function gasBalance() external view returns (uint256);        // ERC20 quote 的 BNB gas 池
 function sync() external;                                     // 无副作用的收入确认
 function fundGas() external payable;                          // 任何人充值 gas 池（仅 ERC20 quote）
-function process() external;                                  // 无许可
+function process() external;                                  // 仅 vault 自身（trigger 回调）可调用
+function requestProcess() external payable;                   // 任何人：预约触发；ERC20 quote 可附带 BNB 作触发费
 function feedDividend() external;                             // 重试被推迟的分红
 function ensurePoolDeployed() external;                       // 发币后预建 myx 池
 function claimReward() external;  function pendingReward(address) external view returns (uint256);

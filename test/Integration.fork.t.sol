@@ -196,10 +196,12 @@ contract MyxVaultForkTest is FlapBSCFixture {
         );
         console2.log("portal quoteExactInput (token wei):", quoted);
 
-        // 5. process() from a RANDOM caller (permissionless): buy back the launched token via the
-        //    REAL Portal, then deposit the balance delta into the mock MYX base pool.
-        vm.prank(makeAddr("keeper"));
-        vault.process();
+        // 5. process() is trigger-only: the dispatch above auto-scheduled a request on the REAL
+        //    FlapTriggerService; simulate its backend executing the callback, which buys back the
+        //    launched token via the REAL Portal and deposits the balance delta into the mock MYX pool.
+        assertTrue(vault.hasPendingTrigger(), "dispatch must have scheduled a trigger");
+        vm.warp(block.timestamp + 61);
+        _executeTrigger(vault.pendingTriggerId());
 
         // All pending BNB was consumed by the buyback.
         assertEq(vault.pendingQuote(), 0, "pendingQuote must zero after process");

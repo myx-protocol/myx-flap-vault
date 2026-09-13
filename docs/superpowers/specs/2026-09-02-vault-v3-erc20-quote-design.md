@@ -40,13 +40,14 @@ Flap TaxProcessor.dispatch()
    ├─ native quote: BNB value transfer ──▶ receive()
    └─ ERC20 quote:  ERC20 transfer + zero-value ping ──▶ receive()
 receive(): _sync() 余额差值记账（轻量，不外呼 DEX）；满足条件则 try scheduleProcess()
-process() [无许可]:
+process() [仅 trigger() 回调可执行，2026-09-13 起；手动入口 requestProcess()]:
    _sync()
    ├─ ERC20 quote 且 gas 池 < gasThreshold ──▶ _refillGas(): quote → WBNB → BNB（Flap MultiDexRouter 自动选池）
    ├─ _buyTaxToken(): quote → tax token（Portal，同块报价做 minOut，余额差值入账）
    ├─ _ensurePoolExists(); basePool.deposit → mBase LP
    └─ _feedDividend(): LP 存入 Flap Dividend（不变，deferral-safe）
 trigger(requestId) [FlapTriggerService 回调]: try process()
+requestProcess() payable [任何人]: 预约触发，不在调用者交易内兑换（Flap 反馈：避免公开 swap 被抢跑+夹子）
 fundGas() payable [任何人]: 向 gas 池充 BNB（仅 ERC20 quote）
 sync() [任何人]: 无副作用的收入确认入口
 ```

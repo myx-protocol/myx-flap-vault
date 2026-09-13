@@ -256,8 +256,12 @@ contract MyxVaultProcessTest is MyxVaultTestBase {
 
     function test_process_buysAddsLiquidityFeedsDividend() public {
         _fund(1 ether);
-        // a random caller can run it — permissionless
+        // process() is trigger-only: a random caller cannot run the swap directly (front-run +
+        // sandwich surface); they request a trigger and the service callback executes it.
         vm.prank(makeAddr("keeper"));
+        vm.expectRevert(bytes(unicode"Caller must be the vault itself / 僅限金庫自身調用"));
+        vault.process();
+        vm.prank(address(vault));
         vault.process();
         assertEq(vault.pendingQuote(), 0);
         assertEq(basePool.depositCallCount(), 1);
@@ -272,7 +276,7 @@ contract MyxVaultProcessTest is MyxVaultTestBase {
 
     function test_process_anyoneCanCall() public {
         _fund(1 ether);
-        vm.prank(makeAddr("stranger"));
+        vm.prank(address(vault));
         vault.process(); // no role gate — must not revert
         assertEq(basePool.depositCallCount(), 1);
     }
@@ -283,26 +287,31 @@ contract MyxVaultProcessTest is MyxVaultTestBase {
         emit RevenueProcessed(1 ether, 1000 ether, 1000 ether);
         vm.expectEmit(true, true, true, true, address(vault));
         emit DividendFed(1000 ether);
+        vm.prank(address(vault));
         vault.process();
     }
 
     function test_process_belowMinimum_reverts() public {
         _fund(0.05 ether); // below 0.1 ether minProcessAmount
         vm.expectRevert(bytes(unicode"Pending below minimum / 待處理金額低於下限"));
+        vm.prank(address(vault));
         vault.process();
     }
 
     function test_process_belowMinimumAfterSuccess_reverts() public {
         _fund(1 ether);
+        vm.prank(address(vault));
         vault.process(); // succeeds, pendingQuote -> 0
         uint256 minAmt = vault.minProcessAmount();
         vm.expectRevert(bytes(unicode"Pending below minimum / 待處理金額低於下限"));
+        vm.prank(address(vault));
         vault.process();
     }
 
     function test_process_dexPhaseTax_accountsBalanceDelta() public {
         portal.setTaxBps(400); // 4% DEX-phase transfer tax: gross 1000, net 960
         _fund(1 ether);
+        vm.prank(address(vault));
         vault.process();
         // deposit must use the balance delta (net), never the Portal's gross output
         assertEq(basePool.lastDepositAmount(), 960 ether);
@@ -314,6 +323,7 @@ contract MyxVaultProcessTest is MyxVaultTestBase {
         portal.setRate(0, 1); // Portal quotes zero output
         _fund(1 ether);
         vm.expectRevert(bytes(unicode"Buyback quote is zero / 回購報價為零"));
+        vm.prank(address(vault));
         vault.process();
         assertEq(vault.pendingQuote(), 1 ether); // retained for retry
     }
@@ -322,6 +332,7 @@ contract MyxVaultProcessTest is MyxVaultTestBase {
         _fund(1 ether);
         vm.mockCallRevert(PORTAL, abi.encodeWithSelector(IPortalTradeV2.swapExactInput.selector), "PORTAL_FAIL");
         vm.expectRevert("PORTAL_FAIL");
+        vm.prank(address(vault));
         vault.process();
         // state rolled back: BNB safely retained for retry
         assertEq(vault.pendingQuote(), 1 ether);
@@ -332,6 +343,7 @@ contract MyxVaultProcessTest is MyxVaultTestBase {
         _fund(1 ether);
         vm.mockCallRevert(address(basePool), abi.encodeWithSelector(IMyxBasePool.deposit.selector), "POOL_PAUSED");
         vm.expectRevert();
+        vm.prank(address(vault));
         vault.process();
         // state rolled back: BNB safely retained for retry
         assertEq(vault.pendingQuote(), 1 ether);
@@ -351,6 +363,7 @@ contract MyxVaultDeployPoolTest is MyxVaultTestBase {
     function test_process_deploysPoolWhenMissing() public {
         // no setPool() — pool does not exist yet
         _fund(1 ether);
+        vm.prank(address(vault));
         vault.process();
         assertEq(poolManager.deployPoolCallCount(), 1);
         assertEq(basePool.depositCallCount(), 1);
@@ -363,6 +376,7 @@ contract MyxVaultDeployPoolTest is MyxVaultTestBase {
         meta.basePoolToken = address(lpToken);
         poolManager.setPool(MyxPoolId.derive(marketId, address(taxToken)), meta);
         _fund(1 ether);
+        vm.prank(address(vault));
         vault.process();
         assertEq(poolManager.deployPoolCallCount(), 0);
     }
@@ -371,6 +385,7 @@ contract MyxVaultDeployPoolTest is MyxVaultTestBase {
         poolManager.setMarketExists(false);
         _fund(1 ether);
         vm.expectRevert("MockPoolManager: market missing");
+        vm.prank(address(vault));
         vault.process();
         assertEq(vault.pendingQuote(), 1 ether); // safely retained for retry after governance creates market
     }
@@ -413,6 +428,7 @@ contract MyxVaultFeedDividendTest is MyxVaultTestBase {
 
     function test_process_feedsLpToDividend() public {
         _fund(1 ether);
+        vm.prank(address(vault));
         vault.process();
         assertEq(vault.totalLpMinted(), 1000 ether);
         assertEq(dividend.totalDeposited(), 1000 ether, "dividend must receive the minted LP");
@@ -425,6 +441,7 @@ contract MyxVaultFeedDividendTest is MyxVaultTestBase {
         dividend.setDepositSucceeds(false); // simulate totalShares == 0: deposit() returns false
         vm.expectEmit(true, true, true, true, address(vault));
         emit DividendDeferred(1000 ether);
+        vm.prank(address(vault));
         vault.process();
         // LP retained in the vault, nothing deposited, no rewards counted
         assertEq(dividend.totalDeposited(), 0);
@@ -445,6 +462,7 @@ contract MyxVaultFeedDividendTest is MyxVaultTestBase {
         dividend.setDepositReverts(true); // external Dividend.deposit THROWS, not just returns false
         vm.expectEmit(true, true, true, true, address(vault));
         emit DividendDeferred(1000 ether);
+        vm.prank(address(vault));
         vault.process(); // must NOT revert: the buyback + LP mint must persist, feed degrades to deferral
         assertEq(dividend.totalDeposited(), 0);
         assertEq(lpToken.balanceOf(address(vault)), 1000 ether, "LP deferred in vault on deposit revert");
@@ -465,6 +483,7 @@ contract MyxVaultFeedDividendTest is MyxVaultTestBase {
         taxToken.setDividendContract(address(0)); // dividend not wired yet
         vm.expectEmit(true, true, true, true, address(vault));
         emit DividendDeferred(1000 ether);
+        vm.prank(address(vault));
         vault.process();
         assertEq(dividend.totalDeposited(), 0);
         assertEq(lpToken.balanceOf(address(vault)), 1000 ether, "LP retained when dividend unwired");
@@ -485,6 +504,7 @@ contract MyxVaultFeedDividendTest is MyxVaultTestBase {
 
     function test_feedDividend_permissionless() public {
         _fund(1 ether);
+        vm.prank(address(vault));
         vault.process();
         assertEq(lpToken.balanceOf(address(vault)), 0);
         vm.prank(makeAddr("stranger"));
@@ -496,11 +516,13 @@ contract MyxVaultFeedDividendTest is MyxVaultTestBase {
         // the WHOLE balance: the deferred LP plus the freshly minted LP.
         _fund(1 ether);
         dividend.setDepositSucceeds(false);
+        vm.prank(address(vault));
         vault.process(); // 1000 LP deferred
         assertEq(lpToken.balanceOf(address(vault)), 1000 ether);
 
         dividend.setDepositSucceeds(true);
         _fund(1 ether);
+        vm.prank(address(vault));
         vault.process(); // mints +1000 LP, feeds the whole 2000
         assertEq(dividend.totalDeposited(), 2000 ether, "whole balance (deferred + new) fed");
         assertEq(lpToken.balanceOf(address(vault)), 0);
@@ -666,7 +688,7 @@ contract MyxVaultViewsTest is MyxVaultTestBase {
         bool hasQuote;
         for (uint256 i = 0; i < methods.length; i++) {
             bytes32 n = keccak256(bytes(methods[i].name));
-            if (n == keccak256("process")) hasProcess = true;
+            if (n == keccak256("requestProcess")) hasProcess = true;
             if (n == keccak256("claimReward")) hasClaim = true;
             if (n == keccak256("feedDividend")) hasFeed = true;
             if (n == keccak256("pendingReward")) hasPending = true;
@@ -675,7 +697,7 @@ contract MyxVaultViewsTest is MyxVaultTestBase {
             if (n == keccak256("gasBalance")) hasGasBalance = true;
             if (n == keccak256("vaultQuoteToken")) hasQuote = true;
         }
-        assertTrue(hasProcess, "schema must expose process");
+        assertTrue(hasProcess, "schema must expose requestProcess");
         assertTrue(hasClaim, "schema must expose claimReward");
         assertTrue(hasFeed, "schema must expose feedDividend");
         assertTrue(hasPending, "schema must expose pendingReward");

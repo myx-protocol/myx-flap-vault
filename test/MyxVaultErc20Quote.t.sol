@@ -161,7 +161,7 @@ contract MyxVaultErc20ProcessTest is MyxVaultErc20QuoteTestBase {
 
     function test_process_buysWithErc20QuoteAndFeedsLp() public {
         _sendTax(20 ether);
-        vm.prank(makeAddr("keeper"));
+        vm.prank(address(vault));
         vault.process();
         assertEq(vault.pendingQuote(), 0);
         assertEq(rwa.balanceOf(address(vault)), 0, "all quote spent");
@@ -172,6 +172,7 @@ contract MyxVaultErc20ProcessTest is MyxVaultErc20QuoteTestBase {
 
     function test_process_recognizesUnpingedRevenueFirst() public {
         rwa.mint(address(vault), 20 ether); // no ping
+        vm.prank(address(vault));
         vault.process(); // must sync then run
         assertEq(basePool.lastDepositAmount(), 20_000 ether);
     }
@@ -179,6 +180,7 @@ contract MyxVaultErc20ProcessTest is MyxVaultErc20QuoteTestBase {
     function test_process_belowMinimum_reverts() public {
         _sendTax(MIN_PROCESS - 1);
         vm.expectRevert(bytes(unicode"Pending below minimum / 待處理金額低於下限"));
+        vm.prank(address(vault));
         vault.process();
     }
 
@@ -186,6 +188,7 @@ contract MyxVaultErc20ProcessTest is MyxVaultErc20QuoteTestBase {
         _sendTax(20 ether);
         portal.setRate(0, 1);
         vm.expectRevert(bytes(unicode"Buyback quote is zero / 回購報價為零"));
+        vm.prank(address(vault));
         vault.process();
         assertEq(vault.pendingQuote(), 20 ether);
         assertEq(rwa.balanceOf(address(vault)), 20 ether);
@@ -269,6 +272,7 @@ contract MyxVaultErc20RefillTest is MyxVaultErc20QuoteTestBase {
         _sendTax(100 ether);
         vm.expectEmit(false, false, false, false);
         emit GasRefilled(0, 0, 0);
+        vm.prank(address(vault));
         vault.process();
         assertEq(router.lastFeeUsed(), 2500);
         uint256 quoteIn = router.lastAmountIn();
@@ -285,6 +289,7 @@ contract MyxVaultErc20RefillTest is MyxVaultErc20QuoteTestBase {
         // before process() ever runs, which is a different scenario than the one under test.
         vault.fundGas{value: GAS_THRESHOLD + triggerService.getFee()}();
         _sendTax(100 ether);
+        vm.prank(address(vault));
         vault.process();
         assertEq(router.lastAmountIn(), 0, "no swap");
         assertEq(basePool.lastDepositAmount(), 100_000 ether);
@@ -296,6 +301,7 @@ contract MyxVaultErc20RefillTest is MyxVaultErc20QuoteTestBase {
         router.setPool(10000, true);
         router.setRate(10000, 1, 1000);
         _sendTax(100 ether);
+        vm.prank(address(vault));
         vault.process();
         assertEq(router.lastFeeUsed(), 500);
     }
@@ -304,6 +310,7 @@ contract MyxVaultErc20RefillTest is MyxVaultErc20QuoteTestBase {
         router.setPool(500, true);
         router.setQuoteReverts(500, true);
         _sendTax(100 ether);
+        vm.prank(address(vault));
         vault.process();
         assertEq(router.lastFeeUsed(), 2500);
     }
@@ -313,6 +320,7 @@ contract MyxVaultErc20RefillTest is MyxVaultErc20QuoteTestBase {
         _sendTax(100 ether);
         vm.expectEmit(true, true, true, true);
         emit GasRefillSkipped(100 ether);
+        vm.prank(address(vault));
         vault.process();
         assertEq(address(vault).balance, 0);
         assertEq(basePool.lastDepositAmount(), 100_000 ether);
@@ -326,6 +334,7 @@ contract MyxVaultErc20RefillTest is MyxVaultErc20QuoteTestBase {
         _sendTax(MIN_PROCESS); // 10 RWA; uncapped sizing would spend all of it on the refill
         vm.expectEmit(true, true, true, true);
         emit BuybackSkipped(8 ether);
+        vm.prank(address(vault));
         vault.process();
         assertEq(router.lastAmountIn(), 2 ether, "capped at MAX_REFILL_SHARE_BPS (20%) of pendingQuote");
         assertEq(address(vault).balance, 0.006 ether, "gas pool gets only the capped swap's output");
@@ -340,6 +349,7 @@ contract MyxVaultErc20RefillTest is MyxVaultErc20QuoteTestBase {
     function test_process_thinPool_refillBoundedByCap() public {
         router.setRate(2500, 1, 100000); // 100 RWA -> 0.001 BNB: far below the 0.05 target
         _sendTax(100 ether);
+        vm.prank(address(vault));
         vault.process();
         assertEq(router.lastAmountIn(), 20 ether, "capped at 20% of pendingQuote despite the thin pool");
         assertEq(vault.pendingQuote(), 0);
@@ -356,6 +366,7 @@ contract MyxVaultErc20RefillTest is MyxVaultErc20QuoteTestBase {
         router.setSwapReverts(true);
         vm.expectEmit(true, true, true, true);
         emit GasRefillSkipped(100 ether);
+        vm.prank(address(vault));
         vault.process();
         assertEq(address(vault).balance, 0, "no gas refilled");
         assertEq(vault.pendingQuote(), 0, "rule 010: the reverted decrement rolled back, then the buyback spent it");
@@ -370,6 +381,7 @@ contract MyxVaultErc20RefillTest is MyxVaultErc20QuoteTestBase {
 
     function test_process_refillDoesNotScheduleTriggerMidProcess() public {
         _sendTax(100 ether);
+        vm.prank(address(vault));
         vault.process(); // WBNB.withdraw pays BNB into receive() while process() holds the guard
         assertFalse(vault.hasPendingTrigger(), "no trigger scheduled from inside process()");
     }
@@ -385,6 +397,7 @@ contract MyxVaultErc20RefillTest is MyxVaultErc20QuoteTestBase {
         p.maxSlippageBps = 0; // zero tolerance: minOut must exactly match the actual swap output
         MyxVault strict = _deployVault(p);
         rwa.mint(address(strict), 100 ether);
+        vm.prank(address(strict));
         strict.process();
         assertGt(address(strict).balance, 0);
     }
@@ -396,6 +409,7 @@ contract MyxVaultErc20RefillTest is MyxVaultErc20QuoteTestBase {
         other.setRate(2500, 3, 1000);
         registry.setMultiDexRouter(address(other));
         _sendTax(100 ether);
+        vm.prank(address(vault));
         vault.process();
         assertGt(other.lastAmountIn(), 0, "router resolved dynamically from SwapRegistry");
         assertEq(router.lastAmountIn(), 0);
@@ -410,6 +424,7 @@ contract MyxVaultErc20RefillTest is MyxVaultErc20QuoteTestBase {
         _sendTax(100 ether);
         vm.expectEmit(true, true, true, true);
         emit GasRefillSkipped(100 ether);
+        vm.prank(address(vault));
         vault.process();
         assertEq(address(vault).balance, 0);
         assertEq(basePool.lastDepositAmount(), 100_000 ether);
@@ -510,6 +525,8 @@ contract MyxVaultErc20StipendTest is MyxVaultErc20QuoteTestBase {
         vault.sync();
         assertEq(address(vault).balance, 0, "gas pool starts empty, below the threshold");
 
+        vm.prank(address(vault));
+
         vault.process();
 
         assertGe(address(vault).balance, GAS_THRESHOLD, "refill topped the gas pool up");
@@ -552,11 +569,48 @@ contract MyxVaultErc20BatchedProcessTest is MyxVaultErc20QuoteTestBase {
         router.setPool(2500, false);
         _sendTax(100 ether); // cannot schedule: no BNB
         assertFalse(vault.hasPendingTrigger());
+        vm.prank(address(vault));
         vault.process();
         assertEq(vault.pendingQuote(), 70 ether, "one batch bought back, remainder retained");
         assertEq(basePool.lastDepositAmount(), 30_000 ether);
         assertEq(address(vault).balance, 0, "refill skipped, nothing to pay a fee with");
         assertFalse(vault.hasPendingTrigger(), "no BNB for the follow-up fee; manual process() picks it up");
+    }
+
+    receive() external payable {}
+}
+
+contract MyxVaultErc20RequestProcessTest is MyxVaultErc20QuoteTestBase {
+    function setUp() public override {
+        super.setUp();
+        PoolMetadata memory meta;
+        meta.marketId = marketId;
+        meta.poolId = MyxPoolId.derive(marketId, address(taxToken));
+        meta.baseToken = address(taxToken);
+        meta.basePoolToken = address(lpToken);
+        poolManager.setPool(meta.poolId, meta);
+    }
+
+    function test_requestProcess_erc20_fundsFeeWithValue() public {
+        _sendTax(20 ether); // no gas -> not auto-scheduled
+        assertFalse(vault.hasPendingTrigger());
+        uint256 fee = triggerService.getFee();
+        vm.deal(address(this), 1 ether);
+        vault.requestProcess{value: fee + GAS_REFILL}(); // caller funds the fee (+ pool headroom)
+        assertTrue(vault.hasPendingTrigger());
+        assertEq(vault.gasBalance(), GAS_REFILL, "fee spent from the just-funded gas pool");
+        assertEq(vault.pendingQuote(), 20 ether, "ERC20 revenue untouched");
+        uint256 id = vault.pendingTriggerId();
+        vm.warp(block.timestamp + 61);
+        triggerService.fire(id);
+        assertEq(vault.pendingQuote(), 0);
+        assertEq(basePool.lastDepositAmount(), 20_000 ether);
+    }
+
+    function test_requestProcess_erc20_noGas_reverts() public {
+        _sendTax(20 ether);
+        vm.expectRevert(bytes(unicode"Gas pool below trigger fee / Gas 池低於觸發手續費"));
+        vault.requestProcess();
     }
 
     receive() external payable {}

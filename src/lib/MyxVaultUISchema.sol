@@ -21,9 +21,9 @@ library MyxVaultUISchema {
         schema.methods[0].outputs = new FieldDescriptor[](1);
         schema.methods[0].outputs[0] = FieldDescriptor("amount", "uint256", "Quote amount", 0);
 
-        schema.methods[1].name = "process";
+        schema.methods[1].name = "requestProcess";
         schema.methods[1].description =
-            unicode"Buy back the token with the pending quote revenue, deposit into MYX pool, and feed LP to dividends. Permissionless. / 用待處理的報價幣稅收回購代幣，注入 MYX 池並將 LP 分發為分紅。任何人可調用。";
+            unicode"Schedule a buyback: the Flap trigger service then buys back the token with the pending quote revenue, deposits into MYX pool, and feeds LP to dividends. Anyone may call; ERC20-quote vaults may attach BNB for the trigger fee. / 預約回購：由 Flap 觸發服務用待處理稅收回購代幣、注入 MYX 池並分發 LP 分紅。任何人可調用；ERC20 報價幣金庫可附帶 BNB 作觸發手續費。";
         schema.methods[1].isWriteMethod = true;
 
         schema.methods[2].name = "feedDividend";
