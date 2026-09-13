@@ -119,8 +119,8 @@ contract MyxVaultErc20QuoteForkTest is FlapBSCFixture {
 
         // process: gas pool is below 0.005 -> refill via Flap MultiDexRouter, then buy back + deposit
         uint256 gasBefore = vault.gasBalance();
-        vm.prank(makeAddr("keeper"));
-        vault.process();
+        vm.warp(block.timestamp + 61);
+        _executeTrigger(vault.pendingTriggerId()); // trigger-only process(): REAL service callback
         assertGt(vault.gasBalance(), gasBefore, "refill topped up the gas pool");
         assertGe(vault.gasBalance(), 0.005 ether);
         assertEq(vault.pendingQuote(), 0);

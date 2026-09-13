@@ -17,7 +17,8 @@ Supported quotes: native BNB, or any ERC20/RWA quote enabled on the Flap Portal 
 Flap tax token ──tax(mktBps)──▶ dispatch() ──BNB or ERC20 quote (+ zero-value ping)──▶ MyxVault.receive()
         receive(): balance-delta accounting (Flap spec V3) + best-effort schedule of a delayed process()
         creator: factory.prepayGas() before launch (ERC20 quote) → forwarded into the vault gas pool
-        [anyone / trigger] process(): sync → (ERC20 quote) refill BNB gas pool via Flap MultiDexRouter
+        [trigger only] process(): sync → (ERC20 quote) refill BNB gas pool via Flap MultiDexRouter
+        [anyone] requestProcess(): schedule the trigger callback (never swaps in the caller's tx)
                  → buy back the tax token via the Flap Portal → deployPool if missing
                  → BasePool.deposit (mBase LP minted to vault) → _feedDividend()
         [anyone] fundGas(): top up the gas pool · sync(): recognize unpinged revenue
@@ -33,6 +34,7 @@ See [docs/flap-vault-integration-design.md](docs/flap-vault-integration-design.m
 `dividendToken = MAGIC_DIVIDEND_COMPUTED`; `dividendBps = 0`.
 
 ## Risks
+- **`process()` is trigger-only.** The buyback executes only inside the FlapTriggerService callback, which Flap submits through an MEV-protected channel. Anyone can schedule it with `requestProcess()` (ERC20-quote vaults may attach BNB for the fee), but nobody can run the swap in their own transaction, so a public caller cannot front-run and sandwich the vault's own buy.
 
 - RWA quote tokens (bStocks) may carry transfer restrictions; the vault holds the quote between
   `dispatch()` and `process()`.

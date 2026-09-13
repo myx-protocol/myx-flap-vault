@@ -28,7 +28,7 @@ import {IWBNB} from "./dex/IWBNB.sol";
 /// @notice Flap vault that buys back the tax token with tax revenue via the Flap Portal, deposits
 ///         it as MYX base-pool liquidity, and feeds the resulting mBase LP into the token's
 ///         native Flap Dividend contract — the LP ITSELF is the dividend asset.
-/// @dev v6 reward model: tax (native or ERC20 quote) → receive() accounting → process() [permissionless]
+/// @dev v6 reward model: tax (native or ERC20 quote) → receive() accounting → process() [trigger-only]
 ///      buys back the token via the Portal, deposits it into the MYX base pool (LP minted to the
 ///      vault), then _feedDividend deposits the LP into the Dividend contract whose dividendToken ==
 ///      that same mBase LP (wired at launch). Holders claim the mBase LP via
@@ -40,7 +40,9 @@ import {IWBNB} from "./dex/IWBNB.sol";
 ///        try/catch; accounting is the Rule-005/010 core and the schedule never reverts receive()
 ///        (deliberate Rule-005 deviation, see auto-trigger doc). sync() exposes the same recognition
 ///        permissionlessly for callers who cannot reach receive() with a wake call.
-///      - process() is permissionless: anyone may convert the pending quote revenue into liquidity + dividend.
+///      - process() runs ONLY through the FlapTriggerService callback (Flap submits callbacks through an
+///        MEV-protected channel). Anyone may requestProcess() to schedule it; nobody can execute the swap
+///        in their own transaction, which closes the front-run + sandwich surface of a public swap.
 ///      - The LP IS the dividend asset: dividendToken == basePoolToken == mBase. _feedDividend
 ///        deposits the whole held LP balance; if the dividend is unwired or deposit() returns false
 ///        (totalShares == 0 early window), the LP is RETAINED (DividendDeferred) — no swap, no
@@ -310,7 +312,7 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
 
     /// @notice FlapTriggerService callback (ITriggerReceiver). Clears the in-flight gate FIRST, then
     ///         runs process() under try/catch so a revert (e.g. pendingQuote already drained below the
-    ///         minimum by a permissionless process()) cannot deadlock scheduling — the next tax
+    ///         minimum by an earlier callback) cannot deadlock scheduling — the next tax
     ///         receipt re-schedules. Stale/unknown request ids are ignored.
     function trigger(uint256 requestId) external {
         require(msg.sender == _getTriggerService(), unicode"Caller must be the trigger service / 僅限觸發服務調用");
@@ -324,6 +326,23 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
             success = false;
         }
         emit ProcessTriggered(requestId, success);
+    }
+
+    /// @notice Manual entry point: schedules process() through the FlapTriggerService instead of
+    ///         executing the swap in the caller's transaction. Flap submits callbacks through an
+    ///         MEV-protected channel; a public, caller-executed swap would expose the buyback to
+    ///         front-running and sandwiching. Anyone may call it. ERC20-quote vaults may attach BNB
+    ///         to fund the gas pool (e.g. exactly one fee); native-quote vaults reject value.
+    ///         Reverts with the scheduling reason (below minimum, no gas, trigger already pending)
+    ///         so the caller learns why nothing was scheduled.
+    function requestProcess() external payable nonReentrant {
+        if (msg.value != 0) {
+            require(quoteToken != address(0), unicode"Gas pool only for ERC20 quote / 僅 ERC20 報價幣金庫可充值 Gas");
+            emit GasFunded(msg.sender, msg.value);
+        }
+        _sync();
+        require(!hasPendingTrigger, unicode"Trigger already pending / 已有待執行的觸發");
+        this.scheduleProcess();
     }
 
     /// @dev FlapTriggerService address per chain — hardcoded like _getPortal/_getGuardian.
@@ -344,11 +363,13 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
 
     /// @notice Converts the accumulated quote revenue into MYX base-pool liquidity by buying back the tax token
     ///         via the Flap Portal, then feeds the resulting mBase LP into the token's dividend
-    ///         contract. PERMISSIONLESS — anyone may run it.
+    ///         contract. TRIGGER-ONLY: callable only by the vault itself, i.e. from the
+    ///         FlapTriggerService callback in trigger(). Use requestProcess() to schedule a run.
     /// @dev Buy leg minOut is a same-block Portal quote × (1 - maxSlippageBps): bounds per-call
     ///      deviation but cannot prevent sandwiching (BSC block proposers reorder at no cost).
     ///      Consumes ALL pendingQuote; the LP IS the reward (v6 model).
     function process() external nonReentrant {
+        require(msg.sender == address(this), unicode"Caller must be the vault itself / 僅限金庫自身調用");
         _sync();
         require(pendingQuote >= minProcessAmount, unicode"Pending below minimum / 待處理金額低於下限");
         _refillGas();

@@ -145,7 +145,7 @@ contract MyxVaultAutoTriggerTest is Test {
         assertEq(address(vault).balance, vault.pendingQuote(), "balance must equal pendingQuote after schedule");
 
         vm.warp(block.timestamp + 61);
-        vm.prank(makeAddr("keeper"));
+        vm.prank(address(vault));
         vault.process(); // forwards amount == pendingQuote == balance; cannot revert on insufficient BNB
         assertEq(vault.pendingQuote(), 0);
         assertEq(address(vault).balance, 0, "balance and pendingQuote both drained after process");
@@ -167,6 +167,7 @@ contract MyxVaultAutoTriggerTest is Test {
     function test_trigger_processReverts_stillClears() public {
         _fund(1 ether);
         uint256 id = vault.pendingTriggerId();
+        vm.prank(address(vault));
         vault.process(); // drain pendingQuote via permissionless process first
         assertEq(vault.pendingQuote(), 0);
         vm.warp(block.timestamp + 61);
@@ -273,9 +274,12 @@ contract MyxVaultBatchedProcessTest is MyxVaultAutoTriggerTest {
         assertFalse(vault.hasPendingTrigger());
         triggerService.setRequestReverts(false);
         vm.prank(makeAddr("keeper"));
-        vault.process();
-        assertEq(vault.pendingQuote(), 1.5 ether - triggerService.getFee());
-        assertTrue(vault.hasPendingTrigger(), "manual process() schedules the remainder");
+        vault.requestProcess(); // manual entry: schedules the service callback, does not swap
+        uint256 id = vault.pendingTriggerId();
+        vm.warp(block.timestamp + 61);
+        triggerService.fire(id);
+        assertEq(vault.pendingQuote(), 1.5 ether - 2 * triggerService.getFee(), "request fee + follow-up fee");
+        assertTrue(vault.hasPendingTrigger(), "callback's process() schedules the remainder");
     }
 
     function test_process_noFollowUpWhenRemainderBelowMin() public {
@@ -283,6 +287,7 @@ contract MyxVaultBatchedProcessTest is MyxVaultAutoTriggerTest {
         triggerService.setRequestReverts(true);
         _fund(1.05 ether); // remainder 0.05 < min 0.1
         triggerService.setRequestReverts(false);
+        vm.prank(address(vault));
         vault.process();
         assertEq(vault.pendingQuote(), 0.05 ether, "dust remainder retained for the next batch");
         assertFalse(vault.hasPendingTrigger(), "no follow-up below minProcessAmount");
@@ -295,5 +300,55 @@ contract MyxVaultBatchedProcessTest is MyxVaultAutoTriggerTest {
         triggerService.fire(id);
         assertEq(vault.pendingQuote(), 0);
         assertFalse(vault.hasPendingTrigger());
+    }
+}
+
+/// @dev process() is executed only through the FlapTriggerService callback (MEV-protected
+///      submission per Flap). The manual entry point is requestProcess(): it schedules the
+///      callback and never swaps in the caller's transaction.
+contract MyxVaultTriggerOnlyProcessTest is MyxVaultAutoTriggerTest {
+    function test_process_directCall_reverts() public {
+        _fund(1 ether);
+        vm.prank(makeAddr("keeper"));
+        vm.expectRevert(bytes(unicode"Caller must be the vault itself / 僅限金庫自身調用"));
+        vault.process();
+        assertEq(vault.pendingQuote(), 1 ether - triggerService.getFee(), "nothing swapped");
+    }
+
+    function test_requestProcess_native_schedulesAndPaysFromRevenue() public {
+        triggerService.setRequestReverts(true);
+        _fund(1 ether); // receive() could not schedule
+        triggerService.setRequestReverts(false);
+        assertFalse(vault.hasPendingTrigger());
+        vm.prank(makeAddr("keeper"));
+        vault.requestProcess();
+        assertTrue(vault.hasPendingTrigger());
+        assertEq(vault.pendingQuote(), 1 ether - triggerService.getFee(), "fee debited from revenue");
+        assertEq(address(vault).balance, vault.pendingQuote(), "native invariant");
+        uint256 id = vault.pendingTriggerId();
+        vm.warp(block.timestamp + 61);
+        triggerService.fire(id);
+        assertEq(vault.pendingQuote(), 0, "callback executed the buyback");
+    }
+
+    function test_requestProcess_whilePending_reverts() public {
+        _fund(1 ether); // auto-scheduled
+        assertTrue(vault.hasPendingTrigger());
+        vm.expectRevert(bytes(unicode"Trigger already pending / 已有待執行的觸發"));
+        vault.requestProcess();
+    }
+
+    function test_requestProcess_native_rejectsValue() public {
+        vm.deal(address(this), 1 ether);
+        vm.expectRevert(bytes(unicode"Gas pool only for ERC20 quote / 僅 ERC20 報價幣金庫可充值 Gas"));
+        vault.requestProcess{value: 0.01 ether}();
+    }
+
+    function test_requestProcess_belowMinimum_reverts() public {
+        triggerService.setRequestReverts(true);
+        _fund(0.05 ether);
+        triggerService.setRequestReverts(false);
+        vm.expectRevert(bytes(unicode"Pending below minimum plus fee / 待處理低於下限加手續費"));
+        vault.requestProcess();
     }
 }
