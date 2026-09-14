@@ -100,6 +100,9 @@ receive():
 | 预约条件 | `pendingQuote ≥ minProcessAmount + fee` | `pendingQuote ≥ minProcessAmount` 且 `balance ≥ fee` |
 | gas 池初始来源 | 不需要 | 发币时工厂转入创建人的预付款 |
 | gas 池补充 | 不需要 | `process()` 内自动 refill（§6.1）；任何人 `fundGas()` |
+| 预约前提（v3 新增） | `poolReady == true`（myx 池已部署） | 同左 |
+
+**池部署开关（v3 新增，回应 §9 第 4 项）。** myx `deployPool` 实测约 206 万 gas，超过 `getMaxCallbackGas()` 的 200 万，因此池部署永远不能放在回调里。vault 增加一次性闩锁 `poolReady`：关闭时任何唤醒（`receive()` / ping / `requestProcess()`）只记账不预约（`requestProcess()` 直接 revert `Pool not deployed`），并在"本来会预约"的唤醒里读一次 myx 池，发现已部署即闩锁；`ensurePoolDeployed()`（无许可，主网由 MYX 链下服务在累计税收达到约 1000 USD 时调用）部署缺失的池、闩锁，并立即为累积的税收预约一次回调。闩锁后永不重置、永不再探测（myx 池不会被移除），`process()` 也跳过部署检查。事件：`PoolReady(poolId)`。
 
 `trigger(requestId)`：校验 `msg.sender == TriggerService`，忽略陈旧 id，先清在途标记再 `try process()`，回调失败不会卡死后续预约。
 
@@ -182,7 +185,7 @@ if (pendingQuote != 0) { emit ProcessBatched; if (pendingQuote >= minProcessAmou
 1. **预付 gas 的两步流程**：ERC20 quote 下 vault 需要 BNB 付触发费，但发币交易的 `msg.value` 被 Portal 吞掉，我们只能让创建人先向工厂 `prepayGas()`。VaultPortal 有没有计划把多余的 `msg.value` 转发给 `newVault`，或提供"发币时附带原生币给 vault"的通道？这能把两笔交易合成一笔。
 2. **MultiDexRouter 的接口稳定性**：我们从 SwapRegistry 动态读取 `multiDexRouter()` 并调用 `getDEXInfo / computeV3PoolAddress / quoteExactInputSingle / exactInputSingle`。这个合约没有公开文档，是否可以视为稳定接口？SwapRegistry 更换 router 时 ABI 会保持吗？
 3. **Portal 的 quote 路由是否可以暴露 getter**：Portal 已为每个 quote 维护 `SWAP_VIA_ROUTE` 多跳路由（NVDAB 走 USDT 中转，深度更好），但没有读取接口。若能提供 `getQuoteSwapRoute(quote)`，vault 可以直接复用 Flap 的路由并反向执行，不必自己选池。
-4. **回调 gas 上限**：`getMaxCallbackGas()` 2,000,000 不够首次 `process()`（myx `deployPool` + 首次买回 + 分红入账）。我们的做法是发币后先由任何人调用 `ensurePoolDeployed()`。是否有更好的做法，例如回调上限可按 requester 配置？
+4. **回调 gas 上限**：`getMaxCallbackGas()` 2,000,000 不够 myx `deployPool`（实测约 206 万）。v3 的做法是把池部署完全移出回调：`poolReady` 闩锁关闭时不预约任何触发，MYX 链下服务在税收累计到位后调用 `ensurePoolDeployed()` 部署池并打开开关（§5）。回调内的 `process()` 稳态约 90 万 gas。是否有更好的做法，例如回调上限可按 requester 配置？
 5. **ping 语义**：请确认 ping 是否会在同一次 `dispatch()` 中对同一钱包多次发出、是否可能被管理员关闭、以及是否有计划引入 `onFlapRevenue` 类型化回调（V3 NatSpec 提到的 FUTURE EXTENSIONS）。
 6. **`receive()` 2300 gas**：我们用 EIP-1153 transient 标志解决 WBNB `withdraw` 的 2300 gas 限制。Flap 后续新链是否都会启用 Cancun（TLOAD/TSTORE）？Robinhood Chain 是否已支持？
 7. **Robinhood**：Robinhood VaultPortal 目前不支持 ERC20 quote 的 vault 发币，也未做 `vaultQuoteToken()` 校验。是否有升级时间表？
@@ -206,7 +209,8 @@ function fundGas() external payable;                          // 任何人充值
 function process() external;                                  // 仅 vault 自身（trigger 回调）可调用
 function requestProcess() external payable;                   // 任何人：预约触发；ERC20 quote 可附带 BNB 作触发费
 function feedDividend() external;                             // 重试被推迟的分红
-function ensurePoolDeployed() external;                       // 发币后预建 myx 池
+function poolReady() external view returns (bool);           // 自动触发开关（myx 池已部署后闩锁为 true）
+function ensurePoolDeployed() external;                       // 部署 myx 池、打开开关并预约积压税收
 function claimReward() external;  function pendingReward(address) external view returns (uint256);
 function trigger(uint256 requestId) external;                 // ITriggerReceiver
 ```
@@ -230,4 +234,4 @@ function factorySpecVersion() external pure returns (string);   // "v2.3"
 | `gasThreshold` | ≈ 2 次触发费（0.0004 BNB） | |
 | `gasRefillAmount` | ≈ 10 次触发费（0.002 BNB），≤ 工厂 `maxGasRefillAmount`（0.05 BNB） | |
 | 工厂 `minInitialGas` | 0.002 BNB | 发币前预付 |
-| 发币后 | 任何人调用一次 `ensurePoolDeployed()` | 避免首次回调超 200 万 gas |
+| 发币后 | MYX 服务（或任何人）在税收累计到位后调用一次 `ensurePoolDeployed()` | 池部署（约 206 万 gas）不能进回调；在此之前 vault 只累积税收、不预约触发 |

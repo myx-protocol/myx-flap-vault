@@ -69,6 +69,21 @@ contract MyxVaultErc20QuoteTestBase is Test {
         triggerService.setFee(0.001 ether);
 
         vault = _deployVault(_initParams());
+        if (_poolPreDeployed()) _registerPool();
+    }
+
+    /// @dev Suites that test the pool gate override this to start without a pool.
+    function _poolPreDeployed() internal pure virtual returns (bool) {
+        return true;
+    }
+
+    function _registerPool() internal {
+        PoolMetadata memory meta;
+        meta.marketId = marketId;
+        meta.poolId = MyxPoolId.derive(marketId, address(taxToken));
+        meta.baseToken = address(taxToken);
+        meta.basePoolToken = address(lpToken);
+        poolManager.setPool(meta.poolId, meta);
     }
 
     function _initParams() internal view returns (MyxVault.InitParams memory p) {
@@ -611,6 +626,62 @@ contract MyxVaultErc20RequestProcessTest is MyxVaultErc20QuoteTestBase {
         _sendTax(20 ether);
         vm.expectRevert(bytes(unicode"Gas pool below trigger fee / Gas 池低於觸發手續費"));
         vault.requestProcess();
+    }
+
+    receive() external payable {}
+}
+
+/// @dev Pool gate on the ERC20 wake path: a funded gas pool is not enough — the myx pool must exist.
+contract MyxVaultErc20PoolGateTest is MyxVaultErc20QuoteTestBase {
+    function _poolPreDeployed() internal pure override returns (bool) {
+        return false;
+    }
+
+    function test_ping_poolMissing_withGas_noSchedule() public {
+        vault.fundGas{value: 0.01 ether}();
+        _sendTax(20 ether);
+        assertEq(vault.pendingQuote(), 20 ether, "revenue still recognized");
+        assertFalse(vault.poolReady());
+        assertFalse(vault.hasPendingTrigger());
+        assertEq(vault.gasBalance(), 0.01 ether, "no fee spent");
+    }
+
+    function test_ping_poolDeployedLater_schedulesOnNextWake() public {
+        vault.fundGas{value: 0.01 ether}();
+        _sendTax(20 ether);
+        _registerPool();
+        assertTrue(_ping());
+        assertTrue(vault.poolReady());
+        assertTrue(vault.hasPendingTrigger());
+    }
+
+    function test_requestProcess_erc20_poolMissing_reverts() public {
+        _sendTax(20 ether);
+        vm.deal(address(this), 1 ether);
+        vm.expectRevert(bytes(unicode"Pool not deployed / 池尚未部署"));
+        vault.requestProcess{value: 0.01 ether}();
+    }
+
+    function test_ensurePoolDeployed_erc20_schedulesBacklogFromGasPool() public {
+        vault.fundGas{value: 0.01 ether}();
+        _sendTax(20 ether);
+        vault.ensurePoolDeployed();
+        assertEq(poolManager.deployPoolCallCount(), 1);
+        assertTrue(vault.hasPendingTrigger());
+        assertEq(vault.pendingQuote(), 20 ether, "fee paid from the gas pool, not revenue");
+        assertEq(vault.gasBalance(), 0.01 ether - triggerService.getFee());
+    }
+
+    function test_ping_gasUnder100k_withProbe() public {
+        _registerPool();
+        vault.fundGas{value: 0.01 ether}();
+        rwa.mint(address(vault), 20 ether);
+        uint256 g0 = gasleft();
+        (bool ok,) = address(vault).call{value: 0, gas: 100_000}("");
+        uint256 used = g0 - gasleft();
+        assertTrue(ok);
+        assertTrue(vault.poolReady(), "probe + latch + schedule ran inside the ping");
+        assertLt(used, 100_000);
     }
 
     receive() external payable {}

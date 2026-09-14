@@ -87,6 +87,8 @@ contract MyxVaultErc20QuoteForkTest is FlapBSCFixture {
         factory.prepayGas{value: 0.003 ether}();
         token = vaultPortal.newTokenV6WithVault(p);
         vault = MyxVault(payable(vaultPortal.getVault(token).vault));
+        // Off-chain MYX service step: deploy the myx pool, which opens the auto-trigger switch.
+        vault.ensurePoolDeployed();
     }
 
     function test_erc20Quote_endToEnd() public {

@@ -13,7 +13,7 @@ library MyxVaultUISchema {
         schema.vaultType = "MyxVault";
         schema.description =
             unicode"Tax revenue is converted to MYX LP and distributed to holders as dividends. / 稅收轉換為 MYX LP，作為分紅分配給持幣者。";
-        schema.methods = new VaultMethodSchema[](9);
+        schema.methods = new VaultMethodSchema[](11);
 
         schema.methods[0].name = "pendingQuote";
         schema.methods[0].description =
@@ -63,5 +63,16 @@ library MyxVaultUISchema {
         schema.methods[8].description = unicode"BNB reserved for auto-trigger fees. / 保留給自動觸發手續費的 BNB。";
         schema.methods[8].outputs = new FieldDescriptor[](1);
         schema.methods[8].outputs[0] = FieldDescriptor("amount", "uint256", "BNB amount", 18);
+
+        schema.methods[9].name = "poolReady";
+        schema.methods[9].description =
+            unicode"Auto-buyback switch: true once the MYX pool exists. Until then tax accumulates and no buyback is scheduled. / 自動回購開關：MYX 池部署後為 true；在此之前稅收只累積，不預約回購。";
+        schema.methods[9].outputs = new FieldDescriptor[](1);
+        schema.methods[9].outputs[0] = FieldDescriptor("ready", "bool", "Pool deployed", 0);
+
+        schema.methods[10].name = "ensurePoolDeployed";
+        schema.methods[10].description =
+            unicode"Deploy the MYX pool (if missing), open the auto-buyback switch and schedule any accumulated tax. Permissionless; needs ~2.1M gas on first use. / 部署 MYX 池（若尚未部署）、打開自動回購開關並預約已累積的稅收。任何人可調用；首次約需 210 萬 gas。";
+        schema.methods[10].isWriteMethod = true;
     }
 }

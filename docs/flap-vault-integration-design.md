@@ -68,7 +68,7 @@ function computeDividendToken(address predictedToken, bytes calldata hint) exter
 | `feedDividend()` | 任意人 | 把 vault 持有的 LP 喂进 Dividend；`dividendContract==0` 或 `deposit()` 返 false(`totalShares==0`) → 留 LP、`emit DividendDeferred`、下次重试（deferral，绝不 revert 卡死） |
 | `claimReward()` | 任意人 | 代理 `dividend.withdrawDividendsFor(msg.sender)` |
 | `pendingReward(user)` | view | 代理 `dividend.withdrawableDividends(user)`（mBase LP 单位） |
-| `ensurePoolDeployed()` | 任意人 | 可选预建池 |
+| `ensurePoolDeployed()` | 任意人（主网由 MYX 链下服务调用） | 部署 myx 池（约 206 万 gas，超过触发回调上限）、闩锁 `poolReady` 自动触发开关并为积压税收预约触发；开关关闭时 vault 只累积税收、不预约 |
 | `sync()` | 任意人 | 补记未经 `receive()` ping 到账的报价余额（V3 balance-delta 兜底识别） |
 | `fundGas()` | 任意人 | 仅 ERC20 报价金库：充值 BNB gas 池，用于支付 FlapTriggerService 手续费 |
 | `gasBalance()` | view | 金库当前 gas 池余额（原生报价金库恒为 0，其 BNB 全部是收益） |
