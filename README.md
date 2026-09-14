@@ -16,6 +16,9 @@ Supported quotes: native BNB, or any ERC20/RWA quote enabled on the Flap Portal 
 ```
 Flap tax token ──tax(mktBps)──▶ dispatch() ──BNB or ERC20 quote (+ zero-value ping)──▶ MyxVault.receive()
         receive(): balance-delta accounting (Flap spec V3) + best-effort schedule of a delayed process()
+                   — only once poolReady (the myx pool exists); before that tax only accumulates
+        [MYX service / anyone] ensurePoolDeployed(): deploy the myx pool (~2.1M gas, never inside a
+                   callback) → latch poolReady → schedule the accumulated backlog
         creator: factory.prepayGas() before launch (ERC20 quote) → forwarded into the vault gas pool
         [trigger only] process(): sync → (ERC20 quote) refill BNB gas pool via Flap MultiDexRouter
         [anyone] requestProcess(): schedule the trigger callback (never swaps in the caller's tx)
@@ -30,7 +33,15 @@ See [docs/flap-vault-integration-design.md](docs/flap-vault-integration-design.m
 ## Launch parameters
 
 `vaultData = abi.encode(address marketQuoteToken, uint256 minProcessAmount, uint256 gasThreshold, uint256 gasRefillAmount, uint256 maxProcessAmount)`;
-`maxProcessAmount` (>= `minProcessAmount`, quote smallest unit) caps a single `process()` buyback; a larger balance is bought back in successive batches, each `process()` scheduling the next one via FlapTriggerService. Size it to roughly 1 BNB worth of the quote. After launching, call `ensurePoolDeployed()` once so the first trigger callback stays under the service's 2,000,000-gas cap.
+`maxProcessAmount` (>= `minProcessAmount`, quote smallest unit) caps a single `process()` buyback; a larger balance is bought back in successive batches, each `process()` scheduling the next one via FlapTriggerService. Size it to roughly 1 BNB worth of the quote.
+
+## Pool gate (auto-trigger switch)
+
+myx `deployPool` costs about 2.06M gas, above the FlapTriggerService callback cap of 2,000,000, so the pool can never be deployed inside a trigger callback. The vault therefore keeps a one-way switch, `poolReady`:
+
+- While `poolReady == false` no trigger is requested: `receive()` and the ERC20 ping only record revenue, `requestProcess()` reverts with `Pool not deployed`. On each wake that would otherwise schedule, the vault reads the myx pool once and latches the switch if the pool already exists.
+- `ensurePoolDeployed()` (permissionless, called by the MYX service once enough tax has accrued) deploys the pool if missing, latches `poolReady`, and immediately schedules a trigger for the accumulated backlog when it is at or above `minProcessAmount`.
+- Once latched the switch never resets and the vault never checks pool existence again (myx pools are never removed); `process()` skips its deploy check.
 `dividendToken = MAGIC_DIVIDEND_COMPUTED`; `dividendBps = 0`.
 
 ## Risks

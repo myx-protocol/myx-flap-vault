@@ -7,9 +7,10 @@ import {MarketId, PoolId, MyxPoolId, MyxMarketId, PoolMetadata} from "../src/myx
 import {ERC1967Proxy} from "@openzeppelin/proxy/ERC1967/ERC1967Proxy.sol";
 import "./mocks/Mocks.sol";
 
-/// @dev Auto-trigger: receive() schedules a delayed process() through FlapTriggerService.
-///      The callback's process() exercises the first-call deployPool path (worst-case gas).
-contract MyxVaultAutoTriggerTest is Test {
+/// @dev Native-quote auto-trigger fixture. The myx pool is pre-registered (as the off-chain MYX
+///      service does on mainnet) because scheduling is gated on pool existence;
+///      MyxVaultPoolGateTest starts without a pool and covers the gate itself.
+contract MyxVaultAutoTriggerFixture is Test {
     MyxVault vault;
     MockERC20 usdt;
     MockERC20 lpToken;
@@ -40,8 +41,8 @@ contract MyxVaultAutoTriggerTest is Test {
         portal = MockPortal(PORTAL);
         portal.setRate(1000, 1); // 1 BNB -> 1000 tax tokens
 
-        // No pool pre-registration: the callback's process() auto-deploys the pool (worst-case gas).
-        // The mock stamps lpToken as basePoolToken so _feedDividend finds a live ERC20.
+        // deployPool (when a test exercises it) stamps lpToken as basePoolToken so _feedDividend
+        // finds a live ERC20.
         poolManager.setLpTokenForDeploy(address(lpToken));
         dividend.setDividendToken(address(lpToken));
 
@@ -52,6 +53,21 @@ contract MyxVaultAutoTriggerTest is Test {
         triggerService.setFee(0.001 ether);
 
         vault = _deployVault();
+        if (_poolPreDeployed()) _registerPool();
+    }
+
+    /// @dev Suites that test the pool gate override this to start without a pool.
+    function _poolPreDeployed() internal pure virtual returns (bool) {
+        return true;
+    }
+
+    function _registerPool() internal {
+        PoolMetadata memory meta;
+        meta.marketId = marketId;
+        meta.poolId = MyxPoolId.derive(marketId, address(taxToken));
+        meta.baseToken = address(taxToken);
+        meta.basePoolToken = address(lpToken);
+        poolManager.setPool(meta.poolId, meta);
     }
 
     function _deployVault() internal returns (MyxVault) {
@@ -76,6 +92,11 @@ contract MyxVaultAutoTriggerTest is Test {
         assertTrue(ok);
     }
 
+    receive() external payable {}
+}
+
+/// @dev Auto-trigger: receive() schedules a delayed process() through FlapTriggerService.
+contract MyxVaultAutoTriggerTest is MyxVaultAutoTriggerFixture {
     // ── scheduling in receive() ──────────────────────────────────────────────
 
     function test_receive_schedulesWhenAboveThreshold() public {
@@ -201,10 +222,8 @@ contract MyxVaultAutoTriggerTest is Test {
         uint256 g0 = gasleft();
         vault.trigger(id);
         uint256 used = g0 - gasleft();
-        assertLt(used, maxGas, "callback incl. first deployPool must fit maxCallbackGas");
+        assertLt(used, maxGas, "steady-state callback must fit maxCallbackGas");
     }
-
-    receive() external payable {}
 }
 
 /// @dev Batched buyback: a single process() consumes at most maxProcessAmount of pendingQuote and,
@@ -350,5 +369,163 @@ contract MyxVaultTriggerOnlyProcessTest is MyxVaultAutoTriggerTest {
         triggerService.setRequestReverts(false);
         vm.expectRevert(bytes(unicode"Pending below minimum plus fee / 待處理低於下限加手續費"));
         vault.requestProcess();
+    }
+}
+
+/// @dev Pool gate: no trigger is requested until the myx pool exists. The vault probes the pool
+///      only while the `poolReady` latch is unset; once set (by observation or by
+///      ensurePoolDeployed) it never probes again.
+contract MyxVaultPoolGateTest is MyxVaultAutoTriggerFixture {
+    event PoolReady(PoolId poolId);
+
+    function _poolPreDeployed() internal pure override returns (bool) {
+        return false;
+    }
+
+    /// @dev Makes any pool-manager read revert. Armed only around wake paths (receive /
+    ///      requestProcess / ensurePoolDeployed): process() itself legitimately reads the pool
+    ///      metadata for the LP address when feeding the dividend.
+    function _forbidPoolProbe() internal {
+        vm.mockCallRevert(
+            address(poolManager), abi.encodeWithSelector(MockPoolManager.getPool.selector), "pool probed after latch"
+        );
+    }
+
+    function _allowPoolReads() internal {
+        vm.clearMockedCalls();
+    }
+
+    function test_receive_poolMissing_noScheduleNoFee() public {
+        _fund(1 ether);
+        assertFalse(vault.poolReady());
+        assertFalse(vault.hasPendingTrigger(), "no trigger before the pool exists");
+        assertEq(vault.pendingQuote(), 1 ether, "no fee taken");
+        assertEq(poolManager.deployPoolCallCount(), 0, "the vault never deploys on a wake");
+    }
+
+    function test_receive_poolDeployedLater_latchesAndSchedules() public {
+        _fund(1 ether);
+        _registerPool();
+        vm.expectEmit(true, true, true, true);
+        emit PoolReady(MyxPoolId.derive(marketId, address(taxToken)));
+        _fund(1 wei);
+        assertTrue(vault.poolReady());
+        assertTrue(vault.hasPendingTrigger(), "first wake after deployment schedules");
+        assertEq(vault.pendingQuote(), 1 ether + 1 wei - triggerService.getFee());
+    }
+
+    function test_receive_afterLatch_neverProbesAgain() public {
+        _registerPool();
+        _fund(1 ether);
+        assertTrue(vault.poolReady());
+        uint256 id = vault.pendingTriggerId();
+        vm.warp(block.timestamp + 61);
+        vm.prank(TRIGGER_SERVICE);
+        vault.trigger(id);
+        assertEq(vault.pendingQuote(), 0);
+        assertEq(poolManager.deployPoolCallCount(), 0, "callback never deploys once latched");
+        _forbidPoolProbe();
+        _fund(1 ether);
+        assertTrue(vault.hasPendingTrigger(), "re-scheduled without probing the pool");
+    }
+
+    function test_receive_latchSurvivesFailedSchedule() public {
+        _registerPool();
+        triggerService.setRequestReverts(true);
+        _fund(1 ether);
+        assertTrue(vault.poolReady(), "latch persists even though scheduling failed");
+        assertFalse(vault.hasPendingTrigger());
+        triggerService.setRequestReverts(false);
+        _forbidPoolProbe();
+        _fund(1 wei);
+        assertTrue(vault.hasPendingTrigger());
+    }
+
+    function test_ensurePoolDeployed_deploysLatchesAndSchedulesBacklog() public {
+        _fund(1 ether);
+        assertFalse(vault.hasPendingTrigger());
+        vm.expectEmit(true, true, true, true);
+        emit PoolReady(MyxPoolId.derive(marketId, address(taxToken)));
+        vm.prank(makeAddr("myx-service"));
+        vault.ensurePoolDeployed();
+        assertEq(poolManager.deployPoolCallCount(), 1);
+        assertTrue(vault.poolReady());
+        assertTrue(vault.hasPendingTrigger(), "backlog above minimum is scheduled right away");
+        assertEq(vault.pendingQuote(), 1 ether - triggerService.getFee());
+    }
+
+    function test_ensurePoolDeployed_noBacklog_latchesWithoutSchedule() public {
+        vault.ensurePoolDeployed();
+        assertTrue(vault.poolReady());
+        assertFalse(vault.hasPendingTrigger());
+        _fund(1 ether);
+        assertTrue(vault.hasPendingTrigger(), "switch is open: the next tax receipt schedules");
+    }
+
+    function test_ensurePoolDeployed_backlogBelowMinimum_noSchedule() public {
+        _fund(0.05 ether);
+        vault.ensurePoolDeployed();
+        assertTrue(vault.poolReady());
+        assertFalse(vault.hasPendingTrigger());
+        assertEq(vault.pendingQuote(), 0.05 ether);
+    }
+
+    function test_ensurePoolDeployed_secondCall_noReprobeNoRedeploy() public {
+        vault.ensurePoolDeployed();
+        _forbidPoolProbe();
+        vault.ensurePoolDeployed();
+        assertEq(poolManager.deployPoolCallCount(), 1);
+    }
+
+    function test_ensurePoolDeployed_poolAlreadyExists_latchesOnly() public {
+        _registerPool();
+        vault.ensurePoolDeployed();
+        assertEq(poolManager.deployPoolCallCount(), 0);
+        assertTrue(vault.poolReady());
+    }
+
+    function test_requestProcess_poolMissing_reverts() public {
+        _fund(1 ether);
+        vm.expectRevert(bytes(unicode"Pool not deployed / 池尚未部署"));
+        vault.requestProcess();
+        assertFalse(vault.poolReady());
+    }
+
+    function test_requestProcess_poolDeployed_latchesAndSchedules() public {
+        _fund(1 ether);
+        _registerPool();
+        vault.requestProcess();
+        assertTrue(vault.poolReady());
+        assertTrue(vault.hasPendingTrigger());
+    }
+
+    function test_scheduleProcess_requiresLatch() public {
+        _fund(1 ether);
+        _registerPool(); // pool exists, but scheduleProcess itself never probes: the latch decides
+        vm.prank(address(vault));
+        vm.expectRevert(bytes(unicode"Pool not deployed / 池尚未部署"));
+        vault.scheduleProcess();
+    }
+
+    function test_process_batchFollowUp_afterLatch_noReprobe() public {
+        _registerPool();
+        MyxVault impl = new MyxVault();
+        MyxVault.InitParams memory p;
+        p.taxToken = address(taxToken);
+        p.creator = creator;
+        p.marketQuoteToken = address(usdt);
+        p.poolManager = address(poolManager);
+        p.basePool = address(basePool);
+        p.maxSlippageBps = 300;
+        p.minProcessAmount = 0.1 ether;
+        p.maxProcessAmount = 0.5 ether;
+        vault = MyxVault(payable(address(new ERC1967Proxy(address(impl), abi.encodeCall(MyxVault.initialize, (p))))));
+        _fund(1 ether);
+        uint256 id = vault.pendingTriggerId();
+        vm.warp(block.timestamp + 61);
+        vm.prank(TRIGGER_SERVICE);
+        vault.trigger(id);
+        assertTrue(vault.hasPendingTrigger(), "follow-up batch scheduled");
+        assertEq(poolManager.deployPoolCallCount(), 0, "batches never re-check or deploy the pool");
     }
 }

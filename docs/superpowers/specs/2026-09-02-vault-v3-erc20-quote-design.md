@@ -39,7 +39,8 @@ VaultPortal ──newVault(taxToken, quote, creator, vaultData)──▶ 工厂�
 Flap TaxProcessor.dispatch()
    ├─ native quote: BNB value transfer ──▶ receive()
    └─ ERC20 quote:  ERC20 transfer + zero-value ping ──▶ receive()
-receive(): _sync() 余额差值记账（轻量，不外呼 DEX）；满足条件则 try scheduleProcess()
+receive(): _sync() 余额差值记账（轻量，不外呼 DEX）；满足条件且 poolReady 则 try scheduleProcess()
+ensurePoolDeployed() [无许可；主网由 MYX 链下服务调用]: 部署 myx 池 → 闩锁 poolReady → 为积压税收预约触发
 process() [仅 trigger() 回调可执行，2026-09-13 起；手动入口 requestProcess()]:
    _sync()
    ├─ ERC20 quote 且 gas 池 < gasThreshold ──▶ _refillGas(): quote → WBNB → BNB（Flap MultiDexRouter 自动选池）
@@ -97,7 +98,7 @@ function _sync() internal returns (uint256 newRevenue) {
 }
 receive() external payable {
     _sync();
-    if (!hasPendingTrigger && pendingQuote >= minProcessAmount) { try this.scheduleProcess() {} catch {} }
+    if (!hasPendingTrigger && pendingQuote >= minProcessAmount && _probePoolReady()) { try this.scheduleProcess() {} catch {} }
 }
 function sync() external { _sync(); }
 ```
@@ -128,6 +129,26 @@ function fundGas() external payable { require(quoteToken != address(0)); emit Ga
 
 - ERC20 quote 的 vault 在 `newVault` 时收到创建人的预付 gas（见 §4.2），首批税收即可自动预约。若预付耗尽且 refill 尚未发生，`receive()` 只记账不预约，任何人可手动 `process()`（内部 refill 后恢复自动预约）或 `fundGas()`。
 - `trigger()` 回调逻辑不变（清标记 → try process）。
+
+**池部署开关（2026-09-14）**
+
+myx `deployPool` 实测约 2.06M gas，超过 FlapTriggerService 的 2M 回调上限，池部署不能进回调，也不拆成单独的触发任务（决定：链下 MYX 服务在税收累计约 1000 USD 时部署）。vault 只依据"池是否已部署"决定是否预约：
+
+```solidity
+bool public poolReady;                       // 一次性闩锁，与 hasPendingTrigger / quoteToken 同槽
+function _probePoolReady() internal returns (bool) {   // 只在未闩锁时读池，发现即闩锁，从不部署
+    if (poolReady) return true;
+    if (poolManager.getPool(poolId).basePoolToken == address(0)) return false;
+    poolReady = true; emit PoolReady(poolId); return true;
+}
+scheduleProcess(): require(poolReady)        // 不变量：有在途触发 ⇒ 池已部署
+requestProcess(): require(_probePoolReady(), "Pool not deployed / 池尚未部署")
+ensurePoolDeployed(): _ensurePoolExists()（部署缺失的池并闩锁）→ _sync() → 积压 ≥ minProcessAmount 则 try scheduleProcess()
+_ensurePoolExists(): poolReady 已置位则直接返回（process() 内不再探测）
+```
+
+- 探测放在预约 try/catch 之外：预约失败（无 gas、服务不可用）不会撤销闩锁。
+- 闩锁后不再读池：myx 池不会被移除；若极端情况下 deposit 失败，`process()` revert、税收留存，不会丢资金。
 
 **gas 补充腿（仅 ERC20 quote）**
 
@@ -190,7 +211,7 @@ function _refillGas() internal {
 
 ## 5. 数据流与状态
 
-状态变量：`pendingQuote`（基线）、gas 池（`address(this).balance`，仅 ERC20 quote 有意义）、`hasPendingTrigger / pendingTriggerId`、`totalLpMinted / totalRewardsForwarded`。
+状态变量：`pendingQuote`（基线）、gas 池（`address(this).balance`，仅 ERC20 quote 有意义）、`hasPendingTrigger / pendingTriggerId`、`poolReady`（一次性闩锁）、`totalLpMinted / totalRewardsForwarded`。
 
 不变量：
 
@@ -199,6 +220,7 @@ function _refillGas() internal {
 3. 任何出账函数结束时 `pendingQuote` 已按出账额扣减。
 4. `receive()` 只做记账、事件、一次 try 自调用；不调用 DEX。
 5. `vaultQuoteToken()` 初始化后不可变、不 revert。
+6. `hasPendingTrigger ⇒ poolReady`；`poolReady` 一旦为 true 永不回退。
 
 ## 6. 错误处理
 
@@ -225,6 +247,7 @@ function _refillGas() internal {
 - ERC20 quote：process 买回走 ERC20 输入并 approve；refill 触发/不触发条件；无池时跳过；refill 后剩余低于阈值时跳过买回；`fundGas` 仅 ERC20 允许；scheduleProcess 从 gas 池付费。
 - 工厂：`isQuoteTokenSupported` 按链与 Portal 配置；vaultData 校验；`resolveDividendToken` 回归；预付 gas：累加、取回、ERC20 quote 发币时低于 `minInitialGas` 拒绝、达标时全额转入 vault 且记账清零、native quote 时不动预存。
 - `receive()` gas 断言维持 ≤ 1,000,000。
+- 池开关：无池时唤醒不预约、不扣费；池后部署则下一次唤醒闩锁并预约；预约失败闩锁仍保留；`ensurePoolDeployed` 部署 + 闩锁 + 预约积压（低于下限不预约）、二次调用不再读池；`requestProcess` 无池 revert；`scheduleProcess` 只看闩锁。
 
 fork（BSC 主网）：
 

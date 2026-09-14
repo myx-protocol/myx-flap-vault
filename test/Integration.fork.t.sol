@@ -106,8 +106,8 @@ contract MyxVaultForkTest is FlapBSCFixture {
         );
 
         // NOTE: no pool pre-registration. The pool key is derived from the LAUNCHED token
-        // address (unknown until the test runs), and process() must prove the
-        // auto-deploy path via poolManager.deployPool().
+        // address (unknown until the test runs); each test calls ensurePoolDeployed() after the
+        // launch, as the off-chain MYX service does, which opens the auto-trigger switch.
 
         vm.label(WBNB, "WBNB");
         vm.label(PANCAKE_ROUTER, "PancakeRouter");
@@ -163,6 +163,12 @@ contract MyxVaultForkTest is FlapBSCFixture {
         // The creator role is granted to the token creator (the msg.sender of the VaultPortal
         // launch — this test contract). Verify the launch attribution.
         assertEq(vault.creator(), address(this), "creator must be the launch msg.sender");
+
+        // 1b. Off-chain MYX service step: deploy the myx pool. Auto-triggering stays off until
+        //     this has happened (pool gate); deployPool (~2.06M gas) can never fit a callback.
+        assertFalse(vault.poolReady(), "pool gate must start closed");
+        vault.ensurePoolDeployed();
+        assertTrue(vault.poolReady(), "ensurePoolDeployed must open the gate");
 
         // 2. Trade to generate tax: buy on the bonding curve, then sell half back.
         vm.deal(address(this), 10 ether);
@@ -222,8 +228,8 @@ contract MyxVaultForkTest is FlapBSCFixture {
         // (quoted * (1 - 5%)), otherwise process() would have reverted inside the Portal.
         assertGe(deposited, (quoted * 9_500) / 10_000, "received below the vault's own minOut bound");
 
-        // Auto-deploy happened exactly once for the token-keyed pool (no pre-registration).
-        assertEq(poolManager.deployPoolCallCount(), 1, "pool auto-deploy must run exactly once");
+        // The pool was deployed exactly once, by ensurePoolDeployed (never inside a callback).
+        assertEq(poolManager.deployPoolCallCount(), 1, "pool deploy must run exactly once");
     }
 
     /// @dev Accept BNB so the EOA-style test contract can fund itself / receive trade proceeds.

@@ -88,6 +88,8 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
     event RevenueReceived(uint256 amount, uint256 pendingTotal);
     event RevenueProcessed(uint256 quoteAmount, uint256 baseAmount, uint256 lpMinted);
     event PoolDeployed(PoolId poolId);
+    /// @notice The auto-trigger switch opened: the myx pool exists and triggers may be requested.
+    event PoolReady(PoolId poolId);
     /// @notice Emitted when the vault's mBase LP balance is successfully fed into the Dividend
     ///         contract. `lpFed` is the LP amount distributed to holders.
     event DividendFed(uint256 lpFed);
@@ -146,6 +148,12 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
 
     /// @notice Revenue currency (address(0) = native gas token). Immutable after initialize.
     address public quoteToken;
+    /// @notice Auto-trigger switch, latched once: false until the myx pool for this token is known to
+    ///         exist (observed on a wake, or deployed by ensurePoolDeployed), then true forever. While
+    ///         false no trigger is requested — the first callback would otherwise have to pay
+    ///         deployPool (~2.06M gas), above the service's callback cap — and the pool is probed
+    ///         once per eligible wake; once true the pool is never probed again.
+    bool public poolReady;
     /// @notice ERC20 quote only: refill the BNB gas pool below this balance (wei).
     uint256 public gasThreshold;
     /// @notice ERC20 quote only: gas pool target after a refill (wei).
@@ -155,8 +163,8 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
     uint256 public maxProcessAmount;
 
     /// @dev Reserved storage for upgrades. 44 original - 2 (trigger) - 2 (gasThreshold,
-    ///      gasRefillAmount; quoteToken packs into the hasPendingTrigger slot) - 1 (maxProcessAmount)
-    ///      = 39. Verified with `forge inspect MyxVault storage-layout`.
+    ///      gasRefillAmount; quoteToken and poolReady pack into the hasPendingTrigger slot)
+    ///      - 1 (maxProcessAmount) = 39. Verified with `forge inspect MyxVault storage-layout`.
     uint256[39] private __gap;
 
     /// @dev Set only while executeGasRefill is unwrapping WBNB, so receive() can recognise the BNB
@@ -245,7 +253,8 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
     receive() external payable {
         if (_unwrapping) return;
         _sync();
-        if (!hasPendingTrigger && pendingQuote >= minProcessAmount && !_reentrancyGuardEntered()) {
+        // The pool probe is last so it runs only on a wake that would otherwise schedule.
+        if (!hasPendingTrigger && pendingQuote >= minProcessAmount && !_reentrancyGuardEntered() && _probePoolReady()) {
             try this.scheduleProcess() {} catch {}
         }
     }
@@ -279,6 +288,9 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
     ///         ERC20 quote: the fee is paid from the BNB gas pool; pendingQuote is untouched.
     function scheduleProcess() external {
         require(msg.sender == address(this), unicode"Caller must be the vault itself / 僅限金庫自身調用");
+        // Invariant: a trigger is only ever requested after the pool is known to exist, so process()
+        // never has to deploy it inside a gas-capped callback. Callers latch via _probePoolReady().
+        require(poolReady, unicode"Pool not deployed / 池尚未部署");
         IFlapTriggerService service = IFlapTriggerService(_getTriggerService());
         uint256 fee = service.getFee();
         if (quoteToken == address(0)) {
@@ -342,6 +354,7 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
         }
         _sync();
         require(!hasPendingTrigger, unicode"Trigger already pending / 已有待執行的觸發");
+        require(_probePoolReady(), unicode"Pool not deployed / 池尚未部署");
         this.scheduleProcess();
     }
 
@@ -458,10 +471,19 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
         emit DividendFed(bal);
     }
 
-    /// @notice Deploys the myx pool for this token if missing. Permissionless pre-deploy so the heavy
-    ///         deployPool gas can be paid out-of-band rather than inside the first process() call.
+    /// @notice Deploys the myx pool for this token if missing and opens the auto-trigger switch.
+    ///         Permissionless: the heavy deployPool gas (~2.06M, above the trigger service's
+    ///         callback cap) is paid out-of-band — on mainnet by the MYX service once enough tax
+    ///         has accrued. Revenue that accumulated while the switch was closed is scheduled here,
+    ///         since no further tax receipt may arrive to wake the vault. Same best-effort
+    ///         scheduling as receive(): a failed request leaves the backlog for the next wake or
+    ///         requestProcess().
     function ensurePoolDeployed() external nonReentrant {
         _ensurePoolExists();
+        _sync();
+        if (!hasPendingTrigger && pendingQuote >= minProcessAmount) {
+            try this.scheduleProcess() {} catch {}
+        }
     }
 
     /// @notice Claim proxy: claims the caller's mBase LP dividend on their behalf
@@ -707,6 +729,7 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
     }
 
     function _ensurePoolExists() internal {
+        if (poolReady) return; // latched: myx pools are never removed, so no re-probe
         PoolMetadata memory pool = poolManager.getPool(poolId);
         // basePoolToken is the deposit-readiness signal: myx deployPool atomically deploys the LP
         // token, so a registered pool always has it set.
@@ -714,6 +737,19 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
             poolManager.deployPool(IMyxPoolManager.DeployPoolParams({marketId: marketId, baseToken: taxToken}));
             emit PoolDeployed(poolId);
         }
+        poolReady = true;
+        emit PoolReady(poolId);
+    }
+
+    /// @dev Auto-trigger switch: true once the myx pool exists. Probes the pool manager only while
+    ///      unlatched and latches on the first sighting; never deploys. Called by the wake paths
+    ///      OUTSIDE the scheduling try/catch so the latch persists even when the request fails.
+    function _probePoolReady() internal returns (bool) {
+        if (poolReady) return true;
+        if (poolManager.getPool(poolId).basePoolToken == address(0)) return false;
+        poolReady = true;
+        emit PoolReady(poolId);
+        return true;
     }
 
     function _nativeSymbol() internal view returns (string memory) {
