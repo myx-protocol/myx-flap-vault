@@ -149,6 +149,15 @@ contract MyxVaultErc20AccountingTest is MyxVaultErc20QuoteTestBase {
         assertEq(address(vault).balance, 1 ether);
     }
 
+    /// @dev Audit round 1, Finding 4: initialize re-validates the slippage bound (defense in depth).
+    function test_initialize_slippageAboveCap_reverts() public {
+        MyxVault.InitParams memory p = _initParams();
+        p.maxSlippageBps = 1_001;
+        MyxVault impl = new MyxVault();
+        vm.expectRevert(bytes(unicode"Slippage above 10% / 滑點超過 10%"));
+        new ERC1967Proxy(address(impl), abi.encodeCall(MyxVault.initialize, (p)));
+    }
+
     function test_ping_gasUnder100k() public {
         rwa.mint(address(vault), 5 ether);
         uint256 g0 = gasleft();
@@ -563,6 +572,18 @@ contract MyxVaultErc20BatchedProcessTest is MyxVaultErc20QuoteTestBase {
         MyxVault.InitParams memory p = _initParams();
         p.maxProcessAmount = 30 ether; // 30 RWA per batch
         vault = _deployVault(p);
+    }
+
+    /// @dev Audit round 1, Finding 9: the refill cap is 20% of the batch actually processed
+    ///      (min(pendingQuote, maxProcessAmount)), not 20% of the whole backlog. 100 RWA backlog,
+    ///      30 RWA batch: linear sizing wants 16.7 RWA for the 0.05 BNB target, cap = 6 RWA.
+    function test_process_refillCappedAtShareOfBatch_notBacklog() public {
+        _sendTax(100 ether); // no gas -> no schedule; gas pool empty -> refill runs
+        vm.prank(address(vault));
+        vault.process();
+        assertEq(router.lastAmountIn(), 6 ether, "20% of the 30 RWA batch, not of the 100 RWA backlog");
+        assertEq(vault.pendingQuote(), 100 ether - 6 ether - 30 ether, "refill + one batch consumed");
+        assertEq(basePool.lastDepositAmount(), 30_000 ether);
     }
 
     function test_process_capsAtMax_followUpPaidFromGasPool() public {

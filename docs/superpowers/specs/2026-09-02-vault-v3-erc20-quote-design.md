@@ -190,7 +190,7 @@ function _refillGas() internal {
 
 ### 4.2 MyxVaultFactory
 
-- `GlobalConfig` 去掉 `minProcessAmount`（移入 vaultData）；保留 `poolManager / basePool / poolFactory / maxSlippageBps`（构造函数校验 `<= 10_000`）；新增 `maxGasRefillAmount`（wei，ERC20 quote 下创建人 `gasRefillAmount` 的上限，BSC 取 0.05 BNB、Robinhood 取 0）与 `minInitialGas`（wei，ERC20 quote 发币前必须预付的最低 BNB，建议取 FlapTriggerService 当前手续费的 10 倍，BSC 约 0.002 BNB）。
+- `GlobalConfig` 去掉 `minProcessAmount`（移入 vaultData）；保留 `poolManager / basePool / poolFactory / maxSlippageBps`（构造函数校验 `<= MAX_SLIPPAGE_BPS = 1_000`，vault 初始化再校验一次；2026-09-15 审计 Finding 4）；新增 `maxGasRefillAmount`（wei，ERC20 quote 下创建人 `gasRefillAmount` 的上限，BSC 取 0.05 BNB、Robinhood 取 0）与 `minInitialGas`（wei，ERC20 quote 发币前必须预付的最低 BNB，建议取 FlapTriggerService 当前手续费的 10 倍，BSC 约 0.002 BNB）。
 - **预付 gas**：
   - `prepayGas() external payable`：`prepaidGas[msg.sender] += msg.value`，任何地址可为自己预存，可多次累加。
   - `withdrawPrepaidGas()`：CEI 顺序全额退回 `prepaidGas[msg.sender]`。

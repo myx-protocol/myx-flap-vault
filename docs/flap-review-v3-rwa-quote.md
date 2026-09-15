@@ -128,7 +128,7 @@ if (pendingQuote != 0) { emit ProcessBatched; if (pendingQuote >= minProcessAmou
 
 - 地址全部运行时解析：`taxToken.taxProcessor().swapRegistry()` → `multiDexRouter()`、`weth()`；`dexId` 取 `Portal.getQuoteTokenConfiguration(quote).dexId`。vault 内不硬编码任何新地址。
 - 选池：遍历 `router.getDEXInfo(dexId).v3SupportedFees`，`computeV3PoolAddress` 有代码的档位才 `quoteExactInputSingle`（try/catch），取最优输出。创建人无需指定费率。
-- 用量：`needed = gasRefillAmount − balance`，按最优报价线性反推 `quoteIn`，**硬上限 20%**（`MAX_REFILL_SHARE_BPS = 2000`），只能补一部分时补一部分。
+- 用量：`needed = gasRefillAmount − balance`，按最优报价线性反推 `quoteIn`，**硬上限为本批（`min(pendingQuote, maxProcessAmount)`）的 20%**（`MAX_REFILL_SHARE_BPS = 2000`），只能补一部分时补一部分。
 - 执行：`executeGasRefill()` 自调用 + try/catch，内部依次扣基线、approve、`exactInputSingle`、清 approve、`WBNB.withdraw`。任何失败整体回滚并发 `GasRefillSkipped`，买回照常进行。
 - 解析 venue 失败（`swapVenue()` revert 或返回零地址）同样跳过。
 
@@ -152,7 +152,9 @@ if (pendingQuote != 0) { emit ProcessBatched; if (pendingQuote >= minProcessAmou
 
 ## 7. 应急与升级
 
-- `EMERGENCY_ROLE`：Guardian 与 creator。`emergencyWithdraw`（LP 赎回）、`emergencySweepNative`（原生 quote 时清税并清基线；ERC20 quote 时只清 gas 池）、`emergencyRescueToken`（rescue quote 时清基线）。
+- `EMERGENCY_ROLE`：仅 Guardian（v4 起；creator 不再持有任何角色，因为应急函数都能转移持币者的税收）。`emergencyWithdraw`（LP 赎回）、`emergencySweepNative`（原生 quote 时清税并清基线；ERC20 quote 时只清 gas 池）、`emergencyRescueToken`（rescue quote 时清基线）。
+- 转发开关（v4 新增，Flap rescue mechanism (b)）：Guardian 调用 `setForward(address)` 后，`receive()` 把所有到账 BNB 用不 revert 的低层调用转到该地址并直接返回，不记账、不预约；上游 dispatch 不会因此失败。置零即关闭，恢复正常记账。
+- 滑点上限：`maxSlippageBps ≤ MAX_SLIPPAGE_BPS = 1000`（10%），工厂构造与 vault 初始化双重校验，minOut 不可能被配置成 0。
 - Guardian 角色不可被他人撤销（Flap 规范）；beacon 升级权限仅 Guardian，可永久锁定。
 - 工厂持有的预付款按地址记账，只能本人取回或在本人发币时转入本人的 vault；工厂没有 `receive()`，余额恒等于预付款总和。
 
@@ -190,7 +192,7 @@ if (pendingQuote != 0) { emit ProcessBatched; if (pendingQuote >= minProcessAmou
 6. **`receive()` 2300 gas**：我们用 EIP-1153 transient 标志解决 WBNB `withdraw` 的 2300 gas 限制。Flap 后续新链是否都会启用 Cancun（TLOAD/TSTORE）？Robinhood Chain 是否已支持？
 7. **Robinhood**：Robinhood VaultPortal 目前不支持 ERC20 quote 的 vault 发币，也未做 `vaultQuoteToken()` 校验。是否有升级时间表？
 8. **RWA 代币特性**：bStocks 类代币是否存在转账限制、黑名单或暂停机制？vault 在 dispatch 与 `process()` 之间会短暂持有 quote，若被冻结会影响买回。
-9. **Rule 001 参数面**：`minProcessAmount / gasThreshold / gasRefillAmount` 由创建人在 vaultData 给出、发币后不可改，工厂只校验 `!= 0`、`refill > threshold`、`refill ≤ maxGasRefillAmount`。创建人最坏能做的是把每批最多 20% 的税转成只有 EMERGENCY_ROLE 能取的 BNB，而 creator 本来就持有 EMERGENCY_ROLE。这样的参数面是否符合 Flap 对 Rule 001 的要求？
+9. **Rule 001 参数面**：`minProcessAmount / gasThreshold / gasRefillAmount` 由创建人在 vaultData 给出、发币后不可改，工厂只校验 `!= 0`、`refill > threshold`、`refill ≤ maxGasRefillAmount`。创建人最坏能做的是把每批（`min(pendingQuote, maxProcessAmount)`）最多 20% 的税转成只有 Guardian 能取的 BNB，creator 自己拿不到。这样的参数面是否符合 Flap 对 Rule 001 的要求？
 10. **20% refill 上限**是否合理，或者 Flap 是否推荐某种价格参考来做更精确的 minOut？
 11. **单批上限 `maxProcessAmount`**：预审建议单笔买回 ≤ 约 1 BNB。该上限以 quote 最小单位由创建人配置，工厂无法用统一的 BNB 值约束不同 quote（USD、XAUT 精度各异）。Flap 是否有推荐的换算方式，或希望工厂增加按 quote 的全局上限表？
 

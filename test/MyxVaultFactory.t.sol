@@ -479,19 +479,22 @@ contract MyxVaultFactoryTest is Test {
         strict.newVault(makeAddr("tax2"), address(rwa), address(this), _erc20VaultData());
     }
 
-    function test_constructor_rejectsSlippageAbove100Percent() public {
+    /// @dev Audit round 1, Finding 4: the slippage tolerance is bounded to MAX_SLIPPAGE_BPS (10%),
+    ///      so minOut can never be disabled by configuration.
+    function test_constructor_rejectsSlippageAboveCap() public {
         MyxVaultFactory.GlobalConfig memory c = _baseConfig();
-        c.maxSlippageBps = 10_001;
-        vm.expectRevert(bytes(unicode"Slippage above 100% / 滑點超過 100%"));
+        c.maxSlippageBps = 1_001;
+        vm.expectRevert(bytes(unicode"Slippage above 10% / 滑點超過 10%"));
         new MyxVaultFactory(c);
     }
 
-    function test_constructor_acceptsSlippageAt100Percent() public {
+    function test_constructor_acceptsSlippageAtCap() public {
         MyxVaultFactory.GlobalConfig memory c = _baseConfig();
-        c.maxSlippageBps = 10_000;
+        c.maxSlippageBps = 1_000;
         MyxVaultFactory f = new MyxVaultFactory(c);
         (,,, uint16 bps,,) = f.config();
-        assertEq(bps, 10_000);
+        assertEq(bps, 1_000);
+        assertEq(f.MAX_SLIPPAGE_BPS(), 1_000);
     }
 }
 

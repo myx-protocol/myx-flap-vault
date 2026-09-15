@@ -76,14 +76,18 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
     uint16 public constant BPS_DENOMINATOR = 10_000;
     /// @notice Delay between a tax receipt and the auto-scheduled process() (seconds).
     uint64 public constant PROCESS_DELAY = 60;
-    /// @notice Hard cap on the gas-refill leg: at most this share of pendingQuote may be sold for
-    ///         BNB in a single process() call, regardless of the linear size estimate. The refill
+    /// @notice Hard cap on the gas-refill leg: at most this share of the batch a process() call
+    ///         will buy back (min(pendingQuote, maxProcessAmount)) may be sold for BNB in that call,
+    ///         regardless of the linear size estimate. The refill
     ///         leg uses no external price reference (by design — see _refillGas), so a thinned or
     ///         sandwiched pool could otherwise make the sizing estimate demand up to all of
     ///         pendingQuote for a fixed ~gasRefillAmount of BNB; this bounds that per-batch loss to
     ///         20% of the batch. A capped refill is partial by design — the shortfall is retried on
     ///         the next process() call.
     uint16 public constant MAX_REFILL_SHARE_BPS = 2000;
+    /// @notice Upper bound on maxSlippageBps (10%); mirrors MyxVaultFactory.MAX_SLIPPAGE_BPS so a
+    ///         vault can never be initialized with a tolerance that disables minOut.
+    uint16 public constant MAX_SLIPPAGE_BPS = 1_000;
 
     event RevenueReceived(uint256 amount, uint256 pendingTotal);
     event RevenueProcessed(uint256 quoteAmount, uint256 baseAmount, uint256 lpMinted);
@@ -102,6 +106,11 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
     ///         mBase LP, residual tax tokens, or any accidentally sent token — including cases where
     ///         the myx pool's withdraw path is unusable.
     event EmergencyTokenRescued(address indexed token, address to, uint256 amount);
+    /// @notice Guardian changed the receive() forward address (zero = switch off).
+    event ForwardUpdated(address indexed to);
+    /// @notice receive() forwarded incoming BNB while the switch was on. `ok == false` means the
+    ///         target refused it and the BNB stayed in the vault (recognized once the switch is off).
+    event RevenueForwarded(address indexed to, uint256 amount, bool ok);
     /// @notice Emitted when receive() schedules a delayed process() via FlapTriggerService.
     event ProcessScheduled(uint256 requestId, uint64 executeAfter);
     /// @notice Emitted when the trigger callback runs; `success` is process()'s try/catch outcome.
@@ -161,11 +170,17 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
     /// @notice Per-call buyback cap (quote base units). Bounds the sandwich exposure of a single
     ///         process() after any accumulation; the remainder is processed in follow-up batches.
     uint256 public maxProcessAmount;
+    /// @notice Guardian rescue switch (Flap rescue mechanism, facet b). While non-zero, receive()
+    ///         forwards every incoming BNB to this address through a non-reverting low-level call
+    ///         and returns before any accounting or scheduling, so upstream tax dispatch keeps
+    ///         working during an incident. Zero (default) = normal operation.
+    address public forwardTo;
 
     /// @dev Reserved storage for upgrades. 44 original - 2 (trigger) - 2 (gasThreshold,
     ///      gasRefillAmount; quoteToken and poolReady pack into the hasPendingTrigger slot)
-    ///      - 1 (maxProcessAmount) = 39. Verified with `forge inspect MyxVault storage-layout`.
-    uint256[39] private __gap;
+    ///      - 1 (maxProcessAmount) - 1 (forwardTo) = 38. Verified with
+    ///      `forge inspect MyxVault storage-layout`.
+    uint256[38] private __gap;
 
     /// @dev Set only while executeGasRefill is unwrapping WBNB, so receive() can recognise the BNB
     ///      coming back from the wrapper and return before doing anything expensive. EIP-1153
@@ -201,6 +216,7 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
         poolId = MyxPoolId.derive(marketId, p.taxToken);
         poolManager = IMyxPoolManager(p.poolManager);
         basePool = IMyxBasePool(p.basePool);
+        require(p.maxSlippageBps <= MAX_SLIPPAGE_BPS, unicode"Slippage above 10% / 滑點超過 10%");
         maxSlippageBps = p.maxSlippageBps;
         minProcessAmount = p.minProcessAmount;
 
@@ -224,10 +240,12 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
         );
         maxProcessAmount = p.maxProcessAmount;
 
+        // Guardian-only privileges. The creator is recorded for attribution but holds NO role:
+        // every emergency path can move holder-bound revenue, and a token launcher must not be
+        // able to divert it (audit round 1, Finding 3).
         address guardian = _getGuardian();
         _grantRole(DEFAULT_ADMIN_ROLE, guardian);
         _grantRole(EMERGENCY_ROLE, guardian);
-        _grantRole(EMERGENCY_ROLE, p.creator);
     }
 
     /// @inheritdoc VaultBaseV3
@@ -252,6 +270,14 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
     ///      and for an ERC20 quote _sync() reads the token balance, which the unwrap does not move.
     receive() external payable {
         if (_unwrapping) return;
+        address fwd = forwardTo;
+        if (fwd != address(0)) {
+            // Rescue mode: redirect, never revert (a revert here would break every upstream tax
+            // dispatch). No accounting, no scheduling; the forwarded BNB is not vault revenue.
+            (bool ok,) = fwd.call{value: msg.value}("");
+            emit RevenueForwarded(fwd, msg.value, ok);
+            return;
+        }
         _sync();
         // The pool probe is last so it runs only on a wake that would otherwise schedule.
         if (!hasPendingTrigger && pendingQuote >= minProcessAmount && !_reentrancyGuardEntered() && _probePoolReady()) {
@@ -361,11 +387,11 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
     /// @dev FlapTriggerService address per chain — hardcoded like _getPortal/_getGuardian.
     ///      Robinhood testnet (46630) has a live service but no Portal/Guardian, so it is omitted
     ///      here too: scheduling on a chain whose vault cannot initialize is dead weight.
-    function _getTriggerService() internal view returns (address) {
-        if (block.chainid == 56) return 0xcf4EE25035CF883895110f367F5BA8172416a7F9;
-        else if (block.chainid == 97) return 0x560E9830926C9e0EB98a59c6b9902383Fc0D9Eb2;
-        else if (block.chainid == 4663) return 0xD3421B1b616a72bB88993A0cf75709BB8D532cc1;
-        revert(unicode"Trigger service not configured / 觸發服務未配置");
+    function _getTriggerService() internal view returns (address service) {
+        if (block.chainid == 56) service = 0xcf4EE25035CF883895110f367F5BA8172416a7F9;
+        else if (block.chainid == 97) service = 0x560E9830926C9e0EB98a59c6b9902383Fc0D9Eb2;
+        else if (block.chainid == 4663) service = 0xD3421B1b616a72bB88993A0cf75709BB8D532cc1;
+        require(service != address(0), unicode"Trigger service not configured / 觸發服務未配置");
     }
 
     /// @dev Flap mandate: the Guardian role must not be revocable by anyone else.
@@ -513,6 +539,14 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
         emit EmergencyWithdrawal(lpAmount, amountOut, to);
     }
 
+    /// @notice Guardian-only: turns the receive() forward switch on (non-zero `to`) or off (zero).
+    ///         While on, incoming BNB is redirected to `to` instead of being recognized as revenue.
+    ///         Guardian-only by DEFAULT_ADMIN_ROLE, which nobody else can ever hold.
+    function setForward(address to) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        forwardTo = to;
+        emit ForwardUpdated(to);
+    }
+
     /// @notice Sweeps the vault's native balance. Native quote: this is the tax revenue, baseline
     ///         reset to zero (rule 010). ERC20 quote: this is only the gas pool, revenue untouched.
     function emergencySweepNative(address to) external nonReentrant onlyRole(EMERGENCY_ROLE) {
@@ -623,7 +657,11 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
         }
         uint256 quoteIn =
             outForAll > needed ? Math.mulDiv(available, needed, outForAll, Math.Rounding.Up) : available;
-        uint256 cap = (available * MAX_REFILL_SHARE_BPS) / BPS_DENOMINATOR;
+        // Cap on the batch this call will actually process (min(pendingQuote, maxProcessAmount)),
+        // not on the whole backlog: a multi-batch drain must not divert several batches' worth of
+        // revenue into the gas pool in one call (audit round 1, Finding 9).
+        uint256 batch = available > maxProcessAmount ? maxProcessAmount : available;
+        uint256 cap = (batch * MAX_REFILL_SHARE_BPS) / BPS_DENOMINATOR;
         if (quoteIn > cap) quoteIn = cap;
         // MAX_REFILL_SHARE_BPS keeps quoteIn strictly below `available`, so the sized amount is
         // always re-quoted at its own size — never reused from the full-amount outForAll quote.
