@@ -50,13 +50,22 @@ myx `deployPool` costs about 2.06M gas, above the FlapTriggerService callback ca
 - RWA quote tokens (bStocks) may carry transfer restrictions; the vault holds the quote between
   `dispatch()` and `process()`.
 - The refill leg (ERC20 quote → WBNB → BNB via Flap's MultiDexRouter) is capped at
-  `MAX_REFILL_SHARE_BPS = 2000` — at most 20% of a processed batch can be diverted to top up the gas
-  pool, bounding griefing/slippage exposure from any single `process()` call.
+  `MAX_REFILL_SHARE_BPS = 2000` — at most 20% of the batch that call processes
+  (`min(pendingQuote, maxProcessAmount)`) can be diverted to top up the gas pool, bounding
+  griefing/slippage exposure from any single `process()` call.
+- **Slippage tolerance is capped.** `maxSlippageBps` (factory `GlobalConfig`) must be at most
+  `MAX_SLIPPAGE_BPS = 1000` (10%), checked in the factory constructor and again in `initialize`, so
+  the same-block `minOut` bound can never be configured away.
+- **Privileges are Guardian-only.** The creator holds no role: `emergencyWithdraw`,
+  `emergencySweepNative`, `emergencyRescueToken` and the rescue forward switch `setForward()` are
+  reserved to Flap's Guardian. With `forwardTo` set, `receive()` redirects all incoming BNB to that
+  address through a non-reverting low-level call and returns before accounting, so tax dispatch
+  keeps working during an incident.
 - A refill swap that reverts (e.g. an RWA transfer restriction toward the DEX pool) does not brick
   the vault: the refill is skipped (`GasRefillSkipped`), the batch is untouched and the buyback still
   runs in the same `process()` call. Only the auto-scheduling stops once the gas pool runs dry —
-  anyone can restore it by calling `fundGas()` with more than `gasThreshold`, and `process()` stays
-  permissionless in the meantime.
+  anyone can restore it by calling `fundGas()` (or `requestProcess{value}()`) with at least one
+  trigger fee.
 
 ## Layout
 

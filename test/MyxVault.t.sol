@@ -200,8 +200,10 @@ contract MyxVaultGuardianTest is MyxVaultTestBase {
         assertTrue(vault.hasRole(vault.DEFAULT_ADMIN_ROLE(), GUARDIAN));
     }
 
-    function test_creatorHasEmergencyRole() public view {
-        assertTrue(vault.hasRole(vault.EMERGENCY_ROLE(), creator));
+    /// @dev Audit round 1, Finding 3: the creator must not be able to divert holder revenue.
+    function test_creatorHasNoRole() public view {
+        assertFalse(vault.hasRole(vault.EMERGENCY_ROLE(), creator));
+        assertFalse(vault.hasRole(vault.DEFAULT_ADMIN_ROLE(), creator));
     }
 
     function test_revokeGuardianRole_reverts() public {
@@ -578,9 +580,10 @@ contract MyxVaultEmergencyTest is MyxVaultTestBase {
         assertEq(usdt.balanceOf(rescue), 10 ether); // MockBasePool pays quote 1:1
     }
 
-    function test_emergencyWithdraw_creatorAllowed() public {
+    function test_emergencyWithdraw_creatorReverts() public {
         lpToken.mint(address(vault), 1 ether);
         vm.prank(creator);
+        vm.expectRevert(); // AccessControl revert: creator holds no role
         vault.emergencyWithdraw(1 ether, 0, creator);
     }
 
@@ -623,7 +626,7 @@ contract MyxVaultEmergencyTest is MyxVaultTestBase {
         MockTaxToken stuck = MockTaxToken(address(taxToken));
         stuck.mint(address(vault), 5 ether);
         address rescue = makeAddr("rescue");
-        vm.prank(creator); // creator also holds EMERGENCY_ROLE
+        vm.prank(GUARDIAN);
         vault.emergencyRescueToken(address(stuck), rescue);
         assertEq(stuck.balanceOf(rescue), 5 ether);
     }
@@ -669,6 +672,20 @@ contract MyxVaultViewsTest is MyxVaultTestBase {
             vault.description(),
             unicode"MYX liquidity vault / MYX 流動性金庫: 0 LP minted / LP 已鑄造, 0 LP distributed / LP 已分發, pending BNB / 待處理 BNB: 0.000009409."
         );
+    }
+
+    /// @dev Audit round 1, Finding 2: every UI-facing label is bilingual ("English / 繁體中文").
+    function test_vaultUISchema_fieldLabelsBilingual() public view {
+        VaultMethodSchema[] memory methods = vault.vaultUISchema().methods;
+        for (uint256 i = 0; i < methods.length; i++) {
+            assertTrue(vm.indexOf(methods[i].description, " / ") != type(uint256).max, methods[i].name);
+            for (uint256 j = 0; j < methods[i].inputs.length; j++) {
+                assertTrue(vm.indexOf(methods[i].inputs[j].description, " / ") != type(uint256).max, methods[i].name);
+            }
+            for (uint256 j = 0; j < methods[i].outputs.length; j++) {
+                assertTrue(vm.indexOf(methods[i].outputs[j].description, " / ") != type(uint256).max, methods[i].name);
+            }
+        }
     }
 
     function test_vaultUISchema_describesMethods() public view {
@@ -738,5 +755,83 @@ contract MyxMarketIdEquivalenceTest is Test {
         MarketId got = MyxMarketId.derive(chainId, quote);
         MarketId want = RefMarketIdLib.toId(RefMarketKey({chainId: chainId, quoteToken: quote}));
         assertEq(MarketId.unwrap(got), MarketId.unwrap(want));
+    }
+}
+
+/// @dev Sink that refuses BNB, to prove the forward switch never reverts receive().
+contract RejectingSink {
+    receive() external payable {
+        revert("RejectingSink: no");
+    }
+}
+
+/// @dev Audit round 1, Finding 5 (SYS-REQ-RESCUE-MECHANISM facet b): a Guardian-controlled forward
+///      switch on receive() that redirects incoming BNB to a safe address via a non-reverting
+///      low-level call and returns before any accounting or scheduling.
+contract MyxVaultForwardSwitchTest is MyxVaultTestBase {
+    event ForwardUpdated(address indexed to);
+    event RevenueForwarded(address indexed to, uint256 amount, bool ok);
+
+    address sink = makeAddr("sink");
+
+    function test_setForward_onlyGuardian() public {
+        vm.prank(creator);
+        vm.expectRevert();
+        vault.setForward(sink);
+        vm.prank(makeAddr("stranger"));
+        vm.expectRevert();
+        vault.setForward(sink);
+
+        vm.prank(GUARDIAN);
+        vm.expectEmit(true, true, true, true);
+        emit ForwardUpdated(sink);
+        vault.setForward(sink);
+        assertEq(vault.forwardTo(), sink);
+    }
+
+    function test_receive_forwardEnabled_redirectsWithoutAccounting() public {
+        vm.prank(GUARDIAN);
+        vault.setForward(sink);
+        vm.expectEmit(true, true, true, true);
+        emit RevenueForwarded(sink, 1 ether, true);
+        _fund(1 ether);
+        assertEq(sink.balance, 1 ether, "all incoming BNB forwarded");
+        assertEq(address(vault).balance, 0);
+        assertEq(vault.pendingQuote(), 0, "forwarded BNB is not revenue");
+        assertFalse(vault.hasPendingTrigger(), "no scheduling while forwarding");
+    }
+
+    function test_receive_forwardTargetReverts_receiveStillSucceeds() public {
+        RejectingSink bad = new RejectingSink();
+        vm.prank(GUARDIAN);
+        vault.setForward(address(bad));
+        vm.expectEmit(true, true, true, true);
+        emit RevenueForwarded(address(bad), 1 ether, false);
+        _fund(1 ether); // asserts the call succeeded
+        assertEq(address(vault).balance, 1 ether, "BNB retained when the forward fails");
+        assertEq(vault.pendingQuote(), 0, "not recognized while the switch is on");
+    }
+
+    function test_setForward_zero_disablesAndResumesAccounting() public {
+        vm.prank(GUARDIAN);
+        vault.setForward(sink);
+        _fund(1 ether);
+        vm.prank(GUARDIAN);
+        vault.setForward(address(0));
+        assertEq(vault.forwardTo(), address(0));
+        _fund(1 ether);
+        assertEq(vault.pendingQuote(), 1 ether, "accounting resumes once the switch is off");
+        assertEq(sink.balance, 1 ether);
+    }
+
+    function test_receive_forward_gasUnder100k() public {
+        vm.prank(GUARDIAN);
+        vault.setForward(sink);
+        vm.deal(address(this), 1 ether);
+        uint256 g0 = gasleft();
+        (bool ok,) = address(vault).call{value: 1 ether}("");
+        uint256 used = g0 - gasleft();
+        assertTrue(ok);
+        assertLt(used, 100_000);
     }
 }

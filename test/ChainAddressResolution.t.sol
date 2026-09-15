@@ -243,7 +243,7 @@ contract ChainAddressResolutionTest is Test {
         base.exposedGetPortal();
         vm.expectRevert(unicode"Trigger service not configured / 觸發服務未配置");
         vault.exposedGetTriggerService();
-        vm.expectRevert("FlapDeployed: unsupported chain");
+        vm.expectRevert(bytes(unicode"Unsupported chain / 不支援的鏈"));
         FlapDeployed.vaultPortal();
     }
 }

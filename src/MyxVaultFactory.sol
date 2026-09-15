@@ -43,6 +43,11 @@ contract MyxVaultFactory is VaultFactoryBaseV2, IVaultFactoryDividendV23 {
         uint256 maxGasRefillAmount;
     }
 
+    /// @notice Upper bound on the buyback / refill slippage tolerance (10%). Bounds the worst
+    ///         execution the vault can accept: minOut = quote x (1 - maxSlippageBps) can never be
+    ///         configured down to zero (audit round 1, Finding 4).
+    uint16 public constant MAX_SLIPPAGE_BPS = 1_000;
+
     /// @notice Creator-supplied per-vault configuration carried in `vaultData`.
     struct VaultData {
         address marketQuoteToken; // myx MARKET quote (USDT/USDC); identifies the myx market
@@ -125,7 +130,7 @@ contract MyxVaultFactory is VaultFactoryBaseV2, IVaultFactoryDividendV23 {
     bool public upgradesLocked;
 
     constructor(GlobalConfig memory _config) {
-        require(_config.maxSlippageBps <= 10_000, unicode"Slippage above 100% / 滑點超過 100%");
+        require(_config.maxSlippageBps <= MAX_SLIPPAGE_BPS, unicode"Slippage above 10% / 滑點超過 10%");
         config = _config;
         beacon = new UpgradeableBeacon(address(new MyxVault()));
     }
@@ -154,11 +159,16 @@ contract MyxVaultFactory is VaultFactoryBaseV2, IVaultFactoryDividendV23 {
             d.maxProcessAmount >= d.minProcessAmount,
             unicode"Max process amount below minimum / 單批處理上限低於最低處理金額"
         );
+        // Fail fast on the prepaid-gas requirement BEFORE deploying the proxy: a launch that cannot
+        // fund its gas pool should not pay for a BeaconProxy creation it is about to revert.
+        uint256 prepaid;
         if (quoteToken != address(0)) {
             require(
                 d.gasRefillAmount <= c.maxGasRefillAmount,
                 unicode"Gas refill above factory cap / Gas 補充值超過工廠上限"
             );
+            prepaid = prepaidGas[creator];
+            require(prepaid >= c.minInitialGas, unicode"Prepaid gas below minimum / 預付 Gas 低於最低要求");
         }
         vault = address(
             new BeaconProxy(
@@ -183,14 +193,10 @@ contract MyxVaultFactory is VaultFactoryBaseV2, IVaultFactoryDividendV23 {
                 )
             )
         );
-        if (quoteToken != address(0)) {
-            uint256 prepaid = prepaidGas[creator];
-            require(prepaid >= c.minInitialGas, unicode"Prepaid gas below minimum / 預付 Gas 低於最低要求");
-            if (prepaid > 0) {
-                prepaidGas[creator] = 0;
-                MyxVault(payable(vault)).fundGas{value: prepaid}();
-                emit VaultGasFunded(vault, creator, prepaid);
-            }
+        if (quoteToken != address(0) && prepaid > 0) {
+            prepaidGas[creator] = 0;
+            MyxVault(payable(vault)).fundGas{value: prepaid}();
+            emit VaultGasFunded(vault, creator, prepaid);
         }
         emit VaultCreated(vault, taxToken, creator, d.marketQuoteToken);
     }
@@ -263,7 +269,7 @@ contract MyxVaultFactory is VaultFactoryBaseV2, IVaultFactoryDividendV23 {
                 marketId, predictedToken, params.symbol
             );
         } else {
-            revert(unicode"Unsupported launch version / 不支援的發行版本");
+            require(false, unicode"Unsupported launch version / 不支援的發行版本");
         }
     }
 

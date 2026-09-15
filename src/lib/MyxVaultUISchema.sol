@@ -19,7 +19,7 @@ library MyxVaultUISchema {
         schema.methods[0].description =
             unicode"Tax revenue awaiting processing, in quote token units. / 待處理的稅收金額（報價幣單位）。";
         schema.methods[0].outputs = new FieldDescriptor[](1);
-        schema.methods[0].outputs[0] = FieldDescriptor("amount", "uint256", "Quote amount", 0);
+        schema.methods[0].outputs[0] = FieldDescriptor("amount", "uint256", unicode"Quote amount / 報價幣金額", 0);
 
         schema.methods[1].name = "requestProcess";
         schema.methods[1].description =
@@ -39,15 +39,15 @@ library MyxVaultUISchema {
         schema.methods[4].name = "pendingReward";
         schema.methods[4].description = unicode"Claimable mBase LP dividend for a holder. / 持幣者可領取的 mBase LP 分紅金額。";
         schema.methods[4].inputs = new FieldDescriptor[](1);
-        schema.methods[4].inputs[0] = FieldDescriptor("user", "address", "Holder address", 0);
+        schema.methods[4].inputs[0] = FieldDescriptor("user", "address", unicode"Holder address / 持幣者地址", 0);
         schema.methods[4].outputs = new FieldDescriptor[](1);
-        schema.methods[4].outputs[0] = FieldDescriptor("amount", "uint256", "Claimable LP amount", 18);
+        schema.methods[4].outputs[0] = FieldDescriptor("amount", "uint256", unicode"Claimable LP amount / 可領取 LP 數量", 18);
 
         schema.methods[5].name = "vaultQuoteToken";
         schema.methods[5].description =
             unicode"Revenue currency of this vault (zero address = native). / 本金庫的稅收幣種（零地址為原生幣）。";
         schema.methods[5].outputs = new FieldDescriptor[](1);
-        schema.methods[5].outputs[0] = FieldDescriptor("quoteToken", "address", "Quote token", 0);
+        schema.methods[5].outputs[0] = FieldDescriptor("quoteToken", "address", unicode"Quote token / 報價幣", 0);
 
         schema.methods[6].name = "sync";
         schema.methods[6].description =
@@ -62,13 +62,13 @@ library MyxVaultUISchema {
         schema.methods[8].name = "gasBalance";
         schema.methods[8].description = unicode"BNB reserved for auto-trigger fees. / 保留給自動觸發手續費的 BNB。";
         schema.methods[8].outputs = new FieldDescriptor[](1);
-        schema.methods[8].outputs[0] = FieldDescriptor("amount", "uint256", "BNB amount", 18);
+        schema.methods[8].outputs[0] = FieldDescriptor("amount", "uint256", unicode"BNB amount / BNB 數量", 18);
 
         schema.methods[9].name = "poolReady";
         schema.methods[9].description =
             unicode"Auto-buyback switch: true once the MYX pool exists. Until then tax accumulates and no buyback is scheduled. / 自動回購開關：MYX 池部署後為 true；在此之前稅收只累積，不預約回購。";
         schema.methods[9].outputs = new FieldDescriptor[](1);
-        schema.methods[9].outputs[0] = FieldDescriptor("ready", "bool", "Pool deployed", 0);
+        schema.methods[9].outputs[0] = FieldDescriptor("ready", "bool", unicode"Pool deployed / 池已部署", 0);
 
         schema.methods[10].name = "ensurePoolDeployed";
         schema.methods[10].description =
