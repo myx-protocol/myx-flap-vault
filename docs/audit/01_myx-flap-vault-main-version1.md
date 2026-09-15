@@ -2,7 +2,7 @@
 
 Generated: 2026-09-15 03:17:25 UTC
 
-> **MYX response (2026-09-15).** Updated source: branch `feat/vault-v3-erc20-quote`, PR https://github.com/myx-protocol/myx-flap-vault/pull/2 (commit hash noted in the PR). Summary: Findings 1, 2, 3, 4, 5, 9 fixed (TP); 6 and 7 By Design; 8 Acknowledged. Verification: 287 unit tests green; BSC mainnet fork tests (native quote and ERC20/NVDAB quote, real Portal / TaxProcessor / MultiDexRouter / TriggerService) green.
+> **MYX response (2026-09-15).** Updated source: branch `feat/vault-v3-erc20-quote`, PR https://github.com/myx-protocol/myx-flap-vault/pull/2 (commit `a25100c`). Summary: Findings 1, 2, 3, 4, 5, 9 fixed (TP); 6 and 7 By Design; 8 Acknowledged. Verification: 287 unit tests green; BSC mainnet fork tests (native quote and ERC20/NVDAB quote, real Portal / TaxProcessor / MultiDexRouter / TriggerService) green.
 
 ## Vault Security Rating
 **High**
