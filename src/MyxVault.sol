@@ -23,6 +23,7 @@ import {ISwapRegistry} from "./flap/ISwapRegistry.sol";
 import {IMultiDexRouter} from "./flap/IMultiDexRouter.sol";
 import {IPortalQuoteConfigU8} from "./flap/IPortalQuoteConfigU8.sol";
 import {IWBNB} from "./dex/IWBNB.sol";
+import {IV3PoolLiquidity} from "./dex/IV3PoolLiquidity.sol";
 
 /// @title MyxVault
 /// @notice Flap vault that buys back the tax token with tax revenue via the Flap Portal, deposits
@@ -85,6 +86,10 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
     ///         20% of the batch. A capped refill is partial by design — the shortfall is retried on
     ///         the next process() call.
     uint16 public constant MAX_REFILL_SHARE_BPS = 2000;
+    /// @notice Gas budget for a single refill quote. A live BSC V3 quote costs ~150k; a pool that
+    ///         exists but cannot be quoted burns whatever it is given before failing. The cap keeps
+    ///         one pathological tier from consuming the trigger service's 2,000,000-gas callback.
+    uint256 public constant REFILL_QUOTE_GAS = 300_000;
     /// @notice Upper bound on maxSlippageBps (10%); mirrors MyxVaultFactory.MAX_SLIPPAGE_BPS so a
     ///         vault can never be initialized with a tolerance that disables minOut.
     uint16 public constant MAX_SLIPPAGE_BPS = 1_000;
@@ -125,7 +130,10 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
     ///         process().
     event GasRefillSkipped(uint256 pendingQuote);
     /// @notice Emitted when, after a refill, the remaining quote is below minProcessAmount.
-    event BuybackSkipped(uint256 pendingQuote);
+    /// @notice process() spent this callback on the gas refill (a swap ran, or reverted late) and
+    ///         deferred the buyback to a follow-up callback; `pendingQuote` is what that follow-up
+    ///         will buy back (no follow-up is scheduled when it is below minProcessAmount).
+    event RefillOnlyBatch(uint256 pendingQuote);
     /// @notice Emitted when process() hit maxProcessAmount: `processed` was bought back this call and
     ///         `remaining` stays in pendingQuote for the follow-up batch process() tries to schedule.
     event ProcessBatched(uint256 processed, uint256 remaining);
@@ -163,6 +171,9 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
     ///         deployPool (~2.06M gas), above the service's callback cap — and the pool is probed
     ///         once per eligible wake; once true the pool is never probed again.
     bool public poolReady;
+    /// @notice Set by a refill-only batch: the next process() skips the refill check once and buys
+    ///         back, so a thin pool can never loop refill-after-refill without buying back.
+    bool public skipRefillOnce;
     /// @notice ERC20 quote only: refill the BNB gas pool below this balance (wei).
     uint256 public gasThreshold;
     /// @notice ERC20 quote only: gas pool target after a refill (wei).
@@ -177,7 +188,7 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
     address public forwardTo;
 
     /// @dev Reserved storage for upgrades. 44 original - 2 (trigger) - 2 (gasThreshold,
-    ///      gasRefillAmount; quoteToken and poolReady pack into the hasPendingTrigger slot)
+    ///      gasRefillAmount; quoteToken, poolReady and skipRefillOnce pack into the hasPendingTrigger slot)
     ///      - 1 (maxProcessAmount) - 1 (forwardTo) = 38. Verified with
     ///      `forge inspect MyxVault storage-layout`.
     uint256[38] private __gap;
@@ -411,15 +422,25 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
         require(msg.sender == address(this), unicode"Caller must be the vault itself / 僅限金庫自身調用");
         _sync();
         require(pendingQuote >= minProcessAmount, unicode"Pending below minimum / 待處理金額低於下限");
-        _refillGas();
-        uint256 available = pendingQuote;
-        if (available < minProcessAmount) {
-            emit BuybackSkipped(available);
-            // Flush any deferred LP from a prior failed feed even when this call's buyback is
-            // skipped — the refill leg alone must not stall a pending dividend distribution.
-            _feedDividend();
-            return;
+        // The trigger service caps a callback at 2,000,000 gas and the buyback alone needs ~1.7M on
+        // mainnet, so a refill that actually spends gas (swap ran, or reverted late) can never share
+        // a callback with the buyback: the call ends here as a refill-only batch and the buyback is
+        // scheduled as its own callback. The follow-up skips this check once so a thin pool cannot
+        // chain refill after refill without ever buying back. A cheap skip (no venue / no pool /
+        // nothing quotable) falls through to the buyback in the same call.
+        if (skipRefillOnce) {
+            skipRefillOnce = false;
+        } else {
+            RefillOutcome outcome = _refillGas();
+            if (outcome == RefillOutcome.Refilled || outcome == RefillOutcome.Failed) {
+                skipRefillOnce = true;
+                uint256 left = pendingQuote;
+                emit RefillOnlyBatch(left);
+                _scheduleFollowUp(left);
+                return;
+            }
         }
+        uint256 available = pendingQuote; // >= minProcessAmount: nothing left the vault since _sync
         // Batch cap: never swap more than maxProcessAmount in one call. Splitting inside one
         // transaction would not help (a sandwich brackets the whole tx); the remainder is left in
         // pendingQuote and a follow-up trigger is scheduled below, so accumulated revenue (e.g. after
@@ -445,12 +466,16 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
         uint256 remaining = pendingQuote;
         if (remaining != 0) {
             emit ProcessBatched(amount, remaining);
-            // No new tax means no receive() wake, so the follow-up must be scheduled here. Same
-            // best-effort semantics as receive(): a failed schedule (no gas, service down) is not an
-            // error — the remainder waits for the next wake or a manual process().
-            if (remaining >= minProcessAmount && !hasPendingTrigger) {
-                try this.scheduleProcess() {} catch {}
-            }
+            _scheduleFollowUp(remaining);
+        }
+    }
+
+    /// @dev No new tax means no receive() wake, so a batch that leaves work behind must schedule
+    ///      its own follow-up. Same best-effort semantics as receive(): a failed schedule (no gas,
+    ///      service down) is not an error — the remainder waits for the next wake or requestProcess().
+    function _scheduleFollowUp(uint256 remaining) internal {
+        if (remaining >= minProcessAmount && !hasPendingTrigger) {
+            try this.scheduleProcess() {} catch {}
         }
     }
 
@@ -626,10 +651,20 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
     ///      venue that prices a swap it will not execute) degrades to GasRefillSkipped and the
     ///      buyback still runs on the untouched batch. Rule 010 holds because the pendingQuote
     ///      decrement sits in the same function as the outflow and reverts with it.
-    function _refillGas() internal {
-        if (quoteToken == address(0)) return;
+    /// @dev How a refill attempt ended. NotNeeded / Skipped cost little gas and let process() carry
+    ///      on with the buyback; Refilled / Failed spent real gas on quotes and a swap, so process()
+    ///      must end the callback there (see process()).
+    enum RefillOutcome {
+        NotNeeded,
+        Skipped,
+        Refilled,
+        Failed
+    }
+
+    function _refillGas() internal returns (RefillOutcome) {
+        if (quoteToken == address(0)) return RefillOutcome.NotNeeded;
         uint256 gasBal = address(this).balance;
-        if (gasBal >= gasThreshold) return;
+        if (gasBal >= gasThreshold) return RefillOutcome.NotNeeded;
         uint256 needed = gasRefillAmount - gasBal;
         uint256 available = pendingQuote;
 
@@ -642,18 +677,18 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
             dexId = d;
         } catch {
             emit GasRefillSkipped(available);
-            return;
+            return RefillOutcome.Skipped;
         }
         if (routerAddr == address(0) || wbnb == address(0)) {
             emit GasRefillSkipped(available);
-            return;
+            return RefillOutcome.Skipped;
         }
         IMultiDexRouter router = IMultiDexRouter(routerAddr);
 
         (uint24 fee, uint256 outForAll) = _bestPool(router, wbnb, dexId, available);
         if (outForAll == 0) {
             emit GasRefillSkipped(available);
-            return;
+            return RefillOutcome.Skipped;
         }
         uint256 quoteIn =
             outForAll > needed ? Math.mulDiv(available, needed, outForAll, Math.Rounding.Up) : available;
@@ -668,15 +703,17 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
         uint256 quoted = _quoteOut(router, wbnb, dexId, fee, quoteIn);
         if (quoteIn == 0 || quoted == 0) {
             emit GasRefillSkipped(available);
-            return;
+            return RefillOutcome.Skipped;
         }
         uint256 minOut = (quoted * (BPS_DENOMINATOR - maxSlippageBps)) / BPS_DENOMINATOR;
 
         try this.executeGasRefill(address(router), wbnb, dexId, fee, quoteIn, minOut) returns (uint256 got) {
             emit GasRefilled(quoteIn, got, fee);
+            return RefillOutcome.Refilled;
         } catch {
             // The whole outflow — the pendingQuote decrement included — rolled back with the swap.
             emit GasRefillSkipped(available);
+            return RefillOutcome.Failed;
         }
     }
 
@@ -737,7 +774,16 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
         if (amountIn == 0) return (0, 0);
         uint24[] memory fees = router.getDEXInfo(dexId).v3SupportedFees;
         for (uint256 i = 0; i < fees.length; i++) {
-            if (router.computeV3PoolAddress(dexId, quoteToken, wbnb, fees[i]).code.length == 0) continue;
+            address pool = router.computeV3PoolAddress(dexId, quoteToken, wbnb, fees[i]);
+            if (pool.code.length == 0) continue;
+            // A deployed pool with no in-range liquidity is not quotable: the quoter would walk the
+            // whole tick bitmap (~450k gas on BSC) before failing. Read liquidity() first; a pool
+            // that cannot even answer that is skipped too.
+            try IV3PoolLiquidity(pool).liquidity() returns (uint128 liquidity) {
+                if (liquidity == 0) continue;
+            } catch {
+                continue;
+            }
             uint256 out = _quoteOut(router, wbnb, dexId, fees[i], amountIn);
             if (out > bestOut) {
                 bestOut = out;
@@ -750,7 +796,7 @@ contract MyxVault is VaultBaseV3, Initializable, AccessControlUpgradeable, Reent
         internal
         returns (uint256 out)
     {
-        try router.quoteExactInputSingle(
+        try router.quoteExactInputSingle{gas: REFILL_QUOTE_GAS}(
             dexId,
             IMultiDexRouter.QuoteExactInputSingleParams({
                 tokenIn: quoteToken,

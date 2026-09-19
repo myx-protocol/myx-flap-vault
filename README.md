@@ -20,7 +20,8 @@ Flap tax token ──tax(mktBps)──▶ dispatch() ──BNB or ERC20 quote (+
         [MYX service / anyone] ensurePoolDeployed(): deploy the myx pool (~2.1M gas, never inside a
                    callback) → latch poolReady → schedule the accumulated backlog
         creator: factory.prepayGas() before launch (ERC20 quote) → forwarded into the vault gas pool
-        [trigger only] process(): sync → (ERC20 quote) refill BNB gas pool via Flap MultiDexRouter
+        [trigger only] process(): sync → (ERC20 quote, gas pool < gasThreshold) refill BNB gas pool via
+                   Flap MultiDexRouter as a REFILL-ONLY batch, then schedule the buyback as its own callback
         [anyone] requestProcess(): schedule the trigger callback (never swaps in the caller's tx)
                  → buy back the tax token via the Flap Portal → deployPool if missing
                  → BasePool.deposit (mBase LP minted to vault) → _feedDividend()
@@ -61,11 +62,23 @@ myx `deployPool` costs about 2.06M gas, above the FlapTriggerService callback ca
   reserved to Flap's Guardian. With `forwardTo` set, `receive()` redirects all incoming BNB to that
   address through a non-reverting low-level call and returns before accounting, so tax dispatch
   keeps working during an incident.
+- **Refill and buyback never share a callback.** The trigger service caps a callback at 2,000,000
+  gas and the buyback alone needs ~1.7M on BSC mainnet, while a refill (tier quotes + swap + unwrap)
+  needs 1.5M or more. When the gas pool is below `gasThreshold`, `process()` runs the refill, emits
+  `RefillOnlyBatch`, sets `skipRefillOnce`, and schedules the buyback as the next callback; that
+  follow-up skips the refill check once so a thin pool can never loop refill-after-refill without
+  buying back. A refill that is skipped cheaply (no venue, no pool, nothing quotable) falls through to
+  the buyback in the same call.
+- **Refill quotes are bounded.** Fee tiers whose pool contract exists but reports zero `liquidity()`
+  are skipped before quoting (on BSC such a quote burns ~450k gas walking the empty tick bitmap), and
+  every `quoteExactInputSingle` call is capped at `REFILL_QUOTE_GAS` (300k).
 - A refill swap that reverts (e.g. an RWA transfer restriction toward the DEX pool) does not brick
-  the vault: the refill is skipped (`GasRefillSkipped`), the batch is untouched and the buyback still
-  runs in the same `process()` call. Only the auto-scheduling stops once the gas pool runs dry —
-  anyone can restore it by calling `fundGas()` (or `requestProcess{value}()`) with at least one
-  trigger fee.
+  the vault: the refill is skipped (`GasRefillSkipped`), the batch is untouched (rule 010) and the next
+  `process()` buys it back without retrying the refill. Only the auto-scheduling stops once the gas
+  pool cannot pay a trigger fee — anyone can restore it by calling `fundGas()` (or
+  `requestProcess{value}()`).
+- The factory requires the creator's prepaid gas to cover the vault's own `gasThreshold` at launch,
+  so a vault never starts its life in refill mode.
 
 ## Layout
 

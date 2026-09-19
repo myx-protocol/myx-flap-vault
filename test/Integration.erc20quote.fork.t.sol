@@ -84,7 +84,7 @@ contract MyxVaultErc20QuoteForkTest is FlapBSCFixture {
         p.quoteToken = NVDAB;
         p.quoteAmt = 0;
         p.dividendToken = MAGIC_DIVIDEND_COMPUTED;
-        factory.prepayGas{value: 0.003 ether}();
+        factory.prepayGas{value: 0.005 ether}(); // == vaultData gasThreshold (factory minimum)
         token = vaultPortal.newTokenV6WithVault(p);
         vault = MyxVault(payable(vaultPortal.getVault(token).vault));
         // Off-chain MYX service step: deploy the myx pool, which opens the auto-trigger switch.
@@ -94,7 +94,7 @@ contract MyxVaultErc20QuoteForkTest is FlapBSCFixture {
     function test_erc20Quote_endToEnd() public {
         (address token, MyxVault vault) = _launch();
         assertEq(vault.vaultQuoteToken(), NVDAB);
-        assertEq(vault.gasBalance(), 0.003 ether, "prepaid gas forwarded at launch");
+        assertEq(vault.gasBalance(), 0.005 ether, "prepaid gas forwarded at launch");
         assertEq(factory.prepaidGas(address(this)), 0);
 
         // trade in NVDAB to generate tax
@@ -117,14 +117,20 @@ contract MyxVaultErc20QuoteForkTest is FlapBSCFixture {
         _dispatchTax(token);
         assertEq(vault.pendingQuote(), expected, "ping recognized the ERC20 revenue");
         assertTrue(vault.hasPendingTrigger(), "gas pool paid the trigger fee");
-        assertLt(vault.gasBalance(), 0.003 ether);
+        assertLt(vault.gasBalance(), 0.005 ether, "the scheduling fee took the pool below gasThreshold");
 
-        // process: gas pool is below 0.005 -> refill via Flap MultiDexRouter, then buy back + deposit
+        // callback 1: gas pool is below 0.005 -> refill-only batch via Flap MultiDexRouter, then
+        // the vault schedules the buyback as its own callback (2M cap cannot hold both).
         uint256 gasBefore = vault.gasBalance();
         vm.warp(block.timestamp + 61);
         _executeTrigger(vault.pendingTriggerId()); // trigger-only process(): REAL service callback
         assertGt(vault.gasBalance(), gasBefore, "refill topped up the gas pool");
         assertGe(vault.gasBalance(), 0.005 ether);
+        assertGt(vault.pendingQuote(), 0, "refill-only batch keeps the quote for the follow-up");
+        assertTrue(vault.hasPendingTrigger(), "buyback follow-up scheduled");
+        // callback 2: buy back + deposit
+        vm.warp(block.timestamp + 61);
+        _executeTrigger(vault.pendingTriggerId());
         assertEq(vault.pendingQuote(), 0);
         assertEq(IERC20(NVDAB).balanceOf(address(vault)), 0, "all quote spent");
         assertGt(basePool.lastDepositAmount(), 0, "bought-back token deposited");

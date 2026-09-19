@@ -6,6 +6,7 @@ import {MyxVault} from "../src/MyxVault.sol";
 import {MarketId, PoolId, MyxPoolId, MyxMarketId, PoolMetadata} from "../src/myx/IMyxPool.sol";
 import {ERC1967Proxy} from "@openzeppelin/proxy/ERC1967/ERC1967Proxy.sol";
 import "./mocks/Mocks.sol";
+import {IMultiDexRouter} from "../src/flap/IMultiDexRouter.sol";
 
 /// @dev Fixture for an ERC20 (RWA) quote vault on chainId 56. Portal, trigger service are etched at
 ///      the addresses MyxVault resolves; the swap venue is reached through
@@ -276,10 +277,23 @@ contract MyxVaultErc20GasPoolTest is MyxVaultErc20QuoteTestBase {
     receive() external payable {}
 }
 
+/// @dev Refill leg. A callback is capped at 2M gas by the trigger service and the buyback alone
+///      needs ~1.7M on mainnet, so whenever the refill actually spends gas (a swap ran, or the swap
+///      reverted late) process() ends as a REFILL-ONLY batch and schedules the buyback as its own
+///      follow-up callback. A refill that is skipped cheaply (no venue / no pool / zero quote) falls
+///      through to the buyback in the same call. The follow-up skips the refill check once
+///      (`skipRefillOnce`) so a thin pool can never loop refill-after-refill without buying back.
 contract MyxVaultErc20RefillTest is MyxVaultErc20QuoteTestBase {
     event GasRefilled(uint256 quoteIn, uint256 nativeOut, uint24 fee);
     event GasRefillSkipped(uint256 pendingQuote);
-    event BuybackSkipped(uint256 pendingQuote);
+    event RefillOnlyBatch(uint256 pendingQuote);
+
+    function _fireFollowUp() internal {
+        assertTrue(vault.hasPendingTrigger(), "follow-up must have been scheduled");
+        uint256 id = vault.pendingTriggerId();
+        vm.warp(block.timestamp + 61);
+        triggerService.fire(id);
+    }
 
     function setUp() public override {
         super.setUp();
@@ -292,7 +306,8 @@ contract MyxVaultErc20RefillTest is MyxVaultErc20QuoteTestBase {
     }
 
     /// @dev Gas pool empty; 1 RWA -> 0.003 BNB on the 2500 pool. Needed = 0.05 BNB -> ~16.67 RWA.
-    function test_process_refillsGasThenBuysBackRemainder() public {
+    ///      Call 1 refills only and schedules the buyback; the follow-up callback buys back.
+    function test_process_refillsGas_thenBuysBackOnFollowUp() public {
         _sendTax(100 ether);
         vm.expectEmit(false, false, false, false);
         emit GasRefilled(0, 0, 0);
@@ -301,10 +316,52 @@ contract MyxVaultErc20RefillTest is MyxVaultErc20QuoteTestBase {
         assertEq(router.lastFeeUsed(), 2500);
         uint256 quoteIn = router.lastAmountIn();
         assertApproxEqRel(quoteIn, 16.666 ether, 0.01e18, "linear estimate of quote needed");
-        assertEq(address(vault).balance, quoteIn * 3 / 1000, "gas pool refilled to ~target");
-        assertGe(address(vault).balance, GAS_THRESHOLD);
+        assertGe(address(vault).balance, GAS_THRESHOLD, "gas pool refilled to ~target");
+        assertEq(basePool.depositCallCount(), 0, "refill-only batch: no buyback in this call");
+        assertEq(vault.pendingQuote(), 100 ether - quoteIn, "batch retained for the follow-up");
+        assertTrue(vault.skipRefillOnce(), "follow-up will skip the refill check");
+
+        _fireFollowUp();
         assertEq(basePool.lastDepositAmount(), (100 ether - quoteIn) * 1000, "remainder bought back");
         assertEq(vault.pendingQuote(), 0);
+        assertFalse(vault.skipRefillOnce());
+        assertFalse(vault.hasPendingTrigger());
+    }
+
+    /// @dev The refill-only batch emits RefillOnlyBatch with the quote left for the follow-up.
+    function test_process_refillOnlyBatch_emitsAndSchedules() public {
+        _sendTax(100 ether);
+        vm.expectEmit(false, false, false, false);
+        emit RefillOnlyBatch(0);
+        vm.prank(address(vault));
+        vault.process();
+        assertTrue(vault.hasPendingTrigger(), "buyback scheduled as its own callback");
+        assertEq(triggerService.requesterOf(vault.pendingTriggerId()), address(vault));
+    }
+
+    /// @dev Thin pool: the capped refill cannot reach gasThreshold. The follow-up must still buy
+    ///      back (skipRefillOnce) instead of refilling again; only the call after that re-checks.
+    function test_process_afterRefillBatch_buysBackEvenBelowThreshold() public {
+        triggerService.setFee(0.0001 ether);
+        router.setRate(2500, 1, 100000); // 100 RWA -> 0.001 BNB, far below the 0.05 target
+        _sendTax(100 ether);
+        vm.prank(address(vault));
+        vault.process();
+        assertEq(router.lastAmountIn(), 20 ether, "capped at 20% of the batch");
+        assertLt(address(vault).balance, GAS_THRESHOLD, "still below threshold after the capped refill");
+        assertEq(basePool.depositCallCount(), 0);
+
+        _fireFollowUp();
+        assertEq(basePool.lastDepositAmount(), 80_000 ether, "buyback ran despite gas < threshold");
+        assertEq(vault.pendingQuote(), 0);
+        assertFalse(vault.skipRefillOnce(), "skip consumed");
+
+        // Next batch re-enters the refill check as usual.
+        _sendTax(100 ether);
+        vm.prank(address(vault));
+        vault.process();
+        assertEq(router.lastAmountIn(), 20 ether, "refill attempted again on the next batch");
+        assertTrue(vault.skipRefillOnce());
     }
 
     function test_process_noRefillWhenGasAboveThreshold() public {
@@ -339,6 +396,7 @@ contract MyxVaultErc20RefillTest is MyxVaultErc20QuoteTestBase {
         assertEq(router.lastFeeUsed(), 2500);
     }
 
+    /// @dev A cheap skip (no pool at all) does not cost a callback: the buyback runs in the same call.
     function test_process_noPool_skipsRefillAndStillBuysBack() public {
         router.setPool(2500, false);
         _sendTax(100 ether);
@@ -348,44 +406,88 @@ contract MyxVaultErc20RefillTest is MyxVaultErc20QuoteTestBase {
         vault.process();
         assertEq(address(vault).balance, 0);
         assertEq(basePool.lastDepositAmount(), 100_000 ether);
+        assertFalse(vault.skipRefillOnce());
+    }
+
+    /// @dev A tier whose pool contract exists but holds no liquidity is skipped BEFORE quoting: on
+    ///      mainnet such a quote walks the whole tick bitmap and burns ~450k gas for nothing.
+    function test_bestPool_skipsZeroLiquidityTier() public {
+        router.setPool(500, true);
+        router.setRate(500, 4, 1000); // would be the best rate if it were quoted
+        router.setPoolLiquidity(500, 0);
+        router.setQuoteBurnsGas(500, true); // any quote on it would be catastrophic
+        _sendTax(100 ether);
+        vm.expectCall(
+            address(router),
+            abi.encodeCall(
+                IMultiDexRouter.quoteExactInputSingle,
+                (
+                    0,
+                    IMultiDexRouter.QuoteExactInputSingleParams({
+                        tokenIn: address(rwa), tokenOut: address(wbnb), amountIn: 100 ether, fee: 500, sqrtPriceLimitX96: 0
+                    })
+                )
+            ),
+            0
+        );
+        vm.prank(address(vault));
+        vault.process();
+        assertEq(router.lastFeeUsed(), 2500, "zero-liquidity tier never quoted, live tier used");
+    }
+
+    /// @dev Every quoter call is gas-capped, so a pathological pool cannot eat the callback budget.
+    function test_quote_gasCapped_pathologicalTierIsBounded() public {
+        router.setPool(500, true); // liquidity > 0, but the quoter burns everything it is given
+        router.setQuoteBurnsGas(500, true);
+        _sendTax(100 ether);
+        vm.prank(address(vault));
+        uint256 g0 = gasleft();
+        vault.process();
+        uint256 used = g0 - gasleft();
+        assertEq(router.lastFeeUsed(), 2500, "fell through to the live tier");
+        assertLt(used, vault.REFILL_QUOTE_GAS() + 1_000_000, "runaway quote bounded by REFILL_QUOTE_GAS");
     }
 
     /// @dev Uncapped linear sizing would spend all 10 RWA to reach the 0.05 BNB target (a thin
     ///      pool needing the whole batch to hit gasRefillAmount); MAX_REFILL_SHARE_BPS caps the
-    ///      swap at 20% of pendingQuote instead, leaving 8 RWA below minProcessAmount so the
-    ///      buyback is skipped (not reverted) and retried whole on the next process().
-    function test_process_refillCappedAtShareOfPending_buybackSkipped() public {
+    ///      swap at 20% of the batch instead, leaving 8 RWA below minProcessAmount: the refill-only
+    ///      batch ends with no follow-up (nothing to buy back yet) and the remainder waits whole
+    ///      for the next tax receipt.
+    function test_process_refillCappedAtShareOfPending_noFollowUpBelowMin() public {
         _sendTax(MIN_PROCESS); // 10 RWA; uncapped sizing would spend all of it on the refill
         vm.expectEmit(true, true, true, true);
-        emit BuybackSkipped(8 ether);
+        emit RefillOnlyBatch(8 ether);
         vm.prank(address(vault));
         vault.process();
-        assertEq(router.lastAmountIn(), 2 ether, "capped at MAX_REFILL_SHARE_BPS (20%) of pendingQuote");
+        assertEq(router.lastAmountIn(), 2 ether, "capped at MAX_REFILL_SHARE_BPS (20%) of the batch");
         assertEq(address(vault).balance, 0.006 ether, "gas pool gets only the capped swap's output");
         assertEq(vault.pendingQuote(), 8 ether, "remainder retained, not reverted");
-        assertEq(basePool.depositCallCount(), 0, "buyback skipped, no revert");
+        assertEq(basePool.depositCallCount(), 0);
+        assertFalse(vault.hasPendingTrigger(), "8 RWA < minProcessAmount: no follow-up to schedule");
     }
 
     /// @dev A thinned/sandwiched pool (100 RWA -> only 0.001 BNB, far short of the 0.05 target)
-    ///      cannot make the vault sell more than MAX_REFILL_SHARE_BPS of pendingQuote: the cap
-    ///      bounds the swap to 20 RWA regardless of how bad the quote is, and the buyback still
-    ///      runs on the remaining 80 RWA in the same call.
+    ///      cannot make the vault sell more than MAX_REFILL_SHARE_BPS of the batch: the cap bounds
+    ///      the swap to 20 RWA regardless of how bad the quote is; the remaining 80 RWA are bought
+    ///      back by the follow-up callback.
     function test_process_thinPool_refillBoundedByCap() public {
+        triggerService.setFee(0.0001 ether);
         router.setRate(2500, 1, 100000); // 100 RWA -> 0.001 BNB: far below the 0.05 target
         _sendTax(100 ether);
         vm.prank(address(vault));
         vault.process();
-        assertEq(router.lastAmountIn(), 20 ether, "capped at 20% of pendingQuote despite the thin pool");
+        assertEq(router.lastAmountIn(), 20 ether, "capped at 20% of the batch despite the thin pool");
+        assertEq(vault.pendingQuote(), 80 ether, "remaining 80 RWA kept for the follow-up");
+        _fireFollowUp();
         assertEq(vault.pendingQuote(), 0);
         assertEq(basePool.lastDepositAmount(), 80_000 ether, "remaining 80 RWA bought back");
     }
 
-    /// @dev The refill swap itself reverting (e.g. an RWA transfer restriction toward the DEX pool,
-    ///      or a venue that prices a swap it will not execute) must NOT brick the buyback: the whole
-    ///      outflow lives in executeGasRefill, called through try/catch, so the swap and its
-    ///      pendingQuote decrement revert together (rule 010) and process() falls through to the
-    ///      buyback with the batch intact.
-    function test_process_swapReverts_skipsRefillAndStillBuysBack() public {
+    /// @dev The refill swap reverting (e.g. an RWA transfer restriction toward the DEX pool) is a
+    ///      LATE failure: the quotes were already paid for, so the call ends as a refill-only batch
+    ///      (nothing bricked, batch intact by rule 010) and the next process() skips the refill
+    ///      check and buys back the full batch.
+    function test_process_swapReverts_isRefillOnlyBatch_thenBuysBack() public {
         _sendTax(100 ether);
         router.setSwapReverts(true);
         vm.expectEmit(true, true, true, true);
@@ -393,8 +495,17 @@ contract MyxVaultErc20RefillTest is MyxVaultErc20QuoteTestBase {
         vm.prank(address(vault));
         vault.process();
         assertEq(address(vault).balance, 0, "no gas refilled");
-        assertEq(vault.pendingQuote(), 0, "rule 010: the reverted decrement rolled back, then the buyback spent it");
+        assertEq(vault.pendingQuote(), 100 ether, "rule 010: the reverted decrement rolled back, batch intact");
+        assertEq(basePool.depositCallCount(), 0, "late failure: no buyback in the same call");
+        assertTrue(vault.skipRefillOnce());
+        assertFalse(vault.hasPendingTrigger(), "gas pool empty: follow-up could not be paid");
+
+        // Next entry (manual or the next tax receipt's wake) buys back without retrying the refill.
+        vm.prank(address(vault));
+        vault.process();
+        assertEq(vault.pendingQuote(), 0);
         assertEq(basePool.lastDepositAmount(), 100_000 ether, "full batch bought back, nothing lost");
+        assertEq(router.lastAmountIn(), 0, "refill not retried on the skip call");
     }
 
     function test_executeGasRefill_onlySelf() public {
@@ -403,11 +514,15 @@ contract MyxVaultErc20RefillTest is MyxVaultErc20QuoteTestBase {
         vault.executeGasRefill(address(router), address(wbnb), 0, 2500, 1 ether, 0);
     }
 
+    /// @dev WBNB.withdraw pays BNB into receive() while process() holds the guard; that wake must
+    ///      not schedule. The only trigger after a refill batch is the one process() itself
+    ///      schedules at the very end (the follow-up buyback).
     function test_process_refillDoesNotScheduleTriggerMidProcess() public {
         _sendTax(100 ether);
         vm.prank(address(vault));
-        vault.process(); // WBNB.withdraw pays BNB into receive() while process() holds the guard
-        assertFalse(vault.hasPendingTrigger(), "no trigger scheduled from inside process()");
+        vault.process();
+        assertTrue(vault.hasPendingTrigger(), "exactly the follow-up buyback is scheduled");
+        assertEq(vault.pendingTriggerId(), 1, "a single request: the follow-up, not a mid-unwrap wake");
     }
 
     /// @dev Proves minOut is re-quoted at the actual (sized) quoteIn, not reused from the
@@ -547,6 +662,7 @@ contract MyxVaultErc20StipendTest is MyxVaultErc20QuoteTestBase {
     function test_process_refillUnwrapSurvivesWbnbTransferStipend() public {
         proxiedRwa.mint(address(vault), 100 ether);
         vault.sync();
+        vault.ensurePoolDeployed(); // latch poolReady as a real launch would before any callback
         assertEq(address(vault).balance, 0, "gas pool starts empty, below the threshold");
 
         vm.prank(address(vault));
@@ -554,8 +670,12 @@ contract MyxVaultErc20StipendTest is MyxVaultErc20QuoteTestBase {
         vault.process();
 
         assertGe(address(vault).balance, GAS_THRESHOLD, "refill topped the gas pool up");
-        assertEq(vault.pendingQuote(), 0, "remainder bought back");
-        assertGt(basePool.lastDepositAmount(), 0, "buyback still deposited");
+        assertEq(vault.pendingQuote(), 100 ether - router.lastAmountIn(), "batch kept for the follow-up");
+        uint256 id = vault.pendingTriggerId();
+        vm.warp(block.timestamp + 61);
+        triggerService.fire(id);
+        assertEq(vault.pendingQuote(), 0, "remainder bought back by the follow-up");
+        assertGt(basePool.lastDepositAmount(), 0, "buyback deposited");
     }
 }
 
@@ -582,7 +702,11 @@ contract MyxVaultErc20BatchedProcessTest is MyxVaultErc20QuoteTestBase {
         vm.prank(address(vault));
         vault.process();
         assertEq(router.lastAmountIn(), 6 ether, "20% of the 30 RWA batch, not of the 100 RWA backlog");
-        assertEq(vault.pendingQuote(), 100 ether - 6 ether - 30 ether, "refill + one batch consumed");
+        assertEq(vault.pendingQuote(), 94 ether, "refill-only batch: nothing bought back yet");
+        uint256 id = vault.pendingTriggerId();
+        vm.warp(block.timestamp + 61);
+        triggerService.fire(id);
+        assertEq(vault.pendingQuote(), 100 ether - 6 ether - 30 ether, "follow-up bought back one batch");
         assertEq(basePool.lastDepositAmount(), 30_000 ether);
     }
 

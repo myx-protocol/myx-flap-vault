@@ -352,10 +352,26 @@ contract MockSwapRegistry {
 ///      pools resolve to a synthetic contract address (this router) so `code.length > 0` holds,
 ///      missing pools resolve to a code-less address. Swaps pay WBNB minted from the router's own
 ///      native balance (tests vm.deal the router) so MockWBNB.withdraw is backed.
+/// @dev Stand-in for a PancakeV3 pool: only `liquidity()` matters to the vault's tier filter.
+contract MockV3Pool {
+    uint128 public liquidity;
+
+    constructor(uint128 l) {
+        liquidity = l;
+    }
+
+    function setLiquidity(uint128 l) external {
+        liquidity = l;
+    }
+}
+
 contract MockMultiDexRouter is IMultiDexRouter {
     MockWBNB public immutable wbnb;
     uint24[] internal fees = [uint24(2500), uint24(100), uint24(10000), uint24(500)];
     mapping(uint24 => bool) public poolExists;
+    mapping(uint24 => MockV3Pool) public pools;
+    /// @dev Models a quoter walking an empty/thin pool: burns every unit of gas it is given.
+    mapping(uint24 => bool) public quoteBurnsGas;
     mapping(uint24 => uint256) public rateNum;
     mapping(uint24 => uint256) public rateDen;
     mapping(uint24 => bool) public quoteReverts;
@@ -369,7 +385,18 @@ contract MockMultiDexRouter is IMultiDexRouter {
     constructor(MockWBNB _wbnb) { wbnb = _wbnb; }
     receive() external payable {}
 
-    function setPool(uint24 fee, bool exists) external { poolExists[fee] = exists; }
+    function setPool(uint24 fee, bool exists) external {
+        poolExists[fee] = exists;
+        if (exists && address(pools[fee]) == address(0)) pools[fee] = new MockV3Pool(1e18);
+    }
+
+    function setPoolLiquidity(uint24 fee, uint128 l) external {
+        pools[fee].setLiquidity(l);
+    }
+
+    function setQuoteBurnsGas(uint24 fee, bool v) external {
+        quoteBurnsGas[fee] = v;
+    }
     function setRate(uint24 fee, uint256 num, uint256 den) external { rateNum[fee] = num; rateDen[fee] = den; }
     function setQuoteReverts(uint24 fee, bool v) external { quoteReverts[fee] = v; }
     function setSwapReverts(bool v) external { swapReverts = v; }
@@ -384,7 +411,7 @@ contract MockMultiDexRouter is IMultiDexRouter {
     }
 
     function computeV3PoolAddress(uint8, address, address, uint24 fee) external view returns (address) {
-        if (poolExists[fee]) return address(this); // has code
+        if (poolExists[fee]) return address(pools[fee]); // has code
         return address(uint160(uint256(keccak256(abi.encode("no-pool", fee))))); // no code
     }
 
@@ -395,6 +422,10 @@ contract MockMultiDexRouter is IMultiDexRouter {
     {
         require(!quoteReverts[p.fee], "MockMultiDexRouter: quote reverted");
         require(poolExists[p.fee], "MockMultiDexRouter: no pool");
+        if (quoteBurnsGas[p.fee]) {
+            uint256 sink;
+            while (true) sink = uint256(keccak256(abi.encode(sink))); // OOG, never returns
+        }
         amountOut = _out(p.fee, p.amountIn);
     }
 
