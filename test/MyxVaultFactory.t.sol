@@ -208,7 +208,7 @@ contract MyxVaultFactoryTest is Test {
 
     function test_newVault_erc20Quote_wiresQuoteAndParams() public {
         vm.deal(address(this), 1 ether);
-        factory.prepayGas{value: 0.002 ether}(); // Task 10 enforces this; harmless before
+        factory.prepayGas{value: 0.01 ether}(); // >= minInitialGas and >= the vaultData gasThreshold
         vm.prank(VAULT_PORTAL);
         address vaultAddr = factory.newVault(makeAddr("tax"), address(rwa), address(this), _erc20VaultData());
         MyxVault v = MyxVault(payable(vaultAddr));
@@ -446,7 +446,7 @@ contract MyxVaultFactoryTest is Test {
 
     function test_newVault_erc20_gasRefillAtCap_passes() public {
         vm.deal(address(this), 1 ether);
-        factory.prepayGas{value: 0.002 ether}();
+        factory.prepayGas{value: 0.01 ether}();
         vm.prank(VAULT_PORTAL);
         address vaultAddr = factory.newVault(
             makeAddr("tax"), address(rwa), address(this),

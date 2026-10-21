@@ -169,6 +169,10 @@ contract MyxVaultFactory is VaultFactoryBaseV2, IVaultFactoryDividendV23 {
             );
             prepaid = prepaidGas[creator];
             require(prepaid >= c.minInitialGas, unicode"Prepaid gas below minimum / 預付 Gas 低於最低要求");
+            // A gas pool that starts below the vault's own refill threshold would spend its first
+            // callback on a refill-only batch instead of a buyback; make the creator fund at least
+            // the threshold up front.
+            require(prepaid >= d.gasThreshold, unicode"Prepaid gas below gas threshold / 預付 Gas 低於 Gas 閾值");
         }
         vault = address(
             new BeaconProxy(

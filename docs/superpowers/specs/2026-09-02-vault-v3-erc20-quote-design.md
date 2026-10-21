@@ -170,9 +170,10 @@ function _refillGas() internal {
 ```
 
 - 地址解析：`registry = ITaxProcessor(IFlapTaxTokenV3(taxToken).taxProcessor()).swapRegistry()`；`router = registry.multiDexRouter()`；`wbnb = registry.weth()`；`dexId = IPortal(_getPortal()).getQuoteTokenConfiguration(quoteToken).dexId`。每次 refill 动态读，不缓存。
-- `_bestPool(amountIn)`：遍历 `router.getDEXInfo(dexId).v3SupportedFees`，`computeV3PoolAddress` 有代码的档位才 `try quoteExactInputSingle`，取最大输出。单档报价 revert 不影响其他档。
+- `_bestPool(amountIn)`：遍历 `router.getDEXInfo(dexId).v3SupportedFees`，`computeV3PoolAddress` 有代码且 `liquidity() > 0` 的档位才 `try quoteExactInputSingle{gas: REFILL_QUOTE_GAS}`，取最大输出。单档报价 revert 不影响其他档。（2026-09-19：主网 MEMESTOCKS/BNCB 事故——500 档池有合约但零流动性，一次报价烧约 45 万 gas。）
 - 没有任何可用池时 refill 跳过并发事件，`process()` 继续买回；不引入备用路径。
-- 兑换后 `process()` 用剩余 `pendingQuote` 买回；若剩余低于 `minProcessAmount`，本次买回跳过（发事件），等下一批。
+- **refill-only 批次（2026-09-19）**：`_refillGas()` 返回 `NotNeeded / Skipped / Refilled / Failed`。`Refilled` 或 `Failed`（swap 阶段失败，报价 gas 已花）时 `process()` 立即结束：发 `RefillOnlyBatch(pendingQuote)`，置 `skipRefillOnce = true`，剩余 ≥ `minProcessAmount` 则预约下一次回调；下一次 `process()` 清 `skipRefillOnce` 并跳过 refill 检查直接买回。原因：回调上限 2M，主网实测买回 1.6–1.7M、含 refill 的回调 4.5–5M，二者不可能同回调。`Skipped` 便宜，继续买回。原 `BuybackSkipped` 分支不再可达，事件删除。
+- 工厂：ERC20 quote 发币要求 `prepaid >= gasThreshold`，vault 不会一出生就处于 refill 状态。
 
 **买回腿**
 

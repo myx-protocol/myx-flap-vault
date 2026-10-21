@@ -82,14 +82,25 @@ contract MyxVaultFactoryPrepaidGasTest is Test {
         assertEq(factory.prepaidGas(creator), 0.001 ether, "prepaid untouched on revert");
     }
 
+    /// @dev A vault whose gas pool starts below its own gasThreshold would try to refill on its
+    ///      very first callback; the refill leg is a separate callback but still a wasted cycle.
+    function test_newVault_erc20_prepaidBelowGasThreshold_reverts() public {
+        vm.prank(creator);
+        factory.prepayGas{value: 0.005 ether}(); // >= minInitialGas (0.002) but < gasThreshold (0.01)
+        vm.prank(VAULT_PORTAL);
+        vm.expectRevert(bytes(unicode"Prepaid gas below gas threshold / 預付 Gas 低於 Gas 閾值"));
+        factory.newVault(makeAddr("tax"), address(rwa), creator, _erc20VaultData());
+        assertEq(factory.prepaidGas(creator), 0.005 ether, "prepaid untouched on revert");
+    }
+
     function test_newVault_erc20_forwardsAllPrepaidToVault() public {
         vm.prank(creator);
-        factory.prepayGas{value: 0.005 ether}();
+        factory.prepayGas{value: 0.02 ether}();
         vm.prank(VAULT_PORTAL);
         vm.expectEmit(false, true, true, true);
-        emit VaultGasFunded(address(0), creator, 0.005 ether);
+        emit VaultGasFunded(address(0), creator, 0.02 ether);
         address vaultAddr = factory.newVault(makeAddr("tax"), address(rwa), creator, _erc20VaultData());
-        assertEq(MyxVault(payable(vaultAddr)).gasBalance(), 0.005 ether);
+        assertEq(MyxVault(payable(vaultAddr)).gasBalance(), 0.02 ether);
         assertEq(factory.prepaidGas(creator), 0);
         assertEq(address(factory).balance, 0);
     }
@@ -114,8 +125,10 @@ contract MyxVaultFactoryPrepaidGasTest is Test {
                 maxGasRefillAmount: 0.05 ether
             })
         );
+        // No prepay is only consistent with a zero gasThreshold (nothing to refill towards).
+        bytes memory zeroThreshold = abi.encode(address(usdt), uint256(10 ether), uint256(0), uint256(0.05 ether), type(uint256).max);
         vm.prank(VAULT_PORTAL);
-        address vaultAddr = lax.newVault(makeAddr("tax"), address(rwa), creator, _erc20VaultData());
+        address vaultAddr = lax.newVault(makeAddr("tax"), address(rwa), creator, zeroThreshold);
         assertEq(MyxVault(payable(vaultAddr)).gasBalance(), 0);
     }
 }

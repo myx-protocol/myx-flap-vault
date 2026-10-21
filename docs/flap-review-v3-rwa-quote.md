@@ -127,9 +127,10 @@ if (pendingQuote != 0) { emit ProcessBatched; if (pendingQuote >= minProcessAmou
 ### 6.1 gas refill（quote → WBNB → BNB）
 
 - 地址全部运行时解析：`taxToken.taxProcessor().swapRegistry()` → `multiDexRouter()`、`weth()`；`dexId` 取 `Portal.getQuoteTokenConfiguration(quote).dexId`。vault 内不硬编码任何新地址。
-- 选池：遍历 `router.getDEXInfo(dexId).v3SupportedFees`，`computeV3PoolAddress` 有代码的档位才 `quoteExactInputSingle`（try/catch），取最优输出。创建人无需指定费率。
+- 选池：遍历 `router.getDEXInfo(dexId).v3SupportedFees`，`computeV3PoolAddress` 有代码**且 `liquidity() > 0`** 的档位才 `quoteExactInputSingle`（try/catch，每次报价 gas 上限 `REFILL_QUOTE_GAS = 300k`），取最优输出。创建人无需指定费率。有合约但零流动性的池在 BSC 上一次报价要烧约 45 万 gas 才失败，必须先过滤。
+- **refill 与买回不共用一次回调（v5）**：回调上限 200 万 gas，主网实测买回本身约 170 万，refill 腿（多档报价 + swap + unwrap）150 万以上。gas 池低于 `gasThreshold` 时本次 `process()` 只做 refill，发 `RefillOnlyBatch`，置 `skipRefillOnce`，并把买回预约为下一次回调；下一次回调跳过一次 refill 检查，保证薄池不会 refill 接 refill 却不买回。便宜的跳过（无 venue / 无池 / 报不出价）不占用回调，同一次调用继续买回。
 - 用量：`needed = gasRefillAmount − balance`，按最优报价线性反推 `quoteIn`，**硬上限为本批（`min(pendingQuote, maxProcessAmount)`）的 20%**（`MAX_REFILL_SHARE_BPS = 2000`），只能补一部分时补一部分。
-- 执行：`executeGasRefill()` 自调用 + try/catch，内部依次扣基线、approve、`exactInputSingle`、清 approve、`WBNB.withdraw`。任何失败整体回滚并发 `GasRefillSkipped`，买回照常进行。
+- 执行：`executeGasRefill()` 自调用 + try/catch，内部依次扣基线、approve、`exactInputSingle`、清 approve、`WBNB.withdraw`。任何失败整体回滚并发 `GasRefillSkipped`；swap 阶段的失败已经花掉报价 gas，同样按 refill-only 批次结束，下一次 `process()` 直接买回。
 - 解析 venue 失败（`swapVenue()` revert 或返回零地址）同样跳过。
 
 ### 6.2 为什么要 20% 上限
